@@ -2257,7 +2257,7 @@ function renderLevel(tilePartsImg, tileMap, canvas, showGrid, bgData, fgData, sh
     const tileH = Math.ceil(contentBottom / 8) * 8 || bgH;
     
     // Use HD BG2 if available, otherwise tile original content
-    if (useHD && hdPack && hdPack.bg2) {
+    if (useHD && hdPack && hdPack.bg2 && (hdPack.bg2GfxSet === undefined || hdPack.bg2GfxSet === currentStyle?.graphics)) {
       const hdBg = hdPack.bg2;
       // Tile at the same logical step as the 1x code (tileW×tileH) but scaled by hdScale,
       // so BG2 stays proportional to the level canvas regardless of the effective hdScale cap.
@@ -2302,7 +2302,9 @@ function renderLevel(tilePartsImg, tileMap, canvas, showGrid, bgData, fgData, sh
       const toX = (ix - mapLeft) * hdScale;
       const toY = (iy - mapTop) * hdScale;
 
-      const hdImg = useHD ? hdPack.tiles.get(tile.partId) : null;
+      // Look up HD tile: try gfxset-scoped key first, fall back to plain id for old packs
+      const _gfxIdx = currentStyle?.graphics;
+      const hdImg = useHD ? (hdPack.tiles.get(_gfxIdx !== undefined ? `${_gfxIdx}_${tile.partId}` : tile.partId) ?? hdPack.tiles.get(tile.partId)) : null;
 
       if (hdImg) {
         // Draw HD tile at native resolution (ts×ts canvas pixels = full quality)
@@ -5253,7 +5255,7 @@ function buildCatalog() {
     console.log(`Catalog debug: all palette rows used in tileset: [${[...allRows].sort().join(',')}], tileArrangement data length: ${currentTileRawData.tileArrangement.data.length}, tileCount: ${tileCount}`);
   }
   console.log(`Catalog: ${bg1Tiles.length} BG1 tiles (${animCount} animated), BG2=${bg2Image ? bg2Image.widthPx+'x'+bg2Image.heightPx : 'none'}, BG3=${bg3Image ? bg3Image.widthPx+'x'+bg3Image.heightPx : 'none'}`);
-  return { bg1Tiles, bg2Image, bg3Image, clusters: [] };
+  return { bg1Tiles, bg2Image, bg3Image, clusters: [], gfxSetIndex: currentStyle?.graphics };
 }
 
 // Helper: draw a single 8x8 tile from raw CHR data (for catalog)
@@ -5324,7 +5326,8 @@ function renderCatalog() {
       wrapper.style.height = (tile.height * scale + 4) + 'px';
 
       const canvas = document.createElement('canvas');
-      const hdTileImg = (hdEnabled && hdPack) ? hdPack.tiles.get(tile.id) : null;
+      const _catGfx = catalogData?.gfxSetIndex ?? currentStyle?.graphics;
+      const hdTileImg = (hdEnabled && hdPack) ? (hdPack.tiles.get(_catGfx !== undefined ? `${_catGfx}_${tile.id}` : tile.id) ?? hdPack.tiles.get(tile.id)) : null;
       if (hdTileImg) {
         canvas.width = hdTileImg.width;
         canvas.height = hdTileImg.height;
@@ -5375,13 +5378,13 @@ function renderCatalog() {
   
   // Render BG2 as composed background image with grid overlay
   if (showBg2 && catalogData.bg2Image) {
-    const hdBg2 = (hdEnabled && hdPack && hdPack.bg2) ? hdPack.bg2 : null;
+    const hdBg2 = (hdEnabled && hdPack && hdPack.bg2 && (hdPack.bg2GfxSet === undefined || hdPack.bg2GfxSet === catalogData?.gfxSetIndex)) ? hdPack.bg2 : null;
     renderBgImageSection(grid, catalogData.bg2Image, 'BG2', '#4fc3f7', scale, hdBg2);
   }
 
   // Render BG3 as composed background image with grid overlay
   if (showBg3 && catalogData.bg3Image) {
-    const hdBg3 = (hdEnabled && hdPack && hdPack.bg3) ? hdPack.bg3 : null;
+    const hdBg3 = (hdEnabled && hdPack && hdPack.bg3 && (hdPack.bg3GfxSet === undefined || hdPack.bg3GfxSet === catalogData?.gfxSetIndex)) ? hdPack.bg3 : null;
     renderBgImageSection(grid, catalogData.bg3Image, 'BG3', '#4caf50', scale, hdBg3);
   }
   
@@ -6292,15 +6295,17 @@ async function importHDPack(file) {
       }
       
       // Extract center tile from padded image
+      // Key includes gfxSetIndex to prevent collision between different gfxsets
+      const hdTileKey = manifest.gfxSetIndex !== undefined ? `${manifest.gfxSetIndex}_${tileInfo.id}` : tileInfo.id;
       if (isPadded) {
         const tileSize = scaleFactor * 32;
         const canvas = new OffscreenCanvas(tileSize, tileSize);
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, tileSize, tileSize, tileSize, tileSize, 0, 0, tileSize, tileSize);
         img.close();
-        hdTiles.set(tileInfo.id, await createImageBitmap(canvas));
+        hdTiles.set(hdTileKey, await createImageBitmap(canvas));
       } else {
-        hdTiles.set(tileInfo.id, img);
+        hdTiles.set(hdTileKey, img);
       }
     }
     
@@ -6330,7 +6335,8 @@ async function importHDPack(file) {
       for (let dy = 0; dy < clInfo.h; dy++) {
         for (let dx = 0; dx < clInfo.w; dx++) {
           const tileId = clInfo.ids[dy * clInfo.w + dx];
-          if (tileId < 0 || hdTiles.has(tileId)) continue;
+          const clTileKey = manifest.gfxSetIndex !== undefined ? `${manifest.gfxSetIndex}_${tileId}` : tileId;
+          if (tileId < 0 || hdTiles.has(clTileKey)) continue;
           // Extract this tile from the cluster, un-flipping if the cluster stored it flipped.
           // Cluster PNGs are built with flip transforms applied, so we must invert them here
           // to get the canonical base tile — the render loop re-applies flips at draw time.
@@ -6347,7 +6353,7 @@ async function importHDPack(file) {
           } else {
             tcCtx.drawImage(clusterImg, dx * tileSize, dy * tileSize, tileSize, tileSize, 0, 0, tileSize, tileSize);
           }
-          hdTiles.set(tileId, await createImageBitmap(tc));
+          hdTiles.set(clTileKey, await createImageBitmap(tc));
         }
       }
       
@@ -6404,8 +6410,8 @@ async function importHDPack(file) {
     }
 
     // BG2/BG3: overwrite if present in this pack
-    if (hdBg2) hdPack.bg2 = hdBg2;
-    if (hdBg3) hdPack.bg3 = hdBg3;
+    if (hdBg2) { hdPack.bg2 = hdBg2; hdPack.bg2GfxSet = manifest.gfxSetIndex; }
+    if (hdBg3) { hdPack.bg3 = hdBg3; hdPack.bg3GfxSet = manifest.gfxSetIndex; }
 
     // Update scaleFactor only when this pack had actual images to auto-detect from.
     // A BG2-only pack has scaleFactor=1 in the manifest and no tiles/clusters to detect
@@ -6561,7 +6567,7 @@ async function saveCurrentHDToContainer(containerName) {
 
   // Determine setId from current context
   const setId = catalogView
-    ? `gfxset_${(currentGfxSetIndex || 0).toString(16).toUpperCase().padStart(2, '0')}`
+    ? `gfxset_${(currentStyle?.graphics || 0).toString(16).toUpperCase().padStart(2, '0')}`
     : `level_${currentLevelId || 0}`;
 
   // Convert tiles to storable format
@@ -6593,15 +6599,20 @@ async function saveCurrentHDToContainer(containerName) {
     };
   }
 
+  const clusters = [];
+  for (const hc of (hdPack.clusters || [])) {
+    clusters.push({ ids: hc.ids, flips: hc.flips || [], w: hc.w, h: hc.h, blob: await bitmapToBlob(hc.image) });
+  }
+
   await hdSaveSet(containerName, 'level', setId, {
     scaleFactor: hdPack.scaleFactor,
     tileCount: tiles.length,
-    tiles, bg2Blob, bg3Blob,
+    tiles, clusters, bg2Blob, bg3Blob,
     tileArrangementData: tileArrangementData ? Array.from(tileArrangementData) : null,
     tileArrangementTileCount: currentTileRawData ? currentTileRawData.tileCount : 0,
     gfxCount,
     ppuConfig,
-    gfxSetIndex: currentGfxSetIndex || null,
+    gfxSetIndex: currentStyle?.graphics || null,
     savedAt: Date.now()
   });
 
@@ -6659,12 +6670,24 @@ async function loadContainerToHDPack(containerName) {
   for (const set of levelSets) {
     if (set.scaleFactor) hdPack.scaleFactor = set.scaleFactor;
     if (set.gfxSetIndex !== undefined) hdPack.gfxSetIndex = set.gfxSetIndex;
+    const gfxIdx = set.gfxSetIndex;
     for (const t of (set.tiles || [])) {
-      hdPack.tiles.set(t.id, await createImageBitmap(t.blob));
+      // Normalize key: add gfxset prefix if not already present (handles old plain-id saves)
+      const key = (gfxIdx !== undefined && !String(t.id).includes('_'))
+        ? `${gfxIdx}_${t.id}` : t.id;
+      hdPack.tiles.set(key, await createImageBitmap(t.blob));
       totalTiles++;
     }
-    if (set.bg2Blob) hdPack.bg2 = await createImageBitmap(set.bg2Blob);
-    if (set.bg3Blob) hdPack.bg3 = await createImageBitmap(set.bg3Blob);
+    if (set.bg2Blob) { hdPack.bg2 = await createImageBitmap(set.bg2Blob); hdPack.bg2GfxSet = set.gfxSetIndex; }
+    if (set.bg3Blob) { hdPack.bg3 = await createImageBitmap(set.bg3Blob); hdPack.bg3GfxSet = set.gfxSetIndex; }
+    const existingClusterKeys = new Set(hdPack.clusters.map(c => c.ids.join(',')));
+    for (const c of (set.clusters || [])) {
+      const key = c.ids.join(',');
+      if (!existingClusterKeys.has(key)) {
+        hdPack.clusters.push({ ids: c.ids, flips: c.flips || [], w: c.w, h: c.h, image: await createImageBitmap(c.blob) });
+        existingClusterKeys.add(key);
+      }
+    }
   }
 
   // Load sprite sets
@@ -7236,7 +7259,8 @@ function selectCatalogTile(tile, e) {
     hdDiv.id = 'catalogDetailHD';
     hdDiv.innerHTML = '<div style="color:#ff9800;font-size:12px;font-weight:bold;margin:8px 0 4px;">HD Version (' + hdPack.scaleFactor + 'x)</div>';
     const hdCanvas = document.createElement('canvas');
-    const hdImg = hdPack.tiles.get(tile.id);
+    const _detGfx = catalogData?.gfxSetIndex ?? currentStyle?.graphics;
+    const hdImg = (hdPack.tiles.get(_detGfx !== undefined ? `${_detGfx}_${tile.id}` : tile.id) ?? hdPack.tiles.get(tile.id));
     hdCanvas.width = hdImg.width;
     hdCanvas.height = hdImg.height;
     // Display at same visual size as detail preview (128px)
@@ -9467,6 +9491,8 @@ clusterExportBtn.addEventListener('click', () => {
 // Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
   if (!rom) return;
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || document.activeElement?.isContentEditable) return;
   if (e.key === 'ArrowLeft' || e.key === 'a') {
     if (currentLevelId >= 256) { if (currentLevelId > 256) loadLevel(currentLevelId - 1); else loadLevel(191); }
     else if (currentLevelId > 0) loadLevel(currentLevelId - 1);
