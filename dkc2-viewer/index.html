@@ -6742,7 +6742,9 @@ async function exportContainerAsZip(containerName) {
       summary.levels++;
       const manifest = {
         type: 'level', setId: set.setId, scaleFactor: set.scaleFactor,
-        tileCount: (set.tiles || []).length, hasBg2: !!set.bg2Blob, hasBg3: !!set.bg3Blob
+        tileCount: (set.tiles || []).length, hasBg2: !!set.bg2Blob, hasBg3: !!set.bg3Blob,
+        tileArrangementTileCount: set.tileArrangementTileCount || 0,
+        gfxCount: set.gfxCount || 0
       };
       folder.file('manifest.json', JSON.stringify(manifest, null, 2));
       for (const t of (set.tiles || [])) {
@@ -6751,6 +6753,14 @@ async function exportContainerAsZip(containerName) {
       }
       if (set.bg2Blob) { folder.file('bg2.png', set.bg2Blob); summary.totalFiles++; }
       if (set.bg3Blob) { folder.file('bg3.png', set.bg3Blob); summary.totalFiles++; }
+      if (set.ppuConfig) {
+        folder.file('ppu_config.json', JSON.stringify(set.ppuConfig, null, 2));
+        summary.totalFiles++;
+      }
+      if (set.tileArrangementData && set.tileArrangementData.length > 0) {
+        folder.file('tile_arrangement.bin', new Uint8Array(set.tileArrangementData));
+        summary.totalFiles++;
+      }
     } else if (set.type === 'sprite' || set.type === 'mapicon') {
       summary.sprites++;
       const manifest = {
@@ -6780,13 +6790,14 @@ async function exportContainerAsZip(containerName) {
   return summary;
 }
 
-// --- Export container as bsnes-hd Texture Pack ---
+// --- Export container as Mesen2 HD Pack ---
 // Converts Map32 HD tiles into per-8x8-subtile PNGs keyed by VRAM address + palette
-// Output format: textures/{gameId}/bg/bg1/{vramAddr}_P{pal}.png (32x32px each, 4x scaled)
+// Output format: HdPacks/{romName}/bg/bg1/{vramAddr}_P{pal}.png (32x32px each, 4x scaled)
 
 async function exportAsTexturePack(containerName) {
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
 
+  try {
   const sets = await hdGetContainerSets(containerName);
   const levelSets = sets.filter(s => s.type === 'level');
 
@@ -6800,8 +6811,8 @@ async function exportAsTexturePack(containerName) {
   }
 
   const zip = new JSZip();
-  const gameId = 'DONKEY_KONG_2';  // ROM header title, sanitized
-  const root = zip.folder(`textures/${gameId}`);
+  const romName = 'Donkey Kong Country 2';  // ROM header title as read by Mesen2 (offset 0xFFC0)
+  const root = zip.folder(`HdPacks/${romName}`);
   const bgFolder = root.folder('bg/bg1');
 
   const scale = 4;  // 4x: 8x8 -> 32x32
@@ -6818,20 +6829,24 @@ async function exportAsTexturePack(containerName) {
     const wordsPerTile = is4bpp ? 16 : 8;  // 4bpp = 32 bytes = 16 words; 2bpp = 16 bytes = 8 words
     const scaleFactor = set.scaleFactor || scale;
 
-    // Build lookup: partId -> ImageBitmap from stored tiles
+    // Build lookup: tileKey -> ImageBitmap from stored tiles
+    // Tile IDs are stored as "{gfxSetIndex}_{partId}" strings (e.g. "7_0", "7_1")
     const tileBitmaps = new Map();
     for (const t of (set.tiles || [])) {
       tileBitmaps.set(t.id, await createImageBitmap(t.blob));
     }
+    const gfxIdx = set.gfxSetIndex;
 
-    // For each Map32 tile in the arrangement
-    for (let partId = 0; partId < arrTileCount; partId++) {
-      const hdBitmap = tileBitmaps.get(partId);
-      if (!hdBitmap) continue;  // no HD replacement for this tile
+    // For each HD tile: keys are "{gfxIdx}_{tileId}" (e.g. "7_4"), tileArrangementData indexed by tileId
+    for (const [tileKey, hdBitmap] of tileBitmaps) {
+      const keyStr = String(tileKey);
+      const underIdx = keyStr.lastIndexOf('_');
+      const tileId = underIdx >= 0 ? parseInt(keyStr.slice(underIdx + 1)) : parseInt(keyStr);
+      if (isNaN(tileId)) continue;
 
       // Each Map32 tile = 4x4 grid of 8x8 sub-tiles = 16 sub-tiles
       for (let j = 0; j < 16; j++) {
-        const byteOff = partId * 32 + j * 2;
+        const byteOff = tileId * 32 + j * 2;
         if (byteOff + 1 >= tileArr.length) continue;
         const tileInfo = tileArr[byteOff] | (tileArr[byteOff + 1] << 8);
         const gfxIndex = tileInfo & 0x03FF;
@@ -6860,7 +6875,9 @@ async function exportAsTexturePack(containerName) {
         let srcY = subRow * srcPixelSize;
 
         // Create output canvas at 32x32 (4x scale of 8x8)
-        const outCanvas = new OffscreenCanvas(subtileSize, subtileSize);
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = subtileSize;
+        outCanvas.height = subtileSize;
         const ctx = outCanvas.getContext('2d');
 
         // Handle flip: we store the UN-FLIPPED version (emulator flips at runtime)
@@ -6877,8 +6894,13 @@ async function exportAsTexturePack(containerName) {
 
         if (flipH || flipV) ctx.restore();
 
-        // Convert to PNG blob and add to ZIP
-        const blob = await outCanvas.convertToBlob({ type: 'image/png' });
+        // Convert to PNG blob — toDataURL is synchronous and avoids toBlob() callback issues
+        const dataUrl = outCanvas.toDataURL('image/png');
+        const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+        const raw = atob(b64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        const blob = new Blob([arr], { type: 'image/png' });
         bgFolder.file(`${fileKey}.png`, blob);
         exportedTiles++;
       }
@@ -6894,7 +6916,7 @@ async function exportAsTexturePack(containerName) {
   root.file('manifest.json', JSON.stringify({
     format_version: 1,
     game: {
-      rom_header_title: 'DONKEY KONG 2',
+      rom_header_title: 'Donkey Kong Country 2',
       rom_sha256: ''
     },
     scale: scale,
@@ -6909,13 +6931,21 @@ async function exportAsTexturePack(containerName) {
   // Generate and download ZIP
   const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
   const url = URL.createObjectURL(zipBlob);
-  const a = document.createElement('a'); a.href = url;
-  a.download = `${containerName}_texture_pack.zip`;
-  a.click(); URL.revokeObjectURL(url);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${containerName}_mesen2_hdpack.zip`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 
-  console.log(`[TexturePack] Exported ${exportedTiles} unique sub-tiles from ${setsWithArrangement.length} sets`);
-  alert(`Texture Pack exportiert!\n\n${exportedTiles} unique 8x8 Sub-Tiles (als ${subtileSize}x${subtileSize}px PNGs)\naus ${setsWithArrangement.length} Level-Sets.`);
+  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique 8×8 Sub-Tiles (32×32px)\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\bg\\bg1\\ wird automatisch erstellt.`);
   return { exportedTiles, sets: setsWithArrangement.length };
+
+  } catch(err) {
+    console.error('[Mesen2 Export] Fehler:', err);
+    alert('Export fehlgeschlagen: ' + err.message);
+  }
 }
 
 // --- Import container from ZIP ---
@@ -6974,9 +7004,21 @@ async function importContainerFromZip(file) {
       const bg3File = zip.file(`${setPath}bg3.png`);
       if (bg3File) bg3Blob = await bg3File.async('blob');
 
+      let ppuConfig = null, tileArrangementData = null;
+      const ppuCfgFile = zip.file(`${setPath}ppu_config.json`);
+      if (ppuCfgFile) ppuConfig = JSON.parse(await ppuCfgFile.async('text'));
+      const tileArrFile = zip.file(`${setPath}tile_arrangement.bin`);
+      if (tileArrFile) {
+        const buf = await tileArrFile.async('arraybuffer');
+        tileArrangementData = Array.from(new Uint8Array(buf));
+      }
+
       await hdSaveSet(containerName, 'level', setInfo.setId, {
         scaleFactor: setManifest.scaleFactor || 1,
         tileCount: tiles.length, tiles, bg2Blob, bg3Blob,
+        ppuConfig, tileArrangementData,
+        tileArrangementTileCount: setManifest.tileArrangementTileCount || 0,
+        gfxCount: setManifest.gfxCount || 0,
         savedAt: Date.now()
       });
       imported++;
@@ -7047,7 +7089,7 @@ async function refreshContainerList() {
         <div style="display:flex;gap:4px;">
           <button onclick="loadContainerToHDPack('${esc}').then(()=>refreshContainerList())" style="padding:3px 10px;background:#2196f3;color:#fff;border:1px solid #2196f3;border-radius:3px;cursor:pointer;font-size:11px;">Laden</button>
           <button onclick="exportContainerAsZip('${esc}')" style="padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;border-radius:3px;cursor:pointer;font-size:11px;">Export ZIP</button>
-          <button onclick="exportAsTexturePack('${esc}')" style="padding:3px 10px;background:#ff9800;color:#fff;border:1px solid #ff9800;border-radius:3px;cursor:pointer;font-size:11px;" title="Export als bsnes-hd Texture Pack (VRAM-basierte 8x8 Sub-Tiles)">Texture Pack</button>
+          <button onclick="exportAsTexturePack('${esc}')" style="padding:3px 10px;background:#ff9800;color:#fff;border:1px solid #ff9800;border-radius:3px;cursor:pointer;font-size:11px;" title="Export als Mesen2 HD Pack (HdPacks/Donkey Kong Country 2/bg/bg1/ — VRAM-basierte 8x8 Sub-Tiles, 32×32px)">Texture Pack</button>
           <button onclick="confirmDeleteContainer('${esc}')" style="padding:3px 10px;background:#f44336;color:#fff;border:1px solid #f44336;border-radius:3px;cursor:pointer;font-size:11px;">Löschen</button>
         </div>
       </div>
