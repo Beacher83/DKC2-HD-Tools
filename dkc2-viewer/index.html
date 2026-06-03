@@ -6880,10 +6880,19 @@ async function exportAsTexturePack(containerName) {
         outCanvas.height = subtileSize;
         const ctx = outCanvas.getContext('2d');
 
-        // hdPack.tiles always contains canonical (unflipped) bitmaps — the emulator
-        // applies flip at render time. Export as-is; no transform needed here.
+        // Handle flip: we store the UN-FLIPPED version (emulator flips at runtime)
+        // The HD bitmap already includes flips baked in from the original render,
+        // so we need to UN-FLIP to get the canonical tile orientation
+        if (flipH || flipV) {
+          ctx.save();
+          if (flipH) { ctx.scale(-1, 1); ctx.translate(-subtileSize, 0); }
+          if (flipV) { ctx.scale(1, -1); ctx.translate(0, -subtileSize); }
+        }
+
         ctx.drawImage(hdBitmap, srcX, srcY, srcPixelSize, srcPixelSize,
                        0, 0, subtileSize, subtileSize);
+
+        if (flipH || flipV) ctx.restore();
 
         // Convert to PNG blob — toDataURL is synchronous and avoids toBlob() callback issues
         const dataUrl = outCanvas.toDataURL('image/png');
