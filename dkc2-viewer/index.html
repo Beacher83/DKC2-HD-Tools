@@ -6979,25 +6979,40 @@ async function exportAsTexturePack(containerName) {
   // Extracts unique 8x8 tiles from the composed bg2.png using the saved tilemap,
   // scales them 4x to 32x32, and stores un-flipped canonical versions.
   // (Mesen2 applies H/V flip at runtime from the tilemap — same as BG1.)
+  //
+  // Fallback: if the stored set is missing bg2TilemapData or ppuConfig (e.g. imported
+  // from an old ZIP that pre-dates container support), use the live catalogData from
+  // the current session — so the user just needs gfxset open, not a re-save.
   const bg2Folder = root.folder('bg/bg2');
   let bg2ExportedTiles = 0;
   const bg2ExportedKeys = new Set();
 
-  const setsWithBg2 = levelSets.filter(s => s.bg2TilemapData && s.bg2TilemapData.length > 0 && s.bg2Blob && s.ppuConfig);
+  const livePpu  = catalogData && catalogData.ppuConfig    ? catalogData.ppuConfig    : null;
+  const liveTmap = catalogData && catalogData.bg2TilemapData ? catalogData.bg2TilemapData : null;
+
+  // Accept sets that have bg2Blob plus either stored OR live ppuConfig/tilemap
+  const setsWithBg2 = levelSets.filter(s => {
+    if (!s.bg2Blob) return false;
+    const hasPpu  = !!(s.ppuConfig     || (livePpu  && s.gfxSetIndex === catalogData.gfxSetIndex));
+    const hasTmap = !!(s.bg2TilemapData && s.bg2TilemapData.length > 0 ||
+                      (liveTmap && liveTmap.length > 0 && s.gfxSetIndex === catalogData.gfxSetIndex));
+    return hasPpu && hasTmap;
+  });
   for (const set of setsWithBg2) {
-    const ppuCfg = set.ppuConfig;
-    const chrBase = ppuCfg.bg2ChrBase || 0;
-    const is4bpp = (ppuCfg.bgMode === 1);   // Mode 1: BG1+BG2 are both 4bpp
-    const wordsPerTile = is4bpp ? 16 : 8;   // 4bpp=32 bytes=16 words; 2bpp=16 bytes=8 words
-    const tilesW = ppuCfg.bg2TilesW || 32;
-    const tilesH = ppuCfg.bg2TilesH || 32;
+    const ppuCfg   = set.ppuConfig     || livePpu;
+    const tilemapRaw = (set.bg2TilemapData && set.bg2TilemapData.length > 0) ? set.bg2TilemapData : liveTmap;
+    const chrBase  = ppuCfg.bg2ChrBase || 0;
+    const is4bpp   = (ppuCfg.bgMode === 1);   // Mode 1: BG1+BG2 are both 4bpp
+    const wordsPerTile = is4bpp ? 16 : 8;     // 4bpp=32 bytes=16 words; 2bpp=16 bytes=8 words
+    const tilesW   = ppuCfg.bg2TilesW  || 32;
+    const tilesH   = ppuCfg.bg2TilesH  || 32;
 
     // Load composed BG2 image (native res: 1px per SNES pixel)
     const bg2Bitmap = await createImageBitmap(set.bg2Blob);
 
     // Read tilemap as 16-bit little-endian words from the stored byte array
     const tilemapWords = [];
-    const td = set.bg2TilemapData;
+    const td = tilemapRaw;
     for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
 
     for (let tileY = 0; tileY < tilesH; tileY++) {
