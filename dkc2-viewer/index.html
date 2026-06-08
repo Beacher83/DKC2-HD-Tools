@@ -6680,6 +6680,7 @@ async function saveCurrentHDToContainer(containerName) {
     const vram = currentBgData.vram;
     const is4bpp = (ppuConfig.bgMode === 1);
     const wordsPerTile = is4bpp ? 16 : 8;
+    const gfxset = currentStyle?.graphics ?? 0;  // gfxset index for this save
     tileChecksums = [];
 
     // BG1: iterate tileArrangement sub-tile entries
@@ -6692,7 +6693,7 @@ async function saveCurrentHDToContainer(containerName) {
         const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
         if (seen.has(vramWordAddr)) continue;
         seen.add(vramWordAddr);
-        tileChecksums.push({ layer: 0, vramAddr: vramWordAddr, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+        tileChecksums.push({ layer: 0, vramAddr: vramWordAddr, gfxset, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
       }
     }
 
@@ -6706,7 +6707,7 @@ async function saveCurrentHDToContainer(containerName) {
         const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
         if (seen.has(vramWordAddr)) continue;
         seen.add(vramWordAddr);
-        tileChecksums.push({ layer: 1, vramAddr: vramWordAddr, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+        tileChecksums.push({ layer: 1, vramAddr: vramWordAddr, gfxset, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
       }
     }
   }
@@ -6931,7 +6932,6 @@ async function exportAsTexturePack(containerName) {
   const scale = 4;  // 4x: 8x8 -> 32x32
   const subtileSize = 8 * scale;  // 32px per HD sub-tile
   let exportedTiles = 0;
-  const exportedKeys = new Set();  // track unique keys to avoid duplicates
 
   for (const set of setsWithArrangement) {
     const tileArr = new Uint8Array(set.tileArrangementData);
@@ -6942,13 +6942,18 @@ async function exportAsTexturePack(containerName) {
     const wordsPerTile = is4bpp ? 16 : 8;  // 4bpp = 32 bytes = 16 words; 2bpp = 16 bytes = 8 words
     const scaleFactor = set.scaleFactor || scale;
 
+    // Per-gfxset subfolder: bg/bg1/gfxset_07/ — allows multiple gfxsets at same VRAM addresses
+    const gfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
+    const gfxIdStr = String(gfxIdx).padStart(2, '0');
+    const bgFolder = root.folder(`bg/bg1/gfxset_${gfxIdStr}`);
+    const exportedKeys = new Set();  // per-set dedup (not global)
+
     // Build lookup: tileKey -> ImageBitmap from stored tiles
     // Tile IDs are stored as "{gfxSetIndex}_{partId}" strings (e.g. "7_0", "7_1")
     const tileBitmaps = new Map();
     for (const t of (set.tiles || [])) {
       tileBitmaps.set(t.id, await createImageBitmap(t.blob));
     }
-    const gfxIdx = set.gfxSetIndex;
 
     // For each HD tile: keys are "{gfxIdx}_{tileId}" (e.g. "7_4"), tileArrangementData indexed by tileId
     for (const [tileKey, hdBitmap] of tileBitmaps) {
@@ -7033,9 +7038,7 @@ async function exportAsTexturePack(containerName) {
   // Fallback: if the stored set is missing bg2TilemapData or ppuConfig (e.g. imported
   // from an old ZIP that pre-dates container support), use the live catalogData from
   // the current session — so the user just needs gfxset open, not a re-save.
-  const bg2Folder = root.folder('bg/bg2');
   let bg2ExportedTiles = 0;
-  const bg2ExportedKeys = new Set();
 
   const livePpu  = catalogData && catalogData.ppuConfig    ? catalogData.ppuConfig    : null;
   const liveTmap = catalogData && catalogData.bg2TilemapData ? catalogData.bg2TilemapData : null;
@@ -7051,6 +7054,13 @@ async function exportAsTexturePack(containerName) {
   for (const set of setsWithBg2) {
     const ppuCfg   = set.ppuConfig     || livePpu;
     const tilemapRaw = (set.bg2TilemapData && set.bg2TilemapData.length > 0) ? set.bg2TilemapData : liveTmap;
+
+    // Per-gfxset subfolder: bg/bg2/gfxset_07/
+    const bg2GfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
+    const bg2GfxIdStr = String(bg2GfxIdx).padStart(2, '0');
+    const bg2Folder = root.folder(`bg/bg2/gfxset_${bg2GfxIdStr}`);
+    const bg2ExportedKeys = new Set();  // per-set dedup
+
     const chrBase  = ppuCfg.bg2ChrBase || 0;
     const is4bpp   = (ppuCfg.bgMode === 1);   // Mode 1: BG1+BG2 are both 4bpp
     const wordsPerTile = is4bpp ? 16 : 8;     // 4bpp=32 bytes=16 words; 2bpp=16 bytes=8 words
@@ -7112,14 +7122,16 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
-  // Write checksums.bin (VRAM content verification — prevents wrong tiles when levels share VRAM addresses)
-  // Binary format: [uint32 count] followed by count × [uint16 vramAddr, uint8 layer, uint8 reserved, uint32 checksum]
+  // Write checksums.bin (VRAM content verification)
+  // Binary format: [uint32 count] × [uint16 vramAddr, uint8 layerIndex, uint8 gfxsetIndex, uint32 checksum]
+  // gfxsetIndex (byte 3) identifies which gfxset this checksum belongs to — allows multiple
+  // gfxsets at the same VRAM address to coexist, Mesen picks the one whose VRAM content matches.
   {
-    const csMap = new Map();  // key: "layer_vramAddr" → checksum entry (dedup)
+    const csMap = new Map();  // key: "gfxset_layer_vramAddr" → checksum entry (dedup)
     for (const set of [...setsWithArrangement, ...setsWithBg2]) {
       if (!set.tileChecksums || !Array.isArray(set.tileChecksums)) continue;
       for (const cs of set.tileChecksums) {
-        csMap.set(`${cs.layer}_${cs.vramAddr}`, cs);
+        csMap.set(`${cs.gfxset}_${cs.layer}_${cs.vramAddr}`, cs);
       }
     }
     if (csMap.size > 0) {
@@ -7130,7 +7142,7 @@ async function exportAsTexturePack(containerName) {
       entries.forEach((cs, i) => {
         view.setUint16(4 + i * 8, cs.vramAddr, true);
         view.setUint8(4 + i * 8 + 2, cs.layer);
-        view.setUint8(4 + i * 8 + 3, 0);
+        view.setUint8(4 + i * 8 + 3, cs.gfxset ?? 0);
         view.setUint32(4 + i * 8 + 4, cs.checksum, true);
       });
       root.file('checksums.bin', new Uint8Array(buf));
