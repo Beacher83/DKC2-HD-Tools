@@ -6591,12 +6591,30 @@ async function saveCurrentHDToContainer(containerName) {
   }
   if (currentBgData && currentBgData.ppu) {
     const ppu = currentBgData.ppu;
+    const bg2TilesW = ppu.bg2 && ppu.bg2.wide ? 64 : 32;
+    const bg2TilesH = ppu.bg2 && ppu.bg2.tall ? 64 : 32;
     ppuConfig = {
       bgMode: ppu.bgMode,
       bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,    // VRAM word address of BG1 character data
       bg2ChrBase: ppu.bg2 ? ppu.bg2.chrBase : 0,
       bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
+      bg2TilesW,
+      bg2TilesH,
     };
+  }
+
+  // Extract raw BG2 tilemap from VRAM so exportAsTexturePack can identify unique tiles
+  let bg2TilemapData = null;
+  if (currentBgData && currentBgData.vram && currentBgData.ppu &&
+      currentBgData.ppu.bg2 && currentBgData.ppu.bg2.enabled && ppuConfig) {
+    const ppu = currentBgData.ppu;
+    const vram = currentBgData.vram;
+    const tmByteOffset = ppu.bg2.tilemapBase * 2;
+    const tmByteLength = ppuConfig.bg2TilesW * ppuConfig.bg2TilesH * 2;
+    if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
+      bg2TilemapData = [];
+      for (let i = 0; i < tmByteLength; i++) bg2TilemapData.push(vram[tmByteOffset + i] || 0);
+    }
   }
 
   const clusters = [];
@@ -6612,6 +6630,7 @@ async function saveCurrentHDToContainer(containerName) {
     tileArrangementTileCount: currentTileRawData ? currentTileRawData.tileCount : 0,
     gfxCount,
     ppuConfig,
+    bg2TilemapData,
     gfxSetIndex: currentStyle?.graphics || null,
     savedAt: Date.now()
   });
@@ -6759,6 +6778,10 @@ async function exportContainerAsZip(containerName) {
       }
       if (set.tileArrangementData && set.tileArrangementData.length > 0) {
         folder.file('tile_arrangement.bin', new Uint8Array(set.tileArrangementData));
+        summary.totalFiles++;
+      }
+      if (set.bg2TilemapData && set.bg2TilemapData.length > 0) {
+        folder.file('bg2_tilemap.bin', new Uint8Array(set.bg2TilemapData));
         summary.totalFiles++;
       }
     } else if (set.type === 'sprite' || set.type === 'mapicon') {
@@ -6912,6 +6935,75 @@ async function exportAsTexturePack(containerName) {
     return;
   }
 
+  // ---- BG2 tile export ----
+  // Extracts unique 8x8 tiles from the composed bg2.png using the saved tilemap,
+  // scales them 4x to 32x32, and stores un-flipped canonical versions.
+  // (Mesen2 applies H/V flip at runtime from the tilemap — same as BG1.)
+  const bg2Folder = root.folder('bg/bg2');
+  let bg2ExportedTiles = 0;
+  const bg2ExportedKeys = new Set();
+
+  const setsWithBg2 = levelSets.filter(s => s.bg2TilemapData && s.bg2TilemapData.length > 0 && s.bg2Blob && s.ppuConfig);
+  for (const set of setsWithBg2) {
+    const ppuCfg = set.ppuConfig;
+    const chrBase = ppuCfg.bg2ChrBase || 0;
+    const is4bpp = (ppuCfg.bgMode === 1);   // Mode 1: BG1+BG2 are both 4bpp
+    const wordsPerTile = is4bpp ? 16 : 8;   // 4bpp=32 bytes=16 words; 2bpp=16 bytes=8 words
+    const tilesW = ppuCfg.bg2TilesW || 32;
+    const tilesH = ppuCfg.bg2TilesH || 32;
+
+    // Load composed BG2 image (native res: 1px per SNES pixel)
+    const bg2Bitmap = await createImageBitmap(set.bg2Blob);
+
+    // Read tilemap as 16-bit little-endian words from the stored byte array
+    const tilemapWords = [];
+    const td = set.bg2TilemapData;
+    for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
+
+    for (let tileY = 0; tileY < tilesH; tileY++) {
+      for (let tileX = 0; tileX < tilesW; tileX++) {
+        const entry = tilemapWords[tileY * tilesW + tileX];
+        if (entry === undefined) continue;
+        const tileNum = entry & 0x3FF;
+        const palRow  = (entry >> 10) & 7;
+        const flipH   = !!(entry & 0x4000);
+        const flipV   = !!(entry & 0x8000);
+
+        const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+        const addrHex = vramWordAddr.toString(16).padStart(4, '0');
+        const palStr  = 'P' + String(palRow).padStart(2, '0');
+        const fileKey = `${addrHex}_${palStr}`;
+
+        if (bg2ExportedKeys.has(fileKey)) continue;
+        bg2ExportedKeys.add(fileKey);
+
+        // Extract 8x8 region from composed bg2.png (already rendered with flips applied)
+        // Un-flip to store the canonical un-flipped version that Mesen2 will re-flip at runtime
+        const srcX = tileX * 8, srcY = tileY * 8;
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = 32; outCanvas.height = 32;
+        const ctx = outCanvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+
+        if (flipH || flipV) {
+          ctx.save();
+          if (flipH) { ctx.scale(-1, 1); ctx.translate(-32, 0); }
+          if (flipV) { ctx.scale(1, -1); ctx.translate(0, -32); }
+        }
+        ctx.drawImage(bg2Bitmap, srcX, srcY, 8, 8, 0, 0, 32, 32);
+        if (flipH || flipV) ctx.restore();
+
+        const dataUrl = outCanvas.toDataURL('image/png');
+        const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+        const raw = atob(b64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        bg2Folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
+        bg2ExportedTiles++;
+      }
+    }
+  }
+
   // Write manifest
   root.file('manifest.json', JSON.stringify({
     format_version: 1,
@@ -6924,7 +7016,8 @@ async function exportAsTexturePack(containerName) {
     hd_tile_size_px: subtileSize,
     lookup_mode: 'tile_address_palette',
     flip_handling: 'runtime',
-    total_tiles: exportedTiles,
+    total_bg1_tiles: exportedTiles,
+    total_bg2_tiles: bg2ExportedTiles,
     notes: `Exported from DKC2 Viewer container "${containerName}"`
   }, null, 2));
 
@@ -6939,8 +7032,9 @@ async function exportAsTexturePack(containerName) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 
-  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique 8×8 Sub-Tiles (32×32px)\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\bg\\bg1\\ wird automatisch erstellt.`);
-  return { exportedTiles, sets: setsWithArrangement.length };
+  const bg2Msg = bg2ExportedTiles > 0 ? `\n${bg2ExportedTiles} unique BG2-Tiles (32×32px, native 4×)` : '\nKeine BG2-Daten (Level neu speichern für BG2-Export)';
+  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${bg2Msg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
+  return { exportedTiles, bg2ExportedTiles, sets: setsWithArrangement.length };
 
   } catch(err) {
     console.error('[Mesen2 Export] Fehler:', err);
@@ -7004,7 +7098,7 @@ async function importContainerFromZip(file) {
       const bg3File = zip.file(`${setPath}bg3.png`);
       if (bg3File) bg3Blob = await bg3File.async('blob');
 
-      let ppuConfig = null, tileArrangementData = null;
+      let ppuConfig = null, tileArrangementData = null, bg2TilemapData = null;
       const ppuCfgFile = zip.file(`${setPath}ppu_config.json`);
       if (ppuCfgFile) ppuConfig = JSON.parse(await ppuCfgFile.async('text'));
       const tileArrFile = zip.file(`${setPath}tile_arrangement.bin`);
@@ -7012,11 +7106,16 @@ async function importContainerFromZip(file) {
         const buf = await tileArrFile.async('arraybuffer');
         tileArrangementData = Array.from(new Uint8Array(buf));
       }
+      const bg2TilemapFile = zip.file(`${setPath}bg2_tilemap.bin`);
+      if (bg2TilemapFile) {
+        const buf = await bg2TilemapFile.async('arraybuffer');
+        bg2TilemapData = Array.from(new Uint8Array(buf));
+      }
 
       await hdSaveSet(containerName, 'level', setInfo.setId, {
         scaleFactor: setManifest.scaleFactor || 1,
         tileCount: tiles.length, tiles, bg2Blob, bg3Blob,
-        ppuConfig, tileArrangementData,
+        ppuConfig, tileArrangementData, bg2TilemapData,
         tileArrangementTileCount: setManifest.tileArrangementTileCount || 0,
         gfxCount: setManifest.gfxCount || 0,
         savedAt: Date.now()
