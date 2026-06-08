@@ -6556,6 +6556,16 @@ async function hdGetContainerSets(containerName) {
 
 // --- Asset Save/Load ---
 
+// Sum 16 VRAM words (32 bytes = one 4bpp tile) — matches C++ ComputeVramTileChecksum()
+function computeVramChecksum(vram, wordAddr, wordsPerTile) {
+  let sum = 0;
+  for (let i = 0; i < wordsPerTile; i++) {
+    const byteIdx = (wordAddr + i) * 2;
+    sum = (sum + ((vram[byteIdx] | (vram[byteIdx + 1] << 8)) >>> 0)) >>> 0;
+  }
+  return sum >>> 0;
+}
+
 async function hdSaveSet(containerName, type, setId, data) {
   const db = await getHDDB();
   const key = `${containerName}/${type}/${setId}`;
@@ -6662,6 +6672,45 @@ async function saveCurrentHDToContainer(containerName) {
     clusters.push({ ids: hc.ids, flips: hc.flips || [], w: hc.w, h: hc.h, blob: await bitmapToBlob(hc.image) });
   }
 
+  // Compute VRAM checksums for content verification (Bug #4: VRAM collision fix).
+  // Stores {layer, vramAddr, checksum} for every unique tile that will be exported.
+  // Only possible when live VRAM is available (currentBgData.vram set during an active session).
+  let tileChecksums = null;
+  if (currentBgData && currentBgData.vram && ppuConfig) {
+    const vram = currentBgData.vram;
+    const is4bpp = (ppuConfig.bgMode === 1);
+    const wordsPerTile = is4bpp ? 16 : 8;
+    tileChecksums = [];
+
+    // BG1: iterate tileArrangement sub-tile entries
+    if (tileArrangementData && ppuConfig.bg1ChrBase !== undefined) {
+      const chrBase = ppuConfig.bg1ChrBase;
+      const seen = new Set();
+      for (let i = 0; i * 2 + 1 < tileArrangementData.length; i++) {
+        const tileInfo = tileArrangementData[i * 2] | (tileArrangementData[i * 2 + 1] << 8);
+        const gfxIndex = tileInfo & 0x03FF;
+        const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
+        if (seen.has(vramWordAddr)) continue;
+        seen.add(vramWordAddr);
+        tileChecksums.push({ layer: 0, vramAddr: vramWordAddr, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+      }
+    }
+
+    // BG2: iterate saved tilemap
+    if (bg2TilemapData && bg2TilemapData.length > 1 && ppuConfig.bg2ChrBase !== undefined) {
+      const chrBase = ppuConfig.bg2ChrBase;
+      const seen = new Set();
+      for (let i = 0; i + 1 < bg2TilemapData.length; i += 2) {
+        const entry = bg2TilemapData[i] | (bg2TilemapData[i + 1] << 8);
+        const tileNum = entry & 0x3FF;
+        const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+        if (seen.has(vramWordAddr)) continue;
+        seen.add(vramWordAddr);
+        tileChecksums.push({ layer: 1, vramAddr: vramWordAddr, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+      }
+    }
+  }
+
   await hdSaveSet(containerName, 'level', setId, {
     scaleFactor: hdPack.scaleFactor,
     tileCount: tiles.length,
@@ -6671,6 +6720,7 @@ async function saveCurrentHDToContainer(containerName) {
     gfxCount,
     ppuConfig,
     bg2TilemapData,
+    tileChecksums,
     gfxSetIndex: currentStyle?.graphics || null,
     savedAt: Date.now()
   });
@@ -7059,6 +7109,31 @@ async function exportAsTexturePack(containerName) {
         bg2Folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
         bg2ExportedTiles++;
       }
+    }
+  }
+
+  // Write checksums.bin (VRAM content verification — prevents wrong tiles when levels share VRAM addresses)
+  // Binary format: [uint32 count] followed by count × [uint16 vramAddr, uint8 layer, uint8 reserved, uint32 checksum]
+  {
+    const csMap = new Map();  // key: "layer_vramAddr" → checksum entry (dedup)
+    for (const set of [...setsWithArrangement, ...setsWithBg2]) {
+      if (!set.tileChecksums || !Array.isArray(set.tileChecksums)) continue;
+      for (const cs of set.tileChecksums) {
+        csMap.set(`${cs.layer}_${cs.vramAddr}`, cs);
+      }
+    }
+    if (csMap.size > 0) {
+      const entries = Array.from(csMap.values());
+      const buf = new ArrayBuffer(4 + entries.length * 8);
+      const view = new DataView(buf);
+      view.setUint32(0, entries.length, true);
+      entries.forEach((cs, i) => {
+        view.setUint16(4 + i * 8, cs.vramAddr, true);
+        view.setUint8(4 + i * 8 + 2, cs.layer);
+        view.setUint8(4 + i * 8 + 3, 0);
+        view.setUint32(4 + i * 8 + 4, cs.checksum, true);
+      });
+      root.file('checksums.bin', new Uint8Array(buf));
     }
   }
 
