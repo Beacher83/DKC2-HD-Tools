@@ -7007,8 +7007,10 @@ async function exportAsTexturePack(containerName) {
     const tilesW   = ppuCfg.bg2TilesW  || 32;
     const tilesH   = ppuCfg.bg2TilesH  || 32;
 
-    // Load composed BG2 image (native res: 1px per SNES pixel)
+    // Load composed BG2 image — may be native (8px/tile) or HD-upscaled (e.g. 32px/tile at 4×)
     const bg2Bitmap = await createImageBitmap(set.bg2Blob);
+    // Dynamic tile size: bg2Blob can be native (tilesW*8 px) or upscaled (tilesW*32 px etc.)
+    const srcTileSize = Math.round(bg2Bitmap.width / tilesW);
 
     // Read tilemap as 16-bit little-endian words from the stored byte array
     const tilemapWords = [];
@@ -7032,9 +7034,10 @@ async function exportAsTexturePack(containerName) {
         if (bg2ExportedKeys.has(fileKey)) continue;
         bg2ExportedKeys.add(fileKey);
 
-        // Extract 8x8 region from composed bg2.png (already rendered with flips applied)
-        // Un-flip to store the canonical un-flipped version that Mesen2 will re-flip at runtime
-        const srcX = tileX * 8, srcY = tileY * 8;
+        // Extract tile region from bg2.png and scale to 32×32 output.
+        // Works for both native (8px/tile) and HD-upscaled (32px/tile) sources.
+        // Un-flip to store the canonical un-flipped version that Mesen2 re-flips at runtime.
+        const srcX = tileX * srcTileSize, srcY = tileY * srcTileSize;
         const outCanvas = document.createElement('canvas');
         outCanvas.width = 32; outCanvas.height = 32;
         const ctx = outCanvas.getContext('2d');
@@ -7045,7 +7048,7 @@ async function exportAsTexturePack(containerName) {
           if (flipH) { ctx.scale(-1, 1); ctx.translate(-32, 0); }
           if (flipV) { ctx.scale(1, -1); ctx.translate(0, -32); }
         }
-        ctx.drawImage(bg2Bitmap, srcX, srcY, 8, 8, 0, 0, 32, 32);
+        ctx.drawImage(bg2Bitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
         if (flipH || flipV) ctx.restore();
 
         const dataUrl = outCanvas.toDataURL('image/png');
