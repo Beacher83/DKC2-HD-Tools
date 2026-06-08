@@ -4193,7 +4193,7 @@ function buildCatalogByGfxSet(gfxSetIndex) {
   }
   
   console.log(`GfxSet catalog 0x${gfxSetIndex.toString(16)}: ${bg1Tiles.length} unique BG1 tiles, ${setInfo.levels.length} levels`);
-  
+
   // Build cluster analysis
   let clusters = [];
   try {
@@ -4201,8 +4201,42 @@ function buildCatalogByGfxSet(gfxSetIndex) {
   } catch (e) {
     console.error('Cluster detection error:', e);
   }
-  
-  return { bg1Tiles, bg2Image: null, bg3Image: null, gfxSetIndex, setInfo, clusters };
+
+  // Load BG2 tilemap and PPU config for texture pack export.
+  // buildCatalogByGfxSet has rom + style, so we can call loadLevelBackground here
+  // even when currentBgData is null (e.g. user is in gfxset catalog without a loaded level).
+  let catalogPpuConfig = null;
+  let catalogBg2TilemapData = null;
+  try {
+    const bgData = loadLevelBackground(rom, style, palette);
+    if (bgData && bgData.vram && bgData.ppu) {
+      const ppu = bgData.ppu;
+      const bg2TilesW = ppu.bg2 && ppu.bg2.wide ? 64 : 32;
+      const bg2TilesH = ppu.bg2 && ppu.bg2.tall ? 64 : 32;
+      catalogPpuConfig = {
+        bgMode: ppu.bgMode,
+        bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,
+        bg2ChrBase: ppu.bg2 ? ppu.bg2.chrBase : 0,
+        bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
+        bg2TilesW,
+        bg2TilesH,
+      };
+      if (ppu.bg2 && ppu.bg2.enabled) {
+        const tmByteOffset = ppu.bg2.tilemapBase * 2;
+        const tmByteLength = bg2TilesW * bg2TilesH * 2;
+        if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= bgData.vram.length) {
+          catalogBg2TilemapData = [];
+          for (let i = 0; i < tmByteLength; i++) catalogBg2TilemapData.push(bgData.vram[tmByteOffset + i] || 0);
+          console.log(`  BG2 tilemap cached: ${tmByteLength} bytes at 0x${tmByteOffset.toString(16)}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('  BG2 tilemap load failed for gfxset:', e.message);
+  }
+
+  return { bg1Tiles, bg2Image: null, bg3Image: null, gfxSetIndex, setInfo, clusters,
+           ppuConfig: catalogPpuConfig, bg2TilemapData: catalogBg2TilemapData };
 }
 
 // ============================================================
@@ -6601,9 +6635,13 @@ async function saveCurrentHDToContainer(containerName) {
       bg2TilesW,
       bg2TilesH,
     };
+  } else if (catalogData && catalogData.ppuConfig) {
+    // Fallback: use PPU config cached by buildCatalogByGfxSet (available in gfxset catalog mode)
+    ppuConfig = catalogData.ppuConfig;
   }
 
-  // Extract raw BG2 tilemap from VRAM so exportAsTexturePack can identify unique tiles
+  // Extract raw BG2 tilemap from VRAM so exportAsTexturePack can identify unique tiles.
+  // Prefer currentBgData (level mode); fall back to catalogData (gfxset catalog mode).
   let bg2TilemapData = null;
   if (currentBgData && currentBgData.vram && currentBgData.ppu &&
       currentBgData.ppu.bg2 && currentBgData.ppu.bg2.enabled && ppuConfig) {
@@ -6615,6 +6653,8 @@ async function saveCurrentHDToContainer(containerName) {
       bg2TilemapData = [];
       for (let i = 0; i < tmByteLength; i++) bg2TilemapData.push(vram[tmByteOffset + i] || 0);
     }
+  } else if (catalogData && catalogData.bg2TilemapData) {
+    bg2TilemapData = catalogData.bg2TilemapData;
   }
 
   const clusters = [];
