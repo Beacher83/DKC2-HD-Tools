@@ -6557,6 +6557,7 @@ async function hdGetContainerSets(containerName) {
 // --- Asset Save/Load ---
 
 // Sum 16 VRAM words (32 bytes = one 4bpp tile) — matches C++ ComputeVramTileChecksum()
+// DEPRECATED: kept for backward compat with old containers; new exports use fnv1a_64 hashes.
 function computeVramChecksum(vram, wordAddr, wordsPerTile) {
   let sum = 0;
   for (let i = 0; i < wordsPerTile; i++) {
@@ -6564,6 +6565,21 @@ function computeVramChecksum(vram, wordAddr, wordsPerTile) {
     sum = (sum + ((vram[byteIdx] | (vram[byteIdx + 1] << 8)) >>> 0)) >>> 0;
   }
   return sum >>> 0;
+}
+
+// FNV-1a 64-bit content hash (BigInt).
+// Must produce identical results to C++ ComputeTileContentHash() in Mesen2's SnesHdData.h.
+// Hashes the raw tile bytes (32 bytes for 4bpp, 16 bytes for 2bpp) to create a
+// content-based tile identity that is independent of VRAM address.
+function fnv1a_64(bytes, offset, length) {
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xFFFFFFFFFFFFFFFFn;
+  for (let i = 0; i < length; i++) {
+    hash ^= BigInt(bytes[offset + i]);
+    hash = (hash * prime) & mask;
+  }
+  return hash;
 }
 
 async function hdSaveSet(containerName, type, setId, data) {
@@ -6633,6 +6649,18 @@ async function saveCurrentHDToContainer(containerName) {
     tileArrangementData = new Uint8Array(ta.data.buffer, 0, currentTileRawData.tileCount * 32);
     gfxCount = currentTileRawData.gfxCount || 0;
   }
+
+  // Store raw BG1 CHR bytes for content-hash computation at export time.
+  // gfxData is a GrowBuffer holding sequential 4bpp tile data (32 bytes per tile).
+  let chrRawData = null;
+  if (currentTileRawData && currentTileRawData.gfxData) {
+    const gd = currentTileRawData.gfxData;
+    const byteLen = (currentTileRawData.gfxCount || 0) * 32;
+    if (byteLen > 0 && gd.data && gd.data.length >= byteLen) {
+      chrRawData = Array.from(gd.data.slice(0, byteLen));
+    }
+  }
+
   if (currentBgData && currentBgData.ppu) {
     const ppu = currentBgData.ppu;
     const bg2TilesW = ppu.bg2 && ppu.bg2.wide ? 64 : 32;
@@ -6665,6 +6693,14 @@ async function saveCurrentHDToContainer(containerName) {
     }
   } else if (catalogData && catalogData.bg2TilemapData) {
     bg2TilemapData = catalogData.bg2TilemapData;
+  }
+
+  // Store full VRAM snapshot for BG2 content-hash computation at export time.
+  // Required because BG2 CHR data lives in VRAM (no separate gfxData buffer for BG2).
+  // Only available in level mode when currentBgData.vram is set.
+  let vramSnapshot = null;
+  if (currentBgData && currentBgData.vram) {
+    vramSnapshot = new Uint8Array(currentBgData.vram);  // 128KB copy
   }
 
   const clusters = [];
@@ -6722,6 +6758,8 @@ async function saveCurrentHDToContainer(containerName) {
     ppuConfig,
     bg2TilemapData,
     tileChecksums,
+    chrRawData,        // BG1 CHR bytes for content-hash (new)
+    vramSnapshot,      // Full VRAM for BG2 content-hash (new)
     gfxSetIndex: currentStyle?.graphics || null,
     savedAt: Date.now()
   });
@@ -6873,6 +6911,16 @@ async function exportContainerAsZip(containerName) {
       }
       if (set.bg2TilemapData && set.bg2TilemapData.length > 0) {
         folder.file('bg2_tilemap.bin', new Uint8Array(set.bg2TilemapData));
+        summary.totalFiles++;
+      }
+      if (set.chrRawData && set.chrRawData.length > 0) {
+        folder.file('chr_raw_data.bin', new Uint8Array(set.chrRawData));
+        summary.totalFiles++;
+      }
+      if (set.vramSnapshot) {
+        const snap = set.vramSnapshot instanceof Uint8Array
+          ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        folder.file('vram_snapshot.bin', snap);
         summary.totalFiles++;
       }
     } else if (set.type === 'sprite' || set.type === 'mapicon') {
@@ -7122,36 +7170,115 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
-  // Write checksums.bin (VRAM content verification)
-  // Binary format: [uint32 count] × [uint16 vramAddr, uint8 layerIndex, uint8 gfxsetIndex, uint32 checksum]
-  // gfxsetIndex (byte 3) identifies which gfxset this checksum belongs to — allows multiple
-  // gfxsets at the same VRAM address to coexist, Mesen picks the one whose VRAM content matches.
+  // Write hashes.bin (content-based tile identification via FNV-1a 64-bit hash)
+  // Binary format: [uint32 count] × [uint16 vramAddr, uint8 layerIndex, uint8 gfxsetIndex, uint64 contentHash]
+  // Entry size: 12 bytes.  Each entry maps a VRAM address (used in PNG filenames) to its
+  // content hash.  The emulator uses the content hash as the runtime tile key — different
+  // gfxsets loading different tiles to the same VRAM address get distinct hashes.
+  // Falls back to legacy checksums.bin for old containers missing chrRawData/vramSnapshot.
+  let usesContentHash = false;
   {
-    const csMap = new Map();  // key: "gfxset_layer_vramAddr" → checksum entry (dedup)
+    const hashEntries = [];  // { vramAddr, layer, gfxset, hash: BigInt }
+    const dedupKey = new Set();
+
     for (const set of [...setsWithArrangement, ...setsWithBg2]) {
-      if (!set.tileChecksums || !Array.isArray(set.tileChecksums)) continue;
-      for (const cs of set.tileChecksums) {
-        csMap.set(`${cs.gfxset}_${cs.layer}_${cs.vramAddr}`, cs);
+      const ppuCfg = set.ppuConfig;
+      if (!ppuCfg) continue;
+      const gfxset = set.gfxSetIndex ?? 0;
+      const is4bpp = (ppuCfg.bgMode === 1);
+      const wordsPerTile = is4bpp ? 16 : 8;
+      const bytesPerTile = wordsPerTile * 2;  // 32 for 4bpp, 16 for 2bpp
+
+      // BG1 hashes from stored chrRawData
+      if (set.chrRawData && set.chrRawData.length > 0 && set.tileArrangementData) {
+        const chrData = new Uint8Array(set.chrRawData);
+        const tileArr = new Uint8Array(set.tileArrangementData);
+        const chrBase = ppuCfg.bg1ChrBase || 0;
+
+        for (let i = 0; i * 2 + 1 < tileArr.length; i++) {
+          const tileInfo = tileArr[i * 2] | (tileArr[i * 2 + 1] << 8);
+          const gfxIndex = tileInfo & 0x03FF;
+          const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
+          const dk = `${gfxset}_0_${vramWordAddr}`;
+          if (dedupKey.has(dk)) continue;
+          dedupKey.add(dk);
+
+          const byteOff = gfxIndex * bytesPerTile;
+          if (byteOff + bytesPerTile <= chrData.length) {
+            const hash = fnv1a_64(chrData, byteOff, bytesPerTile);
+            hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
+          }
+        }
+      }
+
+      // BG2 hashes from stored vramSnapshot
+      if (set.vramSnapshot && set.bg2TilemapData && set.bg2TilemapData.length > 1) {
+        const vram = set.vramSnapshot instanceof Uint8Array
+          ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        const chrBase = ppuCfg.bg2ChrBase || 0;
+        const td = set.bg2TilemapData;
+
+        for (let i = 0; i + 1 < td.length; i += 2) {
+          const entry = td[i] | (td[i + 1] << 8);
+          const tileNum = entry & 0x3FF;
+          const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+          const dk = `${gfxset}_1_${vramWordAddr}`;
+          if (dedupKey.has(dk)) continue;
+          dedupKey.add(dk);
+
+          const byteOff = vramWordAddr * 2;
+          if (byteOff + bytesPerTile <= vram.length) {
+            const hash = fnv1a_64(vram, byteOff, bytesPerTile);
+            hashEntries.push({ vramAddr: vramWordAddr, layer: 1, gfxset, hash });
+          }
+        }
       }
     }
-    if (csMap.size > 0) {
-      const entries = Array.from(csMap.values());
-      const buf = new ArrayBuffer(4 + entries.length * 8);
+
+    if (hashEntries.length > 0) {
+      // hashes.bin: [uint32 count] × [uint16 vramAddr, uint8 layer, uint8 gfxset, uint64 hash]
+      const buf = new ArrayBuffer(4 + hashEntries.length * 12);
       const view = new DataView(buf);
-      view.setUint32(0, entries.length, true);
-      entries.forEach((cs, i) => {
-        view.setUint16(4 + i * 8, cs.vramAddr, true);
-        view.setUint8(4 + i * 8 + 2, cs.layer);
-        view.setUint8(4 + i * 8 + 3, cs.gfxset ?? 0);
-        view.setUint32(4 + i * 8 + 4, cs.checksum, true);
+      view.setUint32(0, hashEntries.length, true);
+      hashEntries.forEach((e, i) => {
+        const off = 4 + i * 12;
+        view.setUint16(off, e.vramAddr, true);
+        view.setUint8(off + 2, e.layer);
+        view.setUint8(off + 3, e.gfxset);
+        // Write uint64 little-endian as two uint32 halves
+        view.setUint32(off + 4, Number(e.hash & 0xFFFFFFFFn), true);
+        view.setUint32(off + 8, Number((e.hash >> 32n) & 0xFFFFFFFFn), true);
       });
-      root.file('checksums.bin', new Uint8Array(buf));
+      root.file('hashes.bin', new Uint8Array(buf));
+      usesContentHash = true;
+    } else {
+      // Fallback: legacy checksums.bin for old containers without chrRawData/vramSnapshot
+      const csMap = new Map();
+      for (const set of [...setsWithArrangement, ...setsWithBg2]) {
+        if (!set.tileChecksums || !Array.isArray(set.tileChecksums)) continue;
+        for (const cs of set.tileChecksums) {
+          csMap.set(`${cs.gfxset}_${cs.layer}_${cs.vramAddr}`, cs);
+        }
+      }
+      if (csMap.size > 0) {
+        const entries = Array.from(csMap.values());
+        const buf = new ArrayBuffer(4 + entries.length * 8);
+        const view = new DataView(buf);
+        view.setUint32(0, entries.length, true);
+        entries.forEach((cs, i) => {
+          view.setUint16(4 + i * 8, cs.vramAddr, true);
+          view.setUint8(4 + i * 8 + 2, cs.layer);
+          view.setUint8(4 + i * 8 + 3, cs.gfxset ?? 0);
+          view.setUint32(4 + i * 8 + 4, cs.checksum, true);
+        });
+        root.file('checksums.bin', new Uint8Array(buf));
+      }
     }
   }
 
   // Write manifest
   root.file('manifest.json', JSON.stringify({
-    format_version: 1,
+    format_version: 2,
     game: {
       rom_header_title: 'Donkey Kong Country 2',
       rom_sha256: ''
@@ -7159,7 +7286,7 @@ async function exportAsTexturePack(containerName) {
     scale: scale,
     tile_size_px: 8,
     hd_tile_size_px: subtileSize,
-    lookup_mode: 'tile_address_palette',
+    lookup_mode: usesContentHash ? 'content_hash' : 'tile_address_palette',
     flip_handling: 'runtime',
     total_bg1_tiles: exportedTiles,
     total_bg2_tiles: bg2ExportedTiles,
@@ -7257,10 +7384,23 @@ async function importContainerFromZip(file) {
         bg2TilemapData = Array.from(new Uint8Array(buf));
       }
 
+      let chrRawData = null, vramSnapshot = null;
+      const chrRawFile = zip.file(`${setPath}chr_raw_data.bin`);
+      if (chrRawFile) {
+        const buf = await chrRawFile.async('arraybuffer');
+        chrRawData = Array.from(new Uint8Array(buf));
+      }
+      const vramSnapFile = zip.file(`${setPath}vram_snapshot.bin`);
+      if (vramSnapFile) {
+        const buf = await vramSnapFile.async('arraybuffer');
+        vramSnapshot = new Uint8Array(buf);
+      }
+
       await hdSaveSet(containerName, 'level', setInfo.setId, {
         scaleFactor: setManifest.scaleFactor || 1,
         tileCount: tiles.length, tiles, bg2Blob, bg3Blob,
         ppuConfig, tileArrangementData, bg2TilemapData,
+        chrRawData, vramSnapshot,
         tileArrangementTileCount: setManifest.tileArrangementTileCount || 0,
         gfxCount: setManifest.gfxCount || 0,
         savedAt: Date.now()
@@ -7332,6 +7472,7 @@ async function refreshContainerList() {
         </div>
         <div style="display:flex;gap:4px;">
           <button onclick="loadContainerToHDPack('${esc}').then(()=>refreshContainerList())" style="padding:3px 10px;background:#2196f3;color:#fff;border:1px solid #2196f3;border-radius:3px;cursor:pointer;font-size:11px;">Laden</button>
+          <button onclick="refreshContainerSetMetadata('${esc}').then(n=>{document.getElementById('containerStatusMsg').textContent=n?'Set aktualisiert (chrRawData + VRAM gespeichert).':'Aktualisierung fehlgeschlagen.';refreshContainerList();})" style="padding:3px 10px;background:#9c27b0;color:#fff;border:1px solid #9c27b0;border-radius:3px;cursor:pointer;font-size:11px;" title="Metadaten des aktuell geladenen GFX-Sets aktualisieren (chrRawData, VRAM-Snapshot für Content-Hashes). Tile-Grafiken bleiben erhalten.">Aktualisieren</button>
           <button onclick="exportContainerAsZip('${esc}')" style="padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;border-radius:3px;cursor:pointer;font-size:11px;">Export ZIP</button>
           <button onclick="exportAsTexturePack('${esc}')" style="padding:3px 10px;background:#ff9800;color:#fff;border:1px solid #ff9800;border-radius:3px;cursor:pointer;font-size:11px;" title="Export als Mesen2 HD Pack (HdPacks/Donkey Kong Country 2/bg/bg1/ — VRAM-basierte 8x8 Sub-Tiles, 32×32px)">Texture Pack</button>
           <button onclick="confirmDeleteContainer('${esc}')" style="padding:3px 10px;background:#f44336;color:#fff;border:1px solid #f44336;border-radius:3px;cursor:pointer;font-size:11px;">Löschen</button>
@@ -7352,6 +7493,145 @@ async function confirmDeleteContainer(name) {
   if (activeContainerName === name) activeContainerName = null;
   document.getElementById('containerStatusMsg').textContent = `Container "${name}" gelöscht.`;
   await refreshContainerList();
+}
+
+// --- Refresh container set metadata ---
+// Updates existing container sets with fresh chrRawData, vramSnapshot, ppuConfig, etc.
+// from the currently loaded ROM/gfxset — WITHOUT re-uploading tile bitmaps.
+// The user must have the matching gfxset/level open for this to work.
+// Returns the number of sets updated.
+async function refreshContainerSetMetadata(containerName) {
+  // Determine which set to update based on current context
+  const setId = catalogView
+    ? `gfxset_${(currentStyle?.graphics || 0).toString(16).toUpperCase().padStart(2, '0')}`
+    : `level_${currentLevelId || 0}`;
+
+  const sets = await hdGetContainerSets(containerName);
+  const existing = sets.find(s => s.setId === setId && s.type === 'level');
+  if (!existing) {
+    const available = sets.filter(s => s.type === 'level').map(s => s.setId).join(', ');
+    alert(`Kein Set "${setId}" im Container "${containerName}" gefunden.\n\nVerfügbare Sets: ${available || '(keine)'}\n\nBitte das passende GFX-Set im Katalog öffnen.`);
+    return 0;
+  }
+
+  if (!currentTileRawData && !currentBgData) {
+    alert('Keine ROM-/Level-Daten verfügbar.\nBitte zuerst das passende GFX-Set im Katalog öffnen.');
+    return 0;
+  }
+
+  // --- Compute fresh metadata from current ROM data ---
+
+  let tileArrangementData = existing.tileArrangementData;
+  let gfxCount = existing.gfxCount || 0;
+  let tileArrangementTileCount = existing.tileArrangementTileCount || 0;
+  if (currentTileRawData && currentTileRawData.tileArrangement) {
+    const ta = currentTileRawData.tileArrangement;
+    tileArrangementData = Array.from(new Uint8Array(ta.data.buffer, 0, currentTileRawData.tileCount * 32));
+    gfxCount = currentTileRawData.gfxCount || 0;
+    tileArrangementTileCount = currentTileRawData.tileCount;
+  }
+
+  let chrRawData = null;
+  if (currentTileRawData && currentTileRawData.gfxData) {
+    const gd = currentTileRawData.gfxData;
+    const byteLen = (currentTileRawData.gfxCount || 0) * 32;
+    if (byteLen > 0 && gd.data && gd.data.length >= byteLen) {
+      chrRawData = Array.from(gd.data.slice(0, byteLen));
+    }
+  }
+
+  let ppuConfig = existing.ppuConfig;
+  if (currentBgData && currentBgData.ppu) {
+    const ppu = currentBgData.ppu;
+    ppuConfig = {
+      bgMode: ppu.bgMode,
+      bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,
+      bg2ChrBase: ppu.bg2 ? ppu.bg2.chrBase : 0,
+      bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
+      bg2TilesW: ppu.bg2 && ppu.bg2.wide ? 64 : 32,
+      bg2TilesH: ppu.bg2 && ppu.bg2.tall ? 64 : 32,
+    };
+  } else if (!ppuConfig && catalogData && catalogData.ppuConfig) {
+    ppuConfig = catalogData.ppuConfig;
+  }
+
+  let bg2TilemapData = existing.bg2TilemapData;
+  if (currentBgData && currentBgData.vram && currentBgData.ppu &&
+      currentBgData.ppu.bg2 && currentBgData.ppu.bg2.enabled && ppuConfig) {
+    const ppu = currentBgData.ppu;
+    const vram = currentBgData.vram;
+    const tmByteOffset = ppu.bg2.tilemapBase * 2;
+    const tmByteLength = ppuConfig.bg2TilesW * ppuConfig.bg2TilesH * 2;
+    if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
+      bg2TilemapData = [];
+      for (let i = 0; i < tmByteLength; i++) bg2TilemapData.push(vram[tmByteOffset + i] || 0);
+    }
+  } else if (!bg2TilemapData && catalogData && catalogData.bg2TilemapData) {
+    bg2TilemapData = catalogData.bg2TilemapData;
+  }
+
+  let vramSnapshot = null;
+  if (currentBgData && currentBgData.vram) {
+    vramSnapshot = new Uint8Array(currentBgData.vram);
+  }
+
+  // Recompute tileChecksums (deprecated but kept for legacy fallback)
+  let tileChecksums = existing.tileChecksums;
+  if (currentBgData && currentBgData.vram && ppuConfig) {
+    const vram = currentBgData.vram;
+    const is4bpp = (ppuConfig.bgMode === 1);
+    const wordsPerTile = is4bpp ? 16 : 8;
+    const gfxset = currentStyle?.graphics ?? 0;
+    tileChecksums = [];
+    if (tileArrangementData && ppuConfig.bg1ChrBase !== undefined) {
+      const chrBase = ppuConfig.bg1ChrBase;
+      const seen = new Set();
+      const tileArr = new Uint8Array(tileArrangementData);
+      for (let i = 0; i * 2 + 1 < tileArr.length; i++) {
+        const tileInfo = tileArr[i * 2] | (tileArr[i * 2 + 1] << 8);
+        const gfxIndex = tileInfo & 0x03FF;
+        const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
+        if (seen.has(vramWordAddr)) continue;
+        seen.add(vramWordAddr);
+        tileChecksums.push({ layer: 0, vramAddr: vramWordAddr, gfxset, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+      }
+    }
+    if (bg2TilemapData && bg2TilemapData.length > 1 && ppuConfig.bg2ChrBase !== undefined) {
+      const chrBase = ppuConfig.bg2ChrBase;
+      const seen = new Set();
+      for (let i = 0; i + 1 < bg2TilemapData.length; i += 2) {
+        const entry = bg2TilemapData[i] | (bg2TilemapData[i + 1] << 8);
+        const tileNum = entry & 0x3FF;
+        const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+        if (seen.has(vramWordAddr)) continue;
+        seen.add(vramWordAddr);
+        tileChecksums.push({ layer: 1, vramAddr: vramWordAddr, gfxset, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+      }
+    }
+  }
+
+  // Re-save: keep existing tile bitmaps, update all metadata
+  await hdSaveSet(containerName, 'level', setId, {
+    scaleFactor: existing.scaleFactor,
+    tileCount: existing.tileCount || (existing.tiles || []).length,
+    tiles: existing.tiles || [],
+    clusters: existing.clusters || [],
+    bg2Blob: existing.bg2Blob || null,
+    bg3Blob: existing.bg3Blob || null,
+    gfxSetIndex: existing.gfxSetIndex,
+    tileArrangementData,
+    tileArrangementTileCount,
+    gfxCount,
+    ppuConfig,
+    bg2TilemapData,
+    tileChecksums,
+    chrRawData,
+    vramSnapshot,
+    savedAt: Date.now()
+  });
+
+  console.log(`[Refresh] Set "${setId}" in Container "${containerName}" aktualisiert. chrRawData: ${chrRawData ? chrRawData.length + ' bytes' : 'n/a'}, vramSnapshot: ${vramSnapshot ? vramSnapshot.length + ' bytes' : 'n/a'}`);
+  return 1;
 }
 
 // --- Container Select Dialog (for import) ---
