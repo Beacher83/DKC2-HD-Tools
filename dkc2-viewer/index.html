@@ -7397,13 +7397,17 @@ async function exportAsTexturePack(containerName) {
     const hashEntries = [];  // { vramAddr, layer, gfxset, hash: BigInt }
     const dedupKey = new Set();
 
-    for (const set of [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3]) {
+    const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3];
+    console.log(`[hashes] Processing ${allHashSets.length} set(s) for hashes.bin`);
+    for (const set of allHashSets) {
       const ppuCfg = set.ppuConfig;
-      if (!ppuCfg) continue;
+      if (!ppuCfg) { console.warn(`[hashes] gfxset ${set.gfxSetIndex}: SKIPPED (no ppuConfig)`); continue; }
       const gfxset = set.gfxSetIndex ?? 0;
       const is4bpp = (ppuCfg.bgMode === 1);
       const wordsPerTile = is4bpp ? 16 : 8;
       const bytesPerTile = wordsPerTile * 2;  // 32 for 4bpp, 16 for 2bpp
+
+      console.log(`[hashes] gfxset ${gfxset}: vramSnapshot=${set.vramSnapshot ? (set.vramSnapshot.byteLength || set.vramSnapshot.length) + 'B' : 'MISSING'}, tileArr=${set.tileArrangementData ? 'yes' : 'MISSING'}, bg2Tmap=${set.bg2TilemapData ? 'yes' : 'no'}, bg3Tmap=${set.bg3TilemapData ? 'yes' : 'no'}, ppuCfg=${JSON.stringify(ppuCfg)}`);
 
       // BG1 hashes from vramSnapshot (same approach as BG2)
       // IMPORTANT: Must use vramSnapshot, NOT chrRawData! chrRawData is the ROM
@@ -7429,6 +7433,10 @@ async function exportAsTexturePack(containerName) {
             hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
           }
         }
+        const bg1Count = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 0).length;
+        console.log(`[hashes] gfxset ${gfxset}: BG1 → ${bg1Count} hash entries (chrBase=0x${chrBase.toString(16)})`);
+      } else {
+        console.warn(`[hashes] gfxset ${gfxset}: BG1 SKIPPED — vramSnapshot: ${!!set.vramSnapshot}, tileArr: ${!!set.tileArrangementData}`);
       }
 
       // BG2 hashes from stored vramSnapshot
@@ -7480,6 +7488,16 @@ async function exportAsTexturePack(containerName) {
         }
       }
     }
+
+    // Summary of hash entries per gfxset
+    const hashByGfx = {};
+    for (const e of hashEntries) {
+      const k = `gfxset_${e.gfxset}`;
+      if (!hashByGfx[k]) hashByGfx[k] = { BG1: 0, BG2: 0, BG3: 0 };
+      const layerName = ['BG1','BG2','BG3'][e.layer] || `L${e.layer}`;
+      hashByGfx[k][layerName]++;
+    }
+    console.log(`[hashes] TOTAL: ${hashEntries.length} entries`, hashByGfx);
 
     if (hashEntries.length > 0) {
       // hashes.bin: [uint32 count] × [uint16 vramAddr, uint8 layer, uint8 gfxset, uint64 hash]
