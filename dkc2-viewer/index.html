@@ -395,6 +395,7 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
     <div style="display:flex;gap:8px;margin-bottom:12px;">
       <button id="containerImportZipBtn" style="padding:6px 14px;background:#2196f3;color:#fff;border:1px solid #2196f3;border-radius:4px;cursor:pointer;">Container ZIP importieren</button>
       <input type="file" id="containerZipInput" accept=".zip" style="display:none;">
+      <input type="file" id="vramDumpInput" accept=".bin,.dmp" style="display:none;">
     </div>
     <div id="containerStatusMsg" style="color:#ff9800;font-size:12px;min-height:18px;"></div>
   </div>
@@ -7885,7 +7886,16 @@ async function refreshContainerList() {
         </div>
       </div>
       <div style="margin-top:6px;font-size:11px;color:#777;">
-        ${levelSets.map(s => `<span style="background:#333;padding:1px 6px;border-radius:3px;margin:1px 2px;display:inline-block;">${s.setId}</span>`).join('')}
+        ${levelSets.map(s => {
+          const hasVram = s.vramSnapshot && (s.vramSnapshot.byteLength || s.vramSnapshot.length) > 0;
+          const vramIcon = hasVram ? '&#9679;' : '&#9675;';  // filled vs empty circle
+          const vramColor = hasVram ? '#4caf50' : '#f44336';
+          const vramTitle = hasVram
+            ? 'VRAM Snapshot vorhanden (' + (s.vramSnapshot.byteLength || s.vramSnapshot.length) + ' bytes). Klick = ersetzen.'
+            : 'Kein VRAM Snapshot — Klick zum Importieren eines Mesen VRAM-Dumps.';
+          const escSet = escHtmlAttr(s.setId);
+          return `<span style="background:#333;padding:1px 6px;border-radius:3px;margin:1px 2px;display:inline-block;">${s.setId} <button onclick="importVramForSet('${esc}','${s.type}','${escSet}')" style="background:none;border:none;color:${vramColor};cursor:pointer;font-size:12px;padding:0 2px;vertical-align:middle;" title="${vramTitle}">${vramIcon}</button></span>`;
+        }).join('')}
         ${spriteSets.length > 0 ? `<span style="color:#666;"> + ${spriteSets.length} Sprites</span>` : ''}
       </div>
     </div>`;
@@ -7900,6 +7910,71 @@ async function confirmDeleteContainer(name) {
   document.getElementById('containerStatusMsg').textContent = `Container "${name}" gelöscht.`;
   await refreshContainerList();
 }
+
+// --- Import Mesen VRAM dump for a specific container set ---
+// Replaces the vramSnapshot in IndexedDB so that export hashes match Mesen's runtime VRAM.
+// Accepts 64KB (Mesen raw dump) or 128KB (viewer format). 64KB is padded to 128KB.
+let _vramImportTarget = null;  // {containerName, type, setId}
+function importVramForSet(containerName, type, setId) {
+  _vramImportTarget = { containerName, type, setId };
+  const input = document.getElementById('vramDumpInput');
+  input.value = '';  // reset so same file can be re-selected
+  input.click();
+}
+document.getElementById('vramDumpInput').addEventListener('change', async (e) => {
+  if (!e.target.files.length || !_vramImportTarget) return;
+  const { containerName, type, setId } = _vramImportTarget;
+  _vramImportTarget = null;
+  const statusEl = document.getElementById('containerStatusMsg');
+
+  try {
+    const file = e.target.files[0];
+    const raw = new Uint8Array(await file.arrayBuffer());
+
+    // Validate size: 64KB (Mesen dump) or 128KB (viewer format)
+    let vramSnapshot;
+    if (raw.length === 0x10000) {
+      // Mesen 64KB VRAM dump → pad to 128KB (viewer uses 0x20000 buffer, upper half is zeros)
+      vramSnapshot = new Uint8Array(0x20000);
+      vramSnapshot.set(raw, 0);
+      console.log(`[VRAM Import] 64KB Mesen dump padded to 128KB for set ${setId}`);
+    } else if (raw.length === 0x20000) {
+      vramSnapshot = raw;
+      console.log(`[VRAM Import] 128KB dump used directly for set ${setId}`);
+    } else {
+      statusEl.textContent = `Fehler: Ungültige VRAM-Dump-Größe (${raw.length} bytes). Erwartet: 65536 (64KB) oder 131072 (128KB).`;
+      statusEl.style.color = '#f44336';
+      return;
+    }
+
+    // Read the existing set from IndexedDB
+    const sets = await hdGetContainerSets(containerName);
+    const targetSet = sets.find(s => s.type === type && s.setId === setId);
+    if (!targetSet) {
+      statusEl.textContent = `Fehler: Set "${setId}" nicht in Container "${containerName}" gefunden.`;
+      statusEl.style.color = '#f44336';
+      return;
+    }
+
+    // Replace vramSnapshot, keeping all other data intact
+    const { key, container, type: _t, setId: _s, ...restData } = targetSet;
+    restData.vramSnapshot = vramSnapshot;
+    await hdSaveSet(containerName, type, setId, restData);
+
+    // Log fingerprint of imported VRAM for verification
+    const fp = fnv1a_64(vramSnapshot, 0, Math.min(512, vramSnapshot.length));
+    console.log(`[VRAM Import] Saved to ${containerName}/${type}/${setId}. Fingerprint(first 512B): ${fp.toString(16)}`);
+
+    statusEl.textContent = `VRAM-Dump importiert für ${setId} (${raw.length} bytes → ${vramSnapshot.length} bytes). Jetzt "Texture Pack" exportieren.`;
+    statusEl.style.color = '#4caf50';
+    await refreshContainerList();
+  } catch (err) {
+    statusEl.textContent = `VRAM Import Fehler: ${err.message}`;
+    statusEl.style.color = '#f44336';
+    console.error('[VRAM Import] Error:', err);
+  }
+  e.target.value = '';  // reset for re-selection
+});
 
 // --- Refresh container set metadata ---
 // Updates existing container sets with fresh chrRawData, vramSnapshot, ppuConfig, etc.
