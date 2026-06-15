@@ -6993,6 +6993,61 @@ async function exportContainerAsZip(containerName) {
   return summary;
 }
 
+// --- BG1 Palette Variant Scanner ---
+// Scans ALL levels in a gfxset via the ROM to collect every (vramAddr, palRow)
+// combination used in BG1 Map32 tile arrangements.  The container stores only
+// ONE level's arrangement per gfxset, but other levels with a different mapId
+// may assign different palette rows to the same CHR tiles.
+//
+// Uses the container's chrBase for address computation (assumes all levels in
+// the gfxset share the same BG1 chr base — true for DKC2).
+// TODO: If a level has a different chrBase (different ppuConfig), its tiles map
+// to different vramAddrs.  Handling that would also require hashes.bin expansion.
+//
+// Returns: Map<addrHex, Set<palRow>>  or  null if ROM/graphicsSetsMap unavailable.
+function collectBG1PaletteVariantsFromROM(gfxSetIndex, chrBase, bgMode) {
+  if (!rom || !graphicsSetsMap || !graphicsSetsMap.has(gfxSetIndex)) return null;
+
+  const setInfo = graphicsSetsMap.get(gfxSetIndex);
+  const variants = new Map(); // addrHex → Set<palRow>
+  const is4bpp = (bgMode === 1);
+  const wordsPerTile = is4bpp ? 16 : 8;
+
+  for (const levelInfo of setInfo.levels) {
+    try {
+      // Warn and skip if this level has a different BG1 chrBase
+      try {
+        const levelPpu = readPpuConfig(rom, levelInfo.style.ppuConfig);
+        const levelChrBase = levelPpu.bg1 ? levelPpu.bg1.chrBase : 0;
+        if (levelChrBase !== chrBase) {
+          console.warn(`[palette-variants] level "${levelInfo.name}" has different BG1 chrBase ` +
+            `(0x${levelChrBase.toString(16)} vs container 0x${chrBase.toString(16)}) — skipping`);
+          continue;
+        }
+      } catch (e) { /* can't read ppuConfig — proceed with container chrBase */ }
+
+      const tileParts = loadTileParts(rom, levelInfo.style);
+      const tileArr = tileParts.tileArrangement;
+      const arrLen = tileArr.getPosition();
+
+      for (let i = 0; i * 2 + 1 < arrLen; i++) {
+        const tileInfo = tileArr.data[i * 2] | (tileArr.data[i * 2 + 1] << 8);
+        const gfxIndex = tileInfo & 0x03FF;
+        const palRow = (tileInfo >> 10) & 7;
+        const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
+        const addrHex = vramWordAddr.toString(16).padStart(4, '0');
+
+        if (!variants.has(addrHex)) variants.set(addrHex, new Set());
+        variants.get(addrHex).add(palRow);
+      }
+    } catch (e) {
+      console.warn(`[palette-variants] Skipping level ${levelInfo.name} (id=${levelInfo.id}):`, e.message);
+    }
+  }
+
+  return variants.size > 0 ? variants : null;
+}
+
 // --- Export container as Mesen2 HD Pack ---
 // Converts Map32 HD tiles into per-8x8-subtile PNGs keyed by VRAM address + palette
 // Output format: HdPacks/{romName}/bg/bg1/{vramAddr}_P{pal}.png (32x32px each, 4x scaled)
@@ -7021,6 +7076,7 @@ async function exportAsTexturePack(containerName) {
   const scale = 4;  // 4x: 8x8 -> 32x32
   const subtileSize = 8 * scale;  // 32px per HD sub-tile
   let exportedTiles = 0;
+  let bg1PaletteVariants = 0;  // count of extra tiles added by ROM palette scan
 
   for (const set of setsWithArrangement) {
     const tileArr = new Uint8Array(set.tileArrangementData);
@@ -7036,6 +7092,7 @@ async function exportAsTexturePack(containerName) {
     const gfxIdStr = String(gfxIdx).padStart(2, '0');
     const bgFolder = root.folder(`bg/bg1/gfxset_${gfxIdStr}`);
     const exportedKeys = new Set();  // per-set dedup (not global)
+    const bg1TileBlobs = new Map();  // addrHex → Blob (reused for palette variant expansion)
 
     // Build lookup: tileKey -> ImageBitmap from stored tiles
     // Tile IDs are stored as "{gfxSetIndex}_{partId}" strings (e.g. "7_0", "7_1")
@@ -7109,7 +7166,38 @@ async function exportAsTexturePack(containerName) {
         for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
         const blob = new Blob([arr], { type: 'image/png' });
         bgFolder.file(`${fileKey}.png`, blob);
+        if (!bg1TileBlobs.has(addrHex)) bg1TileBlobs.set(addrHex, blob);
         exportedTiles++;
+      }
+    }
+
+    // --- Palette variant expansion from ROM ---
+    // The container's tileArrangement reflects ONE level.  Other levels in the
+    // same gfxset may use different palette rows for the same CHR tiles (same
+    // vramAddr, different Map32 arrangement due to different mapId).
+    // Scan all levels via ROM and create PNG copies for missing palette variants.
+    // No hashes.bin change needed — palette comes from the PNG filename only.
+    if (rom && graphicsSetsMap) {
+      const variants = collectBG1PaletteVariantsFromROM(gfxIdx, chrBase, ppuCfg.bgMode);
+      if (variants) {
+        let variantCount = 0;
+        for (const [addrHex, palRows] of variants) {
+          const existingBlob = bg1TileBlobs.get(addrHex);
+          if (!existingBlob) continue; // No HD image for this vramAddr — skip
+          for (const palRow of palRows) {
+            const palStr = 'P' + String(palRow).padStart(2, '0');
+            const fileKey = `${addrHex}_${palStr}`;
+            if (exportedKeys.has(fileKey)) continue;
+            exportedKeys.add(fileKey);
+            bgFolder.file(`${fileKey}.png`, existingBlob);
+            exportedTiles++;
+            variantCount++;
+          }
+        }
+        if (variantCount > 0) {
+          bg1PaletteVariants += variantCount;
+          console.log(`[export] gfxset ${gfxIdStr}: added ${variantCount} BG1 palette variant(s) from ROM scan`);
+        }
       }
     }
   }
@@ -7565,7 +7653,9 @@ async function exportAsTexturePack(containerName) {
   const bg3Msg = bg3ExportedTiles > 0 ? `\n${bg3ExportedTiles} unique BG3-Tiles` : '';
   const fpMsg = (typeof fpEntries !== 'undefined' && fpEntries && fpEntries.size > 0)
     ? `\n${fpEntries.size} Gfxset-Fingerprints` : '';
-  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${bg2Msg}${bg3Msg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
+  const palMsg = bg1PaletteVariants > 0
+    ? `\n(davon ${bg1PaletteVariants} Palette-Varianten via ROM-Scan)` : '';
+  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${bg2Msg}${bg3Msg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
   return { exportedTiles, bg2ExportedTiles, bg3ExportedTiles, sets: setsWithArrangement.length };
 
   } catch(err) {
