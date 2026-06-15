@@ -7499,6 +7499,38 @@ async function exportAsTexturePack(containerName) {
     }
     console.log(`[hashes] TOTAL: ${hashEntries.length} entries`, hashByGfx);
 
+    // DIAGNOSTIC: Compare VRAM snapshots between gfxsets to detect wrong/duplicate snapshots
+    {
+      const snapshotsByGfx = new Map();
+      for (const set of allHashSets) {
+        const gs = set.gfxSetIndex ?? 0;
+        if (snapshotsByGfx.has(gs) || !set.vramSnapshot) continue;
+        const vram = set.vramSnapshot instanceof Uint8Array
+          ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        const chrBase = (set.ppuConfig?.bg1ChrBase || 0);
+        const byteOff = chrBase * 2;
+        // Hash first 512 bytes at BG1 CHR base as fingerprint
+        let fp = 0n;
+        for (let b = 0; b < 512 && (byteOff + b) < vram.length; b++) {
+          fp = ((fp ^ BigInt(vram[byteOff + b])) * 0x100000001b3n) & 0xFFFFFFFFFFFFFFFFn;
+        }
+        // Also show first 32 bytes as hex for manual comparison
+        const hex32 = Array.from(vram.slice(byteOff, byteOff + 32))
+          .map(b => b.toString(16).padStart(2, '0')).join(' ');
+        console.log(`[hashes] VRAM fingerprint for gfxset ${gs} at chrBase=0x${chrBase.toString(16)}: fp=${fp.toString(16)}, first32=[${hex32}]`);
+        snapshotsByGfx.set(gs, fp);
+      }
+      // Check for duplicates
+      const fps = [...snapshotsByGfx.entries()];
+      for (let i = 0; i < fps.length; i++) {
+        for (let j = i + 1; j < fps.length; j++) {
+          if (fps[i][1] === fps[j][1]) {
+            console.error(`[hashes] WARNING: gfxset ${fps[i][0]} and gfxset ${fps[j][0]} have IDENTICAL VRAM at BG1 CHR base! Wrong snapshot saved?`);
+          }
+        }
+      }
+    }
+
     if (hashEntries.length > 0) {
       // hashes.bin: [uint32 count] × [uint16 vramAddr, uint8 layer, uint8 gfxset, uint64 hash]
       const buf = new ArrayBuffer(4 + hashEntries.length * 12);
