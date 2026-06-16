@@ -7460,6 +7460,30 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  // --- VBlank DMA injection into stored VRAM snapshots ---
+  // Containers saved before the VBlank injection fix have vramSnapshots that lack
+  // animated tile data (e.g. pirate flag for gfxset 0x25, vblankType 13).
+  // Re-inject here at export time so hashes.bin always matches Mesen's post-VBlank
+  // VRAM state — regardless of when the container was saved.
+  if (rom && graphicsSetsMap) {
+    const injectedGfxSets = new Set();
+    for (const set of levelSets) {
+      const gfxIdx = set.gfxSetIndex;
+      if (gfxIdx == null || !set.vramSnapshot || injectedGfxSets.has(gfxIdx)) continue;
+      injectedGfxSets.add(gfxIdx);
+      const setInfo = graphicsSetsMap.get(gfxIdx);
+      if (!setInfo || !setInfo.levels || setInfo.levels.length === 0) continue;
+      const vblankType = setInfo.levels[0].style.vblankType;
+      if (vblankType == null) continue;
+      // Ensure vramSnapshot is a mutable Uint8Array
+      let vram = set.vramSnapshot instanceof Uint8Array
+        ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+      injectAnimatedTilesIntoVram(rom, vram, vblankType);
+      set.vramSnapshot = vram;
+      console.log(`[export] VBlank DMA injected into gfxset ${gfxIdx} (vblankType=${vblankType})`);
+    }
+  }
+
   // Write hashes.bin (content-based tile identification via FNV-1a 64-bit hash)
   // Binary format: [uint32 count] × [uint16 vramAddr, uint8 layerIndex, uint8 gfxsetIndex, uint64 contentHash]
   // Entry size: 12 bytes.  Each entry maps a VRAM address (used in PNG filenames) to its
