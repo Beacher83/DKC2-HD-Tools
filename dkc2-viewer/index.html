@@ -1950,12 +1950,12 @@ function readSpritePlacements(rom, levelId) {
 // VBlank dispatch handlers DMA animation frames to specific VRAM addresses.
 // We inject frame 0 data into gfxData at the corresponding tile offsets.
 // VRAM word addr → gfxData byte offset = (VRAMword - charBase) * 2, charBase = $2000 for BG2.
-function injectAnimatedTiles(rom, gfxData, gfxSize, vblankType) {
+function injectAnimatedTiles(rom, gfxData, gfxSize, vblankType, bg1ChrBase) {
   if (vblankType === undefined || vblankType === null) return;
+  if (bg1ChrBase === undefined) bg1ChrBase = 0x2000; // backward compat default
 
   // Define DMA transfers for each VBlank type: [romFileOffset, size, vramWordDest]
-  // Only BG2 char base $2000 animations (skip BG3 rain at $4F00/$6000)
-  const BG2_CHAR_BASE = 0x2000;
+  // Only BG1 foreground char animations (skip BG3 rain at $4F00/$6000)
   const animDefs = {
     // Type 7: Lava (Crocodile Cauldron lava levels)
     7: [
@@ -1985,7 +1985,7 @@ function injectAnimatedTiles(rom, gfxData, gfxSize, vblankType) {
   if (!defs) return;
 
   for (const def of defs) {
-    const gfxOffset = (def.vram - BG2_CHAR_BASE) * 2; // VRAM word to byte offset
+    const gfxOffset = (def.vram - bg1ChrBase) * 2; // VRAM word to byte offset
     if (gfxOffset < 0 || gfxOffset + def.size > gfxSize) continue;
     // Copy frame 0 data from ROM into gfxData
     rom.seek(def.src);
@@ -2012,58 +2012,52 @@ function loadTileParts(rom, style) {
   }
   const tileCount = tileArrangementSize / 32; // each 32x32 tile = 16 words = 32 bytes
 
-  // Load graphics pointer - FollowPtr2(0x3D819A, style.graphics * 2)
-  const gfxPtrVal = rom.readWordAt(0x3D819A + style.graphics * 2);
-  rom.seek(0x3D819A + gfxPtrVal);
+  // ── Generic VRAM loading (replaces hardcoded 3-case DMA switch) ──
+  // Uses readGfxSetEntries() to load ALL DMA entries into a full VRAM array,
+  // then extracts BG1 character data at the PPU-configured chrBase offset.
+  // This is the same proven approach used by loadLevelBackground().
+  const ppu = readPpuConfig(rom, style.ppuConfig);
+  const bg1ChrBase = ppu.bg1.chrBase;           // VRAM word address (e.g. 0x2000)
+  const bg1ChrByteAddr = bg1ChrBase * 2;        // VRAM byte offset  (e.g. 0x4000)
 
-  // Parse graphics entries
-  let addr1 = 0, addr2 = 0, size1 = 0, size2 = 0;
-  let compressed = false;
-  for (let safety = 0; safety < 20; safety++) {
-    const bank = rom.readByte();
-    if (bank === 0) break;
-    const addr = rom.readWord();
-    const op = rom.readWord();
-    const size = rom.readWord();
-    let offset = (bank << 16) | addr;
-    if (offset <= 0xC00000) continue;
-    offset -= 0xC00000;
-    switch (op) {
-      case 0xA000: addr1 = offset; compressed = true; break;
-      case 0x2000: addr1 = offset; compressed = false; size1 = size; break;
-      case 0x4420: addr2 = offset; compressed = false; size2 = size; break;
+  const entries = readGfxSetEntries(rom, style.graphics);
+  const vram = new Uint8Array(0x20000);          // 128KB VRAM
+
+  let gfxSize = 0;
+  for (const entry of entries) {
+    let data;
+    if (entry.compressed) {
+      rom.seek(entry.addr);
+      const decompressed = rareDecompress(rom);
+      data = decompressed.getSlice(0, decompressed.getPosition());
+    } else {
+      data = new Uint8Array(entry.size);
+      rom.seek(entry.addr);
+      for (let i = 0; i < entry.size; i++) data[i] = rom.readByte();
+    }
+    const vramByteAddr = entry.vram * 2;
+    for (let i = 0; i < data.length && (vramByteAddr + i) < vram.length; i++) {
+      vram[vramByteAddr + i] = data[i];
+    }
+    // Track BG1 character data extent (capped at 32KB = max 1024 4bpp tiles)
+    if (entry.vram >= bg1ChrBase) {
+      const end = (entry.vram - bg1ChrBase) * 2 + data.length;
+      if (end > gfxSize) gfxSize = Math.min(end, 0x8000);
     }
   }
-  if (addr1 === 0) throw new Error('No graphics data found');
+  // Align to 32 bytes (4bpp tile boundary)
+  gfxSize = Math.ceil(gfxSize / 32) * 32;
+  if (gfxSize === 0) throw new Error('No BG1 graphics data found (chrBase=$' + bg1ChrBase.toString(16) + ')');
 
-  // Load graphics data
-  let gfxData;
-  let gfxSize;
-  rom.seek(addr1);
-  if (compressed) {
-    gfxData = rareDecompress(rom);
-    gfxSize = gfxData.getPosition();
-  } else {
-    if (size1 >= 0x4840) throw new Error('Graphics size too large');
-    gfxSize = 0x4840 + size2;
-    gfxData = new GrowBuffer(gfxSize + 1024);
-    // Copy size1 bytes from addr1
-    rom.seek(addr1);
-    for (let i = 0; i < size1; i++) gfxData.writeByte(rom.readByte());
-    // Pad with zeros
-    for (let i = size1; i < 0x4840; i++) gfxData.writeByte(0);
-    // Copy second part
-    if (addr2 !== 0) {
-      rom.seek(addr2);
-      gfxData.seek(0x4840);
-      for (let i = 0; i < size2; i++) gfxData.writeByte(rom.readByte());
-    }
+  // Extract gfxData from VRAM at BG1 character base offset
+  const gfxData = new GrowBuffer(gfxSize + 1024);
+  for (let i = 0; i < gfxSize; i++) {
+    gfxData.writeByte(vram[bg1ChrByteAddr + i]);
   }
-  if (gfxSize % 32 !== 0) throw new Error('Graphics size not aligned');
   const gfxCount = gfxSize / 32;
 
   // Inject animated tile data (frame 0) based on VBlank type
-  injectAnimatedTiles(rom, gfxData, gfxSize, style.vblankType);
+  injectAnimatedTiles(rom, gfxData, gfxSize, style.vblankType, bg1ChrBase);
 
   // Load palette
   let palette = new Uint16Array(128);
