@@ -1455,6 +1455,13 @@ function loadLevelBackground(rom, style, palette) {
     }
   }
   
+  // Inject VBlank DMA animated tile data (frame 0) directly into VRAM.
+  // Mesen computes content hashes from live VRAM AFTER VBlank DMA updates —
+  // the viewer's vramSnapshot must match that post-VBlank state for hashes to align.
+  // Without this, gfxsets where initial DMA content differs from VBlank content
+  // (e.g. gfxset 0x25 / Mainbrace Mayhem, vblankType 13) produce wrong hashes → 0% match in Mesen.
+  injectAnimatedTilesIntoVram(rom, vram, style.vblankType);
+  
   // Determine output size from BG2 (primary) or BG3 (fallback)
   const primaryBg = ppu.bg2.enabled ? ppu.bg2 : ppu.bg3;
   const tilesWide = primaryBg.wide ? 64 : 32;
@@ -1996,6 +2003,52 @@ function injectAnimatedTiles(rom, gfxData, gfxSize, vblankType, bg1ChrBase) {
   }
   console.log('Injected animated tiles for VBlank type', vblankType);
 }
+
+// Inject VBlank DMA animated tile data (frame 0) directly into a Uint8Array VRAM buffer.
+// This is the counterpart to injectAnimatedTiles() but writes to the full 128KB VRAM
+// at absolute VRAM word addresses (no chrBase offset needed).
+// Used by loadLevelBackground() to ensure currentBgData.vram (→ vramSnapshot) matches
+// what Mesen sees at runtime after VBlank DMA updates.
+function injectAnimatedTilesIntoVram(rom, vram, vblankType) {
+  if (vblankType === undefined || vblankType === null) return;
+
+  // Same animation definitions as injectAnimatedTiles — VBlank DMA transfers per type.
+  // Format: [romFileOffset, size in bytes, vramWordDest]
+  const animDefs = {
+    7: [
+      { src: 0x350147, size: 0x0180, vram: 0x2010 },
+      { src: 0x3B0AE0, size: 0x02C0, vram: 0x2270 },
+      { src: 0x3B3420, size: 0x01A0, vram: 0x20D0 },
+      { src: 0x3B3420 + 0x1860, size: 0x01A0, vram: 0x21A0 },
+    ],
+    8: [
+      { src: 0x3A5FC1, size: 0x03C0, vram: 0x2010 },
+    ],
+    13: [
+      { src: 0x3A5FC1, size: 0x03C0, vram: 0x2010 },
+    ],
+    19: [
+      { src: 0x350147, size: 0x0180, vram: 0x2010 },
+      { src: 0x3B0AE0, size: 0x02C0, vram: 0x2270 },
+      { src: 0x3B3420, size: 0x01A0, vram: 0x20D0 },
+      { src: 0x3B3420 + 0x1860, size: 0x01A0, vram: 0x21A0 },
+    ],
+  };
+
+  const defs = animDefs[vblankType];
+  if (!defs) return;
+
+  for (const def of defs) {
+    const vramByteAddr = def.vram * 2;
+    if (vramByteAddr + def.size > vram.length) continue;
+    rom.seek(def.src);
+    for (let i = 0; i < def.size; i++) {
+      vram[vramByteAddr + i] = rom.readByte();
+    }
+  }
+  console.log('Injected animated tiles into VRAM for VBlank type', vblankType);
+}
+
 
 // ============================================================
 // Load tile parts and graphics -> returns ImageData of all tile parts
@@ -4197,17 +4250,23 @@ function buildCatalogByGfxSet(gfxSetIndex) {
     console.error('Cluster detection error:', e);
   }
 
-  // Load BG2 tilemap and PPU config for texture pack export.
+  // Load BG2/BG3 tilemap, PPU config, and VRAM snapshot for texture pack export.
   // buildCatalogByGfxSet has rom + style, so we can call loadLevelBackground here
   // even when currentBgData is null (e.g. user is in gfxset catalog without a loaded level).
+  // The VRAM snapshot includes VBlank DMA injection (via injectAnimatedTilesIntoVram)
+  // so hashes computed from it match Mesen's runtime VRAM.
   let catalogPpuConfig = null;
   let catalogBg2TilemapData = null;
+  let catalogBg3TilemapData = null;
+  let catalogVram = null;
   try {
     const bgData = loadLevelBackground(rom, style, palette);
     if (bgData && bgData.vram && bgData.ppu) {
       const ppu = bgData.ppu;
       const bg2TilesW = ppu.bg2 && ppu.bg2.wide ? 64 : 32;
       const bg2TilesH = ppu.bg2 && ppu.bg2.tall ? 64 : 32;
+      const bg3TilesW = ppu.bg3 && ppu.bg3.wide ? 64 : 32;
+      const bg3TilesH = ppu.bg3 && ppu.bg3.tall ? 64 : 32;
       catalogPpuConfig = {
         bgMode: ppu.bgMode,
         bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,
@@ -4215,6 +4274,8 @@ function buildCatalogByGfxSet(gfxSetIndex) {
         bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
         bg2TilesW,
         bg2TilesH,
+        bg3TilesW,
+        bg3TilesH,
       };
       if (ppu.bg2 && ppu.bg2.enabled) {
         const tmByteOffset = ppu.bg2.tilemapBase * 2;
@@ -4225,13 +4286,26 @@ function buildCatalogByGfxSet(gfxSetIndex) {
           console.log(`  BG2 tilemap cached: ${tmByteLength} bytes at 0x${tmByteOffset.toString(16)}`);
         }
       }
+      if (ppu.bg3 && ppu.bg3.enabled) {
+        const tmByteOffset = ppu.bg3.tilemapBase * 2;
+        const tmByteLength = bg3TilesW * bg3TilesH * 2;
+        if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= bgData.vram.length) {
+          catalogBg3TilemapData = [];
+          for (let i = 0; i < tmByteLength; i++) catalogBg3TilemapData.push(bgData.vram[tmByteOffset + i] || 0);
+          console.log(`  BG3 tilemap cached: ${tmByteLength} bytes at 0x${tmByteOffset.toString(16)}`);
+        }
+      }
+      // Store full VRAM snapshot for use by saveCurrentHDToContainer() in catalog mode.
+      // This ensures correct vramSnapshot even when no level is loaded (currentBgData null).
+      catalogVram = bgData.vram;
     }
   } catch (e) {
-    console.warn('  BG2 tilemap load failed for gfxset:', e.message);
+    console.warn('  BG2/BG3 tilemap load failed for gfxset:', e.message);
   }
 
   return { bg1Tiles, bg2Image: null, bg3Image: null, gfxSetIndex, setInfo, clusters,
-           ppuConfig: catalogPpuConfig, bg2TilemapData: catalogBg2TilemapData };
+           ppuConfig: catalogPpuConfig, bg2TilemapData: catalogBg2TilemapData,
+           bg3TilemapData: catalogBg3TilemapData, vram: catalogVram };
 }
 
 // ============================================================
@@ -6710,12 +6784,18 @@ async function saveCurrentHDToContainer(containerName) {
     bg3TilemapData = catalogData.bg3TilemapData;
   }
 
-  // Store full VRAM snapshot for BG2 content-hash computation at export time.
-  // Required because BG2 CHR data lives in VRAM (no separate gfxData buffer for BG2).
-  // Only available in level mode when currentBgData.vram is set.
+  // Store full VRAM snapshot for content-hash computation at export time.
+  // Sources (in priority order):
+  // 1. currentBgData.vram — set by loadLevelBackground() when a level is loaded
+  //    (includes VBlank DMA injection, matching Mesen's runtime VRAM)
+  // 2. catalogData.vram — built by buildCatalogByGfxSet() for the active gfxset
+  //    (fallback when user is in catalog mode without an active level load)
   let vramSnapshot = null;
   if (currentBgData && currentBgData.vram) {
     vramSnapshot = new Uint8Array(currentBgData.vram);  // 128KB copy
+  } else if (catalogData && catalogData.vram) {
+    vramSnapshot = new Uint8Array(catalogData.vram);  // catalog-mode fallback
+    console.log('[save] Using catalogData.vram as vramSnapshot fallback (catalog mode, no active level)');
   }
 
   const clusters = [];
@@ -8065,6 +8145,9 @@ async function refreshContainerSetMetadata(containerName) {
   let vramSnapshot = null;
   if (currentBgData && currentBgData.vram) {
     vramSnapshot = new Uint8Array(currentBgData.vram);
+  } else if (catalogData && catalogData.vram) {
+    vramSnapshot = new Uint8Array(catalogData.vram);
+    console.log('[refresh] Using catalogData.vram as vramSnapshot fallback');
   }
 
   // Recompute tileChecksums (deprecated but kept for legacy fallback)
