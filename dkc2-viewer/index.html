@@ -6699,10 +6699,28 @@ async function saveCurrentHDToContainer(containerName) {
     ? `gfxset_${(currentStyle?.graphics || 0).toString(16).toUpperCase().padStart(2, '0')}`
     : `level_${currentLevelId || 0}`;
 
-  // Convert tiles to storable format
+  // Convert tiles to storable format — filter to current gfxset only.
+  // After loadContainerToHDPack(), hdPack.tiles contains tiles from ALL gfxsets
+  // merged together.  We must only save tiles belonging to the current gfxset,
+  // otherwise re-saving pollutes this set's entry with foreign tiles, causing
+  // the export to produce PNGs with wrong pixel content (Bug: Level 2 showed
+  // Level 1 graphics because gfxset_7 tiles overwrote gfxset_37's exports).
+  const currentGfxIdx = currentStyle?.graphics;
   const tiles = [];
+  let skippedForeignTiles = 0;
   for (const [id, bmp] of hdPack.tiles) {
+    const keyStr = String(id);
+    // Keep tiles belonging to current gfxset (prefix match) or unprefixed legacy tiles
+    if (currentGfxIdx !== undefined && keyStr.includes('_')) {
+      if (!keyStr.startsWith(`${currentGfxIdx}_`)) {
+        skippedForeignTiles++;
+        continue;  // skip foreign gfxset tiles
+      }
+    }
     tiles.push({ id, blob: await bitmapToBlob(bmp) });
+  }
+  if (skippedForeignTiles > 0) {
+    console.log(`[save] Filtered out ${skippedForeignTiles} tiles from other gfxsets (keeping only gfxset ${currentGfxIdx})`);
   }
   let bg2Blob = null, bg3Blob = null;
   if (hdPack.bg2) bg2Blob = await bitmapToBlob(hdPack.bg2);
@@ -7171,9 +7189,20 @@ async function exportAsTexturePack(containerName) {
 
     // Build lookup: tileKey -> ImageBitmap from stored tiles
     // Tile IDs are stored as "{gfxSetIndex}_{partId}" strings (e.g. "7_0", "7_1")
+    // Defense-in-depth: only load tiles whose prefix matches this set's gfxSetIndex.
+    // Older containers saved before the save-filter fix may contain foreign tiles.
     const tileBitmaps = new Map();
+    let skippedForeign = 0;
     for (const t of (set.tiles || [])) {
+      const keyStr = String(t.id);
+      if (keyStr.includes('_') && !keyStr.startsWith(`${gfxIdx}_`)) {
+        skippedForeign++;
+        continue;  // skip tiles from other gfxsets (legacy contamination)
+      }
       tileBitmaps.set(t.id, await createImageBitmap(t.blob));
+    }
+    if (skippedForeign > 0) {
+      console.warn(`[export] gfxset ${gfxIdStr}: skipped ${skippedForeign} foreign tiles (contaminated container)`);
     }
 
     // For each HD tile: keys are "{gfxIdx}_{tileId}" (e.g. "7_4"), tileArrangementData indexed by tileId
@@ -7495,6 +7524,7 @@ async function exportAsTexturePack(containerName) {
   {
     const hashEntries = [];  // { vramAddr, layer, gfxset, hash: BigInt }
     const dedupKey = new Set();
+
 
     const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3];
     console.log(`[hashes] Processing ${allHashSets.length} set(s) for hashes.bin`);

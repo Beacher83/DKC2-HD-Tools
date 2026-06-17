@@ -1,5 +1,32 @@
 # Changelog — DKC2-HD-Tools Viewer
 
+## [2026-06-17] — Cross-Gfxset Tile Contamination Fix
+
+### Bug Fixes
+
+- **Fix: Cross-gfxset tile contamination in save/export pipeline**
+  - `saveCurrentHDToContainer()` now filters `hdPack.tiles` by gfxset prefix before saving. Only tiles belonging to the active gfxset are stored in the container.
+  - `exportAsTexturePack()` adds defense-in-depth filtering: skips tiles with foreign gfxset prefixes (protects against pre-fix contaminated containers).
+  - **Root cause**: After `loadContainerToHDPack()`, all tiles from all gfxsets were merged into a single global Map. Re-saving then dumped foreign tiles into the current set's container slot. During export, deduplication by `tileId` caused wrong bitmaps to win — Level 2 PNGs contained Level 1 pixel art.
+
+- **Fix: Catalog-mode VRAM snapshot fallback**
+  - `saveCurrentHDToContainer()` and `refreshContainerSetMetadata()` now fall back to `catalogData.vram` when `currentBgData` is null (catalog mode without active level load).
+
+### New Features
+
+- **BG3 tilemap caching in catalog mode**
+  - `buildCatalogByGfxSet()` now caches BG3 tilemap data and full VRAM snapshot.
+  - Provides correct data for export even when no level is actively loaded.
+
+### Refactoring
+
+- **`loadTileParts()` rewritten to use generic VRAM loading**
+  - Replaces the hardcoded 3-case DMA switch with `readGfxSetEntries()` + full VRAM array approach.
+  - Same proven method used by `loadLevelBackground()` — eliminates code duplication and handles all gfxset variants correctly.
+  - `injectAnimatedTiles()` updated to accept explicit `bg1ChrBase` parameter.
+
+---
+
 ## [Unreleased] — 2026-06-16
 
 ### VBlank DMA Injection Fix (Level 2 / Mainbrace Mayhem)
