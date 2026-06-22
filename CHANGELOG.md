@@ -1,5 +1,65 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-06-22] — VRAM-based chrBase Auto-Detection (Issue B Fix)
+
+### Problem
+
+Level 2 (Mainbrace Mayhem, gfxset 37) exportiert alle BG1 Hashes mit
+chrBase=$2000 — aber die Tile-Daten liegen im VRAM bei $6000.  Der
+vorherige multi-chrBase Fix (ROM ppuConfig Scan) hat nicht geholfen,
+weil DKC2 den BG12NBA-Register **zur Laufzeit** ändert (VBlank/NMI).
+Die ROM ppuConfig-Tabelle enthält für alle Levels im gfxset 37 denselben
+Wert (BG12NBA low nibble = 2 → chrBase=$2000), obwohl der tatsächliche
+Wert zur Laufzeit = 6 → chrBase=$6000 ist.
+
+**Beweis:** VRAM Fingerprint zeigt `first32=[00 00 00 00 ...]` bei $2000 —
+keine Tile-Daten dort.  Die 760 generierten Hashes hashten NULL-Bytes und
+konnten niemals gegen die echten VRAM-Daten matchen.
+
+### Lösung: `detectChrBasesFromVRAM()`
+
+Neue Funktion die den **tatsächlichen** chrBase aus dem VRAM-Snapshot erkennt:
+1. Sammelt Tile-Indices aus dem tileArrangement
+2. Prüft für jeden der 8 möglichen chrBases ($0000–$7000) ob bei den
+   berechneten VRAM-Adressen non-zero Daten existieren
+3. chrBases mit >50% non-zero Tiles werden als gültig erkannt
+4. Wird ZUSÄTZLICH zum ROM ppuConfig Scan aufgerufen (beide Strategien
+   ergänzen sich)
+
+### Erwartetes Console-Output
+
+```
+[export] gfxset 37: stored chrBase $2000 has NO tile data in VRAM! Detected actual chrBase(s): $6000
+[export] gfxset 37: multiple BG1 chrBases: $2000, $6000
+[hashes] gfxset 37: stored chrBase $2000 has NO tile data! Actual: $6000
+[hashes] gfxset 37: BG1 → N hash entries (chrBases: $2000, $6000)
+```
+
+### Warum Content Hash trotzdem funktioniert
+
+Entries für den falschen chrBase ($2000) hashen Null-Bytes und matchen
+zur Laufzeit NIE (weil das Spiel dort echte Daten hat).  Entries für den
+korrekten chrBase ($6000) hashen die echten Tile-Daten und matchen.
+→ Falsch-positive Matches sind unmöglich.
+
+---
+
+## [2026-06-22a] — Multi-chrBase Export (vorheriger Versuch)
+
+### Ansatz
+
+Scan aller Levels im gfxset via `readPpuConfig()` um verschiedene
+bg1ChrBase-Werte zu finden.  PNG und Hash-Einträge für jeden chrBase
+generiert.
+
+### Ergebnis
+
+Funktioniert NICHT für gfxset 37: Alle Levels in der ROM ppuConfig-Tabelle
+haben denselben BG12NBA-Wert.  DKC2 setzt den echten Wert erst zur Laufzeit.
+→ Superseded by VRAM-based detection above.
+
+---
+
 ## [2026-06-17b] — Enhanced MISS Diagnostik (Mesen2-Seite)
 
 ### Kontext / Was wir wissen

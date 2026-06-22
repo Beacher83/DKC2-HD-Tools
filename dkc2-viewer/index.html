@@ -7086,6 +7086,54 @@ async function exportContainerAsZip(containerName) {
   return summary;
 }
 
+// --- VRAM-based BG1 chrBase Auto-Detection ---
+// The ROM ppuConfig table stores the INITIAL BG12NBA register value, but DKC2
+// often changes it at runtime (VBlank handler, HDMA, level init code).
+// This function scans the actual VRAM snapshot to determine where non-zero
+// tile data is located by testing all 8 possible chrBase values ($0000-$7000).
+//
+// Returns: Set of chrBase values that have significant non-zero tile data.
+function detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile) {
+  const detected = new Set();
+  if (!vram || !tileArr || tileArr.length < 2) return detected;
+
+  // Collect unique tile indices from the arrangement (skip index 0 = empty tile)
+  const tileIndices = new Set();
+  for (let i = 0; i * 2 + 1 < tileArr.length; i++) {
+    const tileInfo = tileArr[i * 2] | (tileArr[i * 2 + 1] << 8);
+    const gfxIndex = tileInfo & 0x03FF;
+    if (gfxIndex > 0) tileIndices.add(gfxIndex);
+  }
+  if (tileIndices.size === 0) return detected;
+
+  // Sample up to 50 tile indices for speed
+  const sampleIndices = [...tileIndices].slice(0, 50);
+
+  // Test each of the 8 possible chrBase values
+  for (let cb = 0; cb <= 0x7000; cb += 0x1000) {
+    let nonZeroCount = 0;
+    for (const gfxIndex of sampleIndices) {
+      const vramWordAddr = (cb + gfxIndex * wordsPerTile) & 0x7FFF;
+      const byteOff = vramWordAddr * 2;
+      if (byteOff + bytesPerTile > vram.length) continue;
+      // Check if at least one word in this tile is non-zero
+      let hasData = false;
+      for (let b = 0; b < bytesPerTile; b += 2) {
+        if (vram[byteOff + b] !== 0 || vram[byteOff + b + 1] !== 0) {
+          hasData = true;
+          break;
+        }
+      }
+      if (hasData) nonZeroCount++;
+    }
+    // If >50% of sampled tiles have non-zero data, this chrBase is valid
+    if (nonZeroCount > sampleIndices.length * 0.5) {
+      detected.add(cb);
+    }
+  }
+  return detected;
+}
+
 // --- BG1 Palette Variant Scanner ---
 // Scans ALL levels in a gfxset via the ROM to collect every (vramAddr, palRow)
 // combination used in BG1 Map32 tile arrangements.  The container stores only
@@ -7179,13 +7227,13 @@ async function exportAsTexturePack(containerName) {
     const wordsPerTile = is4bpp ? 16 : 8;  // 4bpp = 32 bytes = 16 words; 2bpp = 16 bytes = 8 words
     const scaleFactor = set.scaleFactor || scale;
 
-    // Collect all unique BG1 chrBases from levels in this gfxset.
-    // Different levels may have different ppuConfig (BG12NBA register),
-    // placing BG1 CHR at different VRAM word addresses.  Generating hash
-    // entries and PNG files at each chrBase ensures the emulator matches
-    // tiles regardless of which level is currently active.
+    // Collect all unique BG1 chrBases for this gfxset.
+    // Strategy 1: Scan ROM ppuConfig table for all levels in this gfxset.
+    // Strategy 2: Auto-detect from VRAM snapshot (catches runtime BG12NBA changes
+    //             that DKC2 makes via VBlank/HDMA, not reflected in ROM table).
     const allBg1ChrBases = new Set();
     allBg1ChrBases.add(chrBase);
+    const bytesPerTile = wordsPerTile * 2;
     if (rom && graphicsSetsMap) {
       const gfxKey = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
       if (graphicsSetsMap.has(gfxKey)) {
@@ -7197,9 +7245,23 @@ async function exportAsTexturePack(containerName) {
         }
       }
     }
+    // VRAM-based detection: scan actual VRAM snapshot for non-zero tile data.
+    // This catches runtime chrBase changes not reflected in the ROM ppuConfig table.
+    if (set.vramSnapshot) {
+      const vram = set.vramSnapshot instanceof Uint8Array
+        ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+      const tileArr = new Uint8Array(set.tileArrangementData);
+      const detectedBases = detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile);
+      for (const db of detectedBases) allBg1ChrBases.add(db);
+      if (detectedBases.size > 0 && !detectedBases.has(chrBase)) {
+        console.warn(`[export] gfxset ${String(set.gfxSetIndex).padStart(2,'0')}: ` +
+          `stored chrBase $${chrBase.toString(16).toUpperCase()} has NO tile data in VRAM! ` +
+          `Detected actual chrBase(s): ${[...detectedBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
+      }
+    }
     if (allBg1ChrBases.size > 1) {
       console.log(`[export] gfxset ${String(set.gfxSetIndex).padStart(2,'0')}: ` +
-        `multiple BG1 chrBases detected: ${[...allBg1ChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
+        `multiple BG1 chrBases: ${[...allBg1ChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
     }
 
     // Per-gfxset subfolder: bg/bg1/gfxset_07/ — allows multiple gfxsets at same VRAM addresses
@@ -7577,12 +7639,9 @@ async function exportAsTexturePack(containerName) {
         const tileArr = new Uint8Array(set.tileArrangementData);
         const storedChrBase = ppuCfg.bg1ChrBase || 0;
 
-        // Collect all unique BG1 chrBases from levels in this gfxset.
-        // Different levels may have different ppuConfig (BG12NBA register),
-        // placing BG1 CHR at different VRAM word addresses.  We generate
-        // hash entries for each so the emulator matches regardless of
-        // which level is active.  The content hash is computed from actual
-        // VRAM bytes at each address — only correct entries will match.
+        // Collect all unique BG1 chrBases for this gfxset.
+        // Strategy 1: ROM ppuConfig table scan.
+        // Strategy 2: VRAM-based auto-detection (catches runtime BG12NBA changes).
         const hashChrBases = new Set();
         hashChrBases.add(storedChrBase);
         if (rom && graphicsSetsMap && graphicsSetsMap.has(gfxset)) {
@@ -7593,8 +7652,15 @@ async function exportAsTexturePack(containerName) {
             } catch (e) { /* skip */ }
           }
         }
+        // VRAM-based detection: find chrBases where actual tile data exists
+        const detectedHashBases = detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile);
+        for (const db of detectedHashBases) hashChrBases.add(db);
+        if (detectedHashBases.size > 0 && !detectedHashBases.has(storedChrBase)) {
+          console.warn(`[hashes] gfxset ${gfxset}: stored chrBase $${storedChrBase.toString(16).toUpperCase()} ` +
+            `has NO tile data! Actual: ${[...detectedHashBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
+        }
         if (hashChrBases.size > 1) {
-          console.log(`[hashes] gfxset ${gfxset}: multiple BG1 chrBases: ${[...hashChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
+          console.log(`[hashes] gfxset ${gfxset}: BG1 chrBases: ${[...hashChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
         }
 
         for (const chrBase of hashChrBases) {
