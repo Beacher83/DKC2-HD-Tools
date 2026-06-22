@@ -1,5 +1,46 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-06-22b] — Single-Best-ChrBase Detection (Fix v2 for Issue B)
+
+### Problem with Previous Approach
+
+The `detectChrBasesFromVRAM()` function returned ALL chrBases where >50% of
+sampled tiles had non-zero data.  For gfxset 37, this returned 5 chrBases
+($2000, $3000, $4000, $5000, $6000) because BG2, BG3, and tilemap data
+at those addresses also contains non-zero bytes.
+
+Generating hash entries at all 5 chrBases caused **cross-layer hash collisions**:
+- Mesen's `TileByKey` uses `{ContentHash, PaletteIndex, LayerIndex}` — NOT vramAddr
+- BG2 tile content hashes at $3000 could accidentally match BG1 hash entries
+  exported from that same address → wrong HD tile image served
+- Result: BG2 disappeared, BG3 fog broken, BG1 tiles visually misassigned
+
+### Fix: Return Only the Single Best chrBase
+
+`detectChrBasesFromVRAM()` now:
+1. Scores each chrBase by non-zero tile count (same as before)
+2. Returns ONLY the one with the highest score (not all above threshold)
+3. Threshold raised to 70% (from 50%) for minimum acceptance
+
+Calling code (PNG export + hash generation) changed:
+- If VRAM detection returns a chrBase → use it EXCLUSIVELY (replaces stored)
+- If detection fails → fallback to stored chrBase
+- ROM ppuConfig scan REMOVED (was useless for gfxset 37, all return same value)
+
+### Expected Results
+
+```
+[export] gfxset 07: (detection returns $2000, matches stored → no override)
+[export] gfxset 37: stored chrBase $2000 overridden by VRAM detection → $6000
+[hashes] gfxset 37: stored chrBase $2000 overridden by VRAM detection → $6000
+[hashes] gfxset 37: BG1 → N hash entries (chrBases: $6000)
+```
+
+- Level 1: Only $2000 exported → no collision with BG2/BG3 at other addresses
+- Level 2: Only $6000 exported → correct BG1 data, no collision with BG2 at $2000
+
+---
+
 ## [2026-06-22] — VRAM-based chrBase Auto-Detection (Issue B Fix)
 
 ### Problem
