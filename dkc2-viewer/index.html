@@ -7092,10 +7092,9 @@ async function exportContainerAsZip(containerName) {
 // ONE level's arrangement per gfxset, but other levels with a different mapId
 // may assign different palette rows to the same CHR tiles.
 //
-// Uses the container's chrBase for address computation (assumes all levels in
-// the gfxset share the same BG1 chr base — true for DKC2).
-// TODO: If a level has a different chrBase (different ppuConfig), its tiles map
-// to different vramAddrs.  Handling that would also require hashes.bin expansion.
+// Uses the passed-in chrBase for address computation.  Levels with a different
+// BG1 chrBase are skipped (the caller iterates over all unique chrBases from
+// allBg1ChrBases, invoking this function once per chrBase).
 //
 // Returns: Map<addrHex, Set<palRow>>  or  null if ROM/graphicsSetsMap unavailable.
 function collectBG1PaletteVariantsFromROM(gfxSetIndex, chrBase, bgMode) {
@@ -7180,6 +7179,29 @@ async function exportAsTexturePack(containerName) {
     const wordsPerTile = is4bpp ? 16 : 8;  // 4bpp = 32 bytes = 16 words; 2bpp = 16 bytes = 8 words
     const scaleFactor = set.scaleFactor || scale;
 
+    // Collect all unique BG1 chrBases from levels in this gfxset.
+    // Different levels may have different ppuConfig (BG12NBA register),
+    // placing BG1 CHR at different VRAM word addresses.  Generating hash
+    // entries and PNG files at each chrBase ensures the emulator matches
+    // tiles regardless of which level is currently active.
+    const allBg1ChrBases = new Set();
+    allBg1ChrBases.add(chrBase);
+    if (rom && graphicsSetsMap) {
+      const gfxKey = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
+      if (graphicsSetsMap.has(gfxKey)) {
+        for (const levelInfo of graphicsSetsMap.get(gfxKey).levels) {
+          try {
+            const lPpu = readPpuConfig(rom, levelInfo.style.ppuConfig);
+            if (lPpu.bg1) allBg1ChrBases.add(lPpu.bg1.chrBase);
+          } catch (e) { /* skip unreadable levels */ }
+        }
+      }
+    }
+    if (allBg1ChrBases.size > 1) {
+      console.log(`[export] gfxset ${String(set.gfxSetIndex).padStart(2,'0')}: ` +
+        `multiple BG1 chrBases detected: ${[...allBg1ChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
+    }
+
     // Per-gfxset subfolder: bg/bg1/gfxset_07/ — allows multiple gfxsets at same VRAM addresses
     const gfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const gfxIdStr = String(gfxIdx).padStart(2, '0');
@@ -7222,25 +7244,21 @@ async function exportAsTexturePack(containerName) {
         const flipH = !!(tileInfo & 0x4000);
         const flipV = !!(tileInfo & 0x8000);
 
-        // Compute VRAM word address (same formula as PPU::Background::fetchNameTable)
-        const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
-        const addrHex = vramWordAddr.toString(16).padStart(4, '0');
+        // Pre-check: skip sub-tile if ALL chrBases already exported for this gfxIndex/palRow
         const palStr = 'P' + String(palRow).padStart(2, '0');
-        const fileKey = `${addrHex}_${palStr}`;
+        let anyNeeded = false;
+        for (const cb of allBg1ChrBases) {
+          const va = (cb + gfxIndex * wordsPerTile) & 0x7FFF;
+          if (!exportedKeys.has(`${va.toString(16).padStart(4, '0')}_${palStr}`)) { anyNeeded = true; break; }
+        }
+        if (!anyNeeded) continue;
 
-        // Skip duplicates (same VRAM tile + palette already exported)
-        if (exportedKeys.has(fileKey)) continue;
-        exportedKeys.add(fileKey);
-
-        // Extract the 8x8 sub-tile region from the HD bitmap (which is scaleFactor*32 x scaleFactor*32 or 32x32)
-        // Sub-tile position in the 32x32 Map32 tile:
+        // Extract the 8x8 sub-tile region from the HD bitmap (chrBase-independent)
         const subCol = j % 4;  // 0-3
         const subRow = Math.floor(j / 4);  // 0-3
-
-        // Source region in the HD bitmap (which may be scaleFactor*8 per sub-tile)
         const srcPixelSize = hdBitmap.width / 4;  // pixels per sub-tile in HD image
-        let srcX = subCol * srcPixelSize;
-        let srcY = subRow * srcPixelSize;
+        const srcX = subCol * srcPixelSize;
+        const srcY = subRow * srcPixelSize;
 
         // Create output canvas at 32x32 (4x scale of 8x8)
         const outCanvas = document.createElement('canvas');
@@ -7249,29 +7267,36 @@ async function exportAsTexturePack(containerName) {
         const ctx = outCanvas.getContext('2d');
 
         // Handle flip: we store the UN-FLIPPED version (emulator flips at runtime)
-        // The HD bitmap already includes flips baked in from the original render,
-        // so we need to UN-FLIP to get the canonical tile orientation
         if (flipH || flipV) {
           ctx.save();
           if (flipH) { ctx.scale(-1, 1); ctx.translate(-subtileSize, 0); }
           if (flipV) { ctx.scale(1, -1); ctx.translate(0, -subtileSize); }
         }
-
         ctx.drawImage(hdBitmap, srcX, srcY, srcPixelSize, srcPixelSize,
                        0, 0, subtileSize, subtileSize);
-
         if (flipH || flipV) ctx.restore();
 
-        // Convert to PNG blob — toDataURL is synchronous and avoids toBlob() callback issues
+        // Convert to PNG blob once (reused across all chrBases)
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-        const raw = atob(b64);
-        const arr = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        const rawPng = atob(b64);
+        const arr = new Uint8Array(rawPng.length);
+        for (let k = 0; k < rawPng.length; k++) arr[k] = rawPng.charCodeAt(k);
         const blob = new Blob([arr], { type: 'image/png' });
-        bgFolder.file(`${fileKey}.png`, blob);
-        if (!bg1TileBlobs.has(addrHex)) bg1TileBlobs.set(addrHex, blob);
-        exportedTiles++;
+
+        // Export PNG at VRAM addresses for ALL chrBases in this gfxset.
+        // The content hash in hashes.bin ensures only the correct chrBase's
+        // entry will match at runtime — wrong-chrBase PNGs are harmless.
+        for (const curChrBase of allBg1ChrBases) {
+          const vramWordAddr = (curChrBase + gfxIndex * wordsPerTile) & 0x7FFF;
+          const addrHex = vramWordAddr.toString(16).padStart(4, '0');
+          const fileKey = `${addrHex}_${palStr}`;
+          if (exportedKeys.has(fileKey)) continue;
+          exportedKeys.add(fileKey);
+          bgFolder.file(`${fileKey}.png`, blob);
+          if (!bg1TileBlobs.has(addrHex)) bg1TileBlobs.set(addrHex, blob);
+          exportedTiles++;
+        }
       }
     }
 
@@ -7281,26 +7306,30 @@ async function exportAsTexturePack(containerName) {
     // vramAddr, different Map32 arrangement due to different mapId).
     // Scan all levels via ROM and create PNG copies for missing palette variants.
     // No hashes.bin change needed — palette comes from the PNG filename only.
+    // With multi-chrBase support, iterate over each chrBase separately so that
+    // levels with a matching chrBase are included (the function skips mismatches).
     if (rom && graphicsSetsMap) {
-      const variants = collectBG1PaletteVariantsFromROM(gfxIdx, chrBase, ppuCfg.bgMode);
-      if (variants) {
-        let variantCount = 0;
-        for (const [addrHex, palRows] of variants) {
-          const existingBlob = bg1TileBlobs.get(addrHex);
-          if (!existingBlob) continue; // No HD image for this vramAddr — skip
-          for (const palRow of palRows) {
-            const palStr = 'P' + String(palRow).padStart(2, '0');
-            const fileKey = `${addrHex}_${palStr}`;
-            if (exportedKeys.has(fileKey)) continue;
-            exportedKeys.add(fileKey);
-            bgFolder.file(`${fileKey}.png`, existingBlob);
-            exportedTiles++;
-            variantCount++;
+      for (const curChrBase of allBg1ChrBases) {
+        const variants = collectBG1PaletteVariantsFromROM(gfxIdx, curChrBase, ppuCfg.bgMode);
+        if (variants) {
+          let variantCount = 0;
+          for (const [addrHex, palRows] of variants) {
+            const existingBlob = bg1TileBlobs.get(addrHex);
+            if (!existingBlob) continue; // No HD image for this vramAddr — skip
+            for (const palRow of palRows) {
+              const palStr = 'P' + String(palRow).padStart(2, '0');
+              const fileKey = `${addrHex}_${palStr}`;
+              if (exportedKeys.has(fileKey)) continue;
+              exportedKeys.add(fileKey);
+              bgFolder.file(`${fileKey}.png`, existingBlob);
+              exportedTiles++;
+              variantCount++;
+            }
           }
-        }
-        if (variantCount > 0) {
-          bg1PaletteVariants += variantCount;
-          console.log(`[export] gfxset ${gfxIdStr}: added ${variantCount} BG1 palette variant(s) from ROM scan`);
+          if (variantCount > 0) {
+            bg1PaletteVariants += variantCount;
+            console.log(`[export] gfxset ${gfxIdStr}: added ${variantCount} BG1 palette variant(s) from ROM scan (chrBase=$${curChrBase.toString(16)})`);
+          }
         }
       }
     }
@@ -7546,24 +7575,46 @@ async function exportAsTexturePack(containerName) {
         const vram = set.vramSnapshot instanceof Uint8Array
           ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
         const tileArr = new Uint8Array(set.tileArrangementData);
-        const chrBase = ppuCfg.bg1ChrBase || 0;
+        const storedChrBase = ppuCfg.bg1ChrBase || 0;
 
-        for (let i = 0; i * 2 + 1 < tileArr.length; i++) {
-          const tileInfo = tileArr[i * 2] | (tileArr[i * 2 + 1] << 8);
-          const gfxIndex = tileInfo & 0x03FF;
-          const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
-          const dk = `${gfxset}_0_${vramWordAddr}`;
-          if (dedupKey.has(dk)) continue;
-          dedupKey.add(dk);
+        // Collect all unique BG1 chrBases from levels in this gfxset.
+        // Different levels may have different ppuConfig (BG12NBA register),
+        // placing BG1 CHR at different VRAM word addresses.  We generate
+        // hash entries for each so the emulator matches regardless of
+        // which level is active.  The content hash is computed from actual
+        // VRAM bytes at each address — only correct entries will match.
+        const hashChrBases = new Set();
+        hashChrBases.add(storedChrBase);
+        if (rom && graphicsSetsMap && graphicsSetsMap.has(gfxset)) {
+          for (const levelInfo of graphicsSetsMap.get(gfxset).levels) {
+            try {
+              const lPpu = readPpuConfig(rom, levelInfo.style.ppuConfig);
+              if (lPpu.bg1) hashChrBases.add(lPpu.bg1.chrBase);
+            } catch (e) { /* skip */ }
+          }
+        }
+        if (hashChrBases.size > 1) {
+          console.log(`[hashes] gfxset ${gfxset}: multiple BG1 chrBases: ${[...hashChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')}`);
+        }
 
-          const byteOff = vramWordAddr * 2;
-          if (byteOff + bytesPerTile <= vram.length) {
-            const hash = fnv1a_64(vram, byteOff, bytesPerTile);
-            hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
+        for (const chrBase of hashChrBases) {
+          for (let i = 0; i * 2 + 1 < tileArr.length; i++) {
+            const tileInfo = tileArr[i * 2] | (tileArr[i * 2 + 1] << 8);
+            const gfxIndex = tileInfo & 0x03FF;
+            const vramWordAddr = (chrBase + gfxIndex * wordsPerTile) & 0x7FFF;
+            const dk = `${gfxset}_0_${vramWordAddr}`;
+            if (dedupKey.has(dk)) continue;
+            dedupKey.add(dk);
+
+            const byteOff = vramWordAddr * 2;
+            if (byteOff + bytesPerTile <= vram.length) {
+              const hash = fnv1a_64(vram, byteOff, bytesPerTile);
+              hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
+            }
           }
         }
         const bg1Count = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 0).length;
-        console.log(`[hashes] gfxset ${gfxset}: BG1 → ${bg1Count} hash entries (chrBase=0x${chrBase.toString(16)})`);
+        console.log(`[hashes] gfxset ${gfxset}: BG1 → ${bg1Count} hash entries (chrBases: ${[...hashChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')})`);
       } else {
         console.warn(`[hashes] gfxset ${gfxset}: BG1 SKIPPED — vramSnapshot: ${!!set.vramSnapshot}, tileArr: ${!!set.tileArrangementData}`);
       }

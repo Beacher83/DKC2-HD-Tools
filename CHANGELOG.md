@@ -1,4 +1,101 @@
-# Changelog — DKC2-HD-Tools Viewer
+# Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
+
+## [2026-06-17b] — Enhanced MISS Diagnostik (Mesen2-Seite)
+
+### Kontext / Was wir wissen
+
+Nach dem Cross-Gfxset Contamination Fix zeigt Level 2 (Mainbrace Mayhem,
+gfxset 37 / 0x25) immer noch KEINE HD Tiles. Level 1 funktioniert.
+
+Bisherige Analyse ergab zwei getrennte Probleme:
+
+1. **VBlank DMA Content Hash Mismatch (30 Tiles, VRAM 0x2000-0x21D0):**
+   Viewer injiziert Animations-Frame 0, Spiel ist zur Laufzeit bei Frame N != 0.
+   Alle 30 geloggten MISSes waren in diesem Bereich — das alte MISS-Limit (30)
+   verhinderte, dass wir Tiles jenseits von 0x21D0 sehen konnten.
+
+2. **Non-animated Tiles (0x2200+) — 100% Content Hash Match aber kein Display:**
+   VRAM-Dump-Vergleich: 730 von 760 non-DMA Tiles haben IDENTISCHE Content Hashes
+   zwischen Viewer-Snapshot und Mesen VRAM Dump. Trotzdem zeigt nichts an.
+
+### HD Pack ZIP Analyse (`Test v1.0_mesen2_hdpack.zip`)
+
+gfxset_37 enthält 1223 Tiles mit folgender Palette-Verteilung:
+
+| Palette | Anzahl | Anteil |
+|---------|--------|--------|
+| P04     | 428    | 35%    |
+| P07     | 252    | 21%    |
+| P02     | 228    | 19%    |
+| P03     | 128    | 10%    |
+| P05     | 50     | 4%     |
+| P06     | 50     | 4%     |
+| P01     | 45     | 4%     |
+| P00     | 42     | 3%     |
+
+Die alte MISS-Diagnostik zeigte `pal=2` für alle 30 geloggten Tiles.
+Hypothese: Wenn die Laufzeit-Palette (z.B. 2) nicht mit der Export-Palette
+(z.B. P04) übereinstimmt, dann matcht `SnesHdTileKey::operator==` nicht —
+obwohl der ContentHash identisch ist.
+
+**Tile Matching Logik** (`SnesHdData.h:83-88`):
+```cpp
+return ContentHash == other.ContentHash
+    && PaletteIndex == other.PaletteIndex  // <-- Verdacht: hier scheitert's
+    && LayerIndex == other.LayerIndex;
+```
+
+### Neue Diagnostik (SnesHdVideoFilter.cpp)
+
+Erweiterte Diagnose mit 4 Log-Kategorien:
+
+| Log-Typ        | Was es zeigt                                          | Limit    |
+|----------------|-------------------------------------------------------|----------|
+| `MATCH`        | HD Tile gefunden (hash+pal+layer stimmen überein)     | Erste 5  |
+| `PAL MISMATCH` | ContentHash existiert, aber mit ANDERER Palette       | Erste 20 |
+| `MISS`         | ContentHash gar nicht im Pack (Limit 30 → 60 erhöht) | Erste 60 |
+| `FRAME`        | bgPixels / match / miss / palMismatch / TileByKey + Level-ID | Erste 10 Frames |
+| `CONTEXT CHANGE` | VRAM-Signatur hat sich geändert (Level-Wechsel) | Jedes Mal |
+
+**Kernstück: `PAL MISMATCH`-Erkennung** — Bei jedem MISS werden alle 8 Paletten
+(0-7) durchprobiert. Wenn der ContentHash mit einer anderen Palette im TileByKey
+existiert, wird `PAL MISMATCH` statt `MISS` geloggt. Das bestätigt oder widerlegt
+die Palette-Mismatch-Theorie definitiv.
+
+### Kontext-Erkennung (VRAM-Signatur)
+
+Mesen lädt beim Start automatisch den letzten Spielstand (oft Worldmap).
+Ohne Schutz würden die statischen Diagnose-Zähler auf Worldmap-Daten verbraucht.
+
+**Lösung:** VRAM-basierte Level-Erkennung:
+- Zwei stabile Referenz-Tiles (außerhalb VBlank DMA-Bereich 0x2000-0x21D0):
+  - `0x32E0` → bekannter Hash `0x1585855B0633F405` = **gfxset_37 (Level 2)**
+  - `0x2080` → bekannter Hash `0xF33C58BA8611DF5D` = gfxset_07 (Level 1)
+- Kombinierte Signatur wird jedes Frame berechnet
+- Bei Signatur-Änderung: `CONTEXT CHANGE` geloggt, ALLE Zähler zurückgesetzt
+- FRAME-Log zeigt `[LEVEL2]` oder `[other]` + Signatur-Hash
+
+**Effekt:** Man kann auf der Worldmap starten, zum Level navigieren, und bekommt
+frische Diagnose-Daten genau ab dem Frame wo Level 2 geladen wird.
+
+### Erwartete Test-Ergebnisse
+
+| Szenario | FRAME-Log | Bedeutung |
+|----------|-----------|-----------|
+| A: Palette-Mismatch bestätigt | `match=0, palMismatch=HOCH` | Export-Palette stimmt nicht mit Runtime überein. Fix nötig. |
+| B: Tiles matchen doch | `match=HOCH` | HD Tiles werden geladen, Problem ist Rendering oder BG3-Verdeckung |
+| C: Hash-Mismatch überall | `miss=HOCH, palMismatch=0` | Weder Hash noch Palette stimmt. Tieferes Problem. |
+
+### Gelernt
+
+- `GetMatchingTile()` (`SnesHdData.h:356-382`) ist simpel: `TileByKey.find(key)`,
+  dann erstes nicht-transparentes Tile zurückgeben. Fingerprint-Scoping deaktiviert.
+- Das alte 30-Tile MISS-Limit hat uns blind gemacht für non-DMA Tiles.
+- Das HD Pack enthält ALLE 8 Palette-Varianten für manche Tiles, aber der Großteil
+  hat nur eine spezifische Palette (z.B. P04). Wenn Runtime eine andere verwendet,
+  gibt es keinen Match.
+
+---
 
 ## [2026-06-17] — Cross-Gfxset Tile Contamination Fix
 
