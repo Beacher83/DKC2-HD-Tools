@@ -7089,21 +7089,18 @@ async function exportContainerAsZip(containerName) {
 // --- VRAM-based BG1 chrBase Auto-Detection ---
 // The ROM ppuConfig table stores the INITIAL BG12NBA register value, but DKC2
 // often changes it at runtime (VBlank handler, HDMA, level init code).
-// This function scans the actual VRAM snapshot to determine where non-zero
-// tile data is located by testing all 8 possible chrBase values ($0000-$7000).
 //
-// IMPORTANT: Returns ONLY the single best chrBase (highest data density).
-// Returning multiple chrBases causes cross-layer hash collisions — BG2/BG3 data
-// at other addresses gets incorrectly treated as BG1 tile data, producing wrong
-// HD tile assignments in Mesen's TileByKey lookup.
+// PRIMARY METHOD: Cross-reference chrRawData against vramSnapshot.
+// chrRawData contains the decompressed tile graphics in sequential order.
+// Tile N in chrRawData starts at byte N*bytesPerTile.  We check each candidate
+// chrBase by comparing chrRawData bytes against vramSnapshot bytes at the
+// corresponding VRAM address.  The chrBase with the most byte-for-byte matches
+// is definitively correct — this is deterministic, not heuristic.
 //
-// Scoring: Total non-zero WORDS across ALL sampled tiles, normalized per valid
-// sample.  This is more discriminating than the old boolean "any non-zero" check.
-// Addresses that wrap past $7FFF are SKIPPED (not wrapped) to avoid penalizing
-// high chrBase values like $6000 whose high-index tiles wrap into empty regions.
+// FALLBACK: If chrRawData is unavailable, falls back to density scoring.
 //
 // Returns: Set containing at most ONE chrBase value (the best match), or empty set.
-function detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile) {
+function detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile, chrRawData) {
   const detected = new Set();
   if (!vram || !tileArr || tileArr.length < 2) return detected;
 
@@ -7116,27 +7113,87 @@ function detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile) {
   }
   if (tileIndices.size === 0) return detected;
 
-  // Use ALL unique tile indices (no sampling limit — typically 100-500 indices)
-  const allIndices = [...tileIndices];
-  const wordsInTile = bytesPerTile / 2;  // 16 for 4bpp, 8 for 2bpp
+  // === PRIMARY METHOD: chrRawData cross-reference ===
+  // chrRawData stores tiles sequentially: tile N at byte offset N*bytesPerTile.
+  // In VRAM, tile N is at word address (chrBase + N*wordsPerTile) & 0x7FFF.
+  // We compare the actual bytes to find which chrBase matches.
+  if (chrRawData && chrRawData.length >= bytesPerTile * 2) {
+    const chrData = chrRawData instanceof Uint8Array
+      ? chrRawData : new Uint8Array(chrRawData);
 
-  // Test each of the 8 possible chrBase values and track density scores
+    // Sample non-empty tiles from chrRawData for comparison.
+    // Skip tile 0 (empty) and early tiles (may be VBlank-animated).
+    // Use tiles from indices 30+ to avoid DMA-animated zone.
+    const sampleTiles = [];
+    const sortedIndices = [...tileIndices].sort((a, b) => a - b);
+    for (const idx of sortedIndices) {
+      if (idx < 30) continue;  // skip VBlank DMA zone
+      const chrOff = idx * bytesPerTile;
+      if (chrOff + bytesPerTile > chrData.length) continue;
+      // Check if tile has data in chrRawData (not all zeros)
+      let hasData = false;
+      for (let b = 0; b < bytesPerTile; b++) {
+        if (chrData[chrOff + b] !== 0) { hasData = true; break; }
+      }
+      if (hasData) sampleTiles.push(idx);
+      if (sampleTiles.length >= 40) break;  // 40 samples is enough
+    }
+
+    if (sampleTiles.length >= 5) {
+      let bestCb = -1;
+      let bestMatches = 0;
+      const scores = [];
+      for (let cb = 0; cb <= 0x7000; cb += 0x1000) {
+        let matchCount = 0;
+        for (const idx of sampleTiles) {
+          const chrOff = idx * bytesPerTile;
+          const vramWordAddr = (cb + idx * wordsPerTile) & 0x7FFF;
+          const byteOff = vramWordAddr * 2;
+          if (byteOff + bytesPerTile > vram.length) continue;
+          // Compare chrRawData bytes vs vramSnapshot bytes
+          let match = true;
+          for (let b = 0; b < bytesPerTile; b++) {
+            if (chrData[chrOff + b] !== vram[byteOff + b]) {
+              match = false;
+              break;
+            }
+          }
+          if (match) matchCount++;
+        }
+        scores.push({ cb, matches: matchCount, total: sampleTiles.length });
+        if (matchCount > bestMatches) {
+          bestMatches = matchCount;
+          bestCb = cb;
+        }
+      }
+      console.log(`[detectChrBase] chrRawData cross-ref (${sampleTiles.length} tiles): ${scores.map(s =>
+        `$${s.cb.toString(16).toUpperCase()}=${s.matches}/${s.total}`
+      ).join(', ')}`);
+
+      // Accept if at least 50% of sampled tiles match byte-for-byte
+      if (bestCb >= 0 && bestMatches >= sampleTiles.length * 0.5) {
+        detected.add(bestCb);
+        console.log(`[detectChrBase] → best (chrRawData match): $${bestCb.toString(16).toUpperCase()} (${bestMatches}/${sampleTiles.length})`);
+        return detected;
+      }
+      console.warn(`[detectChrBase] chrRawData cross-ref inconclusive (best: ${bestMatches}/${sampleTiles.length}), falling back to density`);
+    }
+  }
+
+  // === FALLBACK: Density scoring (used when chrRawData unavailable or inconclusive) ===
+  const allIndices = [...tileIndices];
+  const wordsInTile = bytesPerTile / 2;
   let bestCb = -1;
   let bestDensity = 0;
-  const scores = [];  // for diagnostic logging
+  const scores = [];
   for (let cb = 0; cb <= 0x7000; cb += 0x1000) {
     let totalNonZeroWords = 0;
     let validSamples = 0;
     for (const gfxIndex of allIndices) {
-      // IMPORTANT: Do NOT wrap addresses past $7FFF.  High chrBase values
-      // ($5000-$7000) combined with high tile indices wrap around and hit
-      // unrelated/empty VRAM regions, falsely lowering the score.
-      const rawAddr = cb + gfxIndex * wordsPerTile;
-      if (rawAddr > 0x7FFF) continue;  // skip instead of wrapping
-      const byteOff = rawAddr * 2;
+      const vramWordAddr = (cb + gfxIndex * wordsPerTile) & 0x7FFF;
+      const byteOff = vramWordAddr * 2;
       if (byteOff + bytesPerTile > vram.length) continue;
       validSamples++;
-      // Count ALL non-zero words in this tile (not just "any")
       for (let b = 0; b < bytesPerTile; b += 2) {
         if (vram[byteOff + b] !== 0 || vram[byteOff + b + 1] !== 0) {
           totalNonZeroWords++;
@@ -7152,17 +7209,15 @@ function detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile) {
       bestCb = cb;
     }
   }
-  // Log all scores for diagnosis
-  console.log(`[detectChrBase] scores: ${scores.map(s =>
-    `$${s.cb.toString(16).toUpperCase()}=${s.density}% (${s.valid}/${s.total} valid)`
+  console.log(`[detectChrBase] density fallback: ${scores.map(s =>
+    `$${s.cb.toString(16).toUpperCase()}=${s.density}% (${s.valid}/${s.total})`
   ).join(', ')}`);
 
-  // Only return the best chrBase if it has significant density (>50%)
   if (bestCb >= 0 && bestDensity > 0.5) {
     detected.add(bestCb);
-    console.log(`[detectChrBase] → best: $${bestCb.toString(16).toUpperCase()} (${(bestDensity * 100).toFixed(1)}%)`);
+    console.log(`[detectChrBase] → best (density): $${bestCb.toString(16).toUpperCase()} (${(bestDensity * 100).toFixed(1)}%)`);
   } else {
-    console.warn(`[detectChrBase] → no chrBase with >50% density found!`);
+    console.warn(`[detectChrBase] → no chrBase found!`);
   }
   return detected;
 }
@@ -7272,7 +7327,9 @@ async function exportAsTexturePack(containerName) {
       const vram = set.vramSnapshot instanceof Uint8Array
         ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
       const tileArr = new Uint8Array(set.tileArrangementData);
-      const detectedBases = detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile);
+      const chrData = set.chrRawData ? (set.chrRawData instanceof Uint8Array
+        ? set.chrRawData : new Uint8Array(set.chrRawData)) : null;
+      const detectedBases = detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile, chrData);
       if (detectedBases.size > 0) {
         const detectedChrBase = [...detectedBases][0];
         allBg1ChrBases.add(detectedChrBase);
@@ -7667,7 +7724,9 @@ async function exportAsTexturePack(containerName) {
         // Use VRAM detection to find the single best chrBase.  This avoids
         // cross-layer hash collisions from generating entries at wrong addresses.
         const hashChrBases = new Set();
-        const detectedHashBases = detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile);
+        const chrData = set.chrRawData ? (set.chrRawData instanceof Uint8Array
+          ? set.chrRawData : new Uint8Array(set.chrRawData)) : null;
+        const detectedHashBases = detectChrBasesFromVRAM(vram, tileArr, wordsPerTile, bytesPerTile, chrData);
         if (detectedHashBases.size > 0) {
           const detectedChrBase = [...detectedHashBases][0];
           hashChrBases.add(detectedChrBase);
