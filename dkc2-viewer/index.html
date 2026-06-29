@@ -116,6 +116,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DKC2 Level Viewer</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="vram_groundtruth.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -6930,10 +6931,35 @@ async function saveSpritesToContainer(containerName, spriteEntries) {
   return count;
 }
 
+// --- VRAM Ground Truth: auto-apply embedded VRAM snapshots ---
+// Decodes a base64 string to Uint8Array (works in file:// context, no fetch needed).
+function _b64ToUint8Array(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// For each level set without a vramSnapshot, check VRAM_GROUND_TRUTH and auto-apply.
+// Called after loading sets from IndexedDB so all downstream operations benefit.
+function applyGroundTruthVram(sets) {
+  if (typeof VRAM_GROUND_TRUTH === 'undefined') return;
+  for (const set of sets) {
+    if (set.type !== 'level') continue;
+    if (set.vramSnapshot && set.vramSnapshot.length > 0) continue;  // already has one
+    const key = set.setId;  // e.g. "gfxset_07"
+    if (key && VRAM_GROUND_TRUTH[key]) {
+      set.vramSnapshot = _b64ToUint8Array(VRAM_GROUND_TRUTH[key]);
+      console.log(`[groundtruth] Auto-applied VRAM snapshot for ${key} (${set.vramSnapshot.length} bytes)`);
+    }
+  }
+}
+
 // --- Load container into hdPack ---
 
 async function loadContainerToHDPack(containerName) {
   const sets = await hdGetContainerSets(containerName);
+  applyGroundTruthVram(sets);  // auto-patch missing vramSnapshots before any export
   const levelSets = sets.filter(s => s.type === 'level');
   const spriteSets = sets.filter(s => s.type === 'sprite' || s.type === 'mapicon');
 
@@ -7323,6 +7349,11 @@ async function exportAsTexturePack(containerName) {
     // from stored, otherwise the stored one.
     const allBg1ChrBases = new Set();
     const bytesPerTile = wordsPerTile * 2;
+    // Safety fallback: apply ground truth VRAM if still missing at export time
+    if (!set.vramSnapshot && typeof VRAM_GROUND_TRUTH !== 'undefined' && set.setId && VRAM_GROUND_TRUTH[set.setId]) {
+      set.vramSnapshot = _b64ToUint8Array(VRAM_GROUND_TRUTH[set.setId]);
+      console.log(`[groundtruth] Export fallback: applied VRAM for ${set.setId}`);
+    }
     if (set.vramSnapshot) {
       const vram = set.vramSnapshot instanceof Uint8Array
         ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
