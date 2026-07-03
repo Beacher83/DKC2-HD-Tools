@@ -2773,11 +2773,86 @@ function renderLevel(tilePartsImg, tileMap, canvas, showGrid, bgData, fgData, sh
     const renderRight = mapLeft + widthPx;
     const renderBottom = mapTop + heightPx;
 
+    // === Whole-cluster rendering: match cluster patterns in tilemap ===
+    // Before the tile-by-tile loop, find complete cluster matches and render
+    // them as single draw calls. This eliminates seams WITHIN clusters entirely.
+    const coveredPositions = new Set();
+
+    if (useHD && hdPack && hdPack.clusters && hdPack.clusters.length > 0) {
+      // Sort clusters by area descending — larger clusters take priority
+      const sortedClusters = hdPack.clusters
+        .filter(cl => !cl.ids.some(id => id < 0)) // skip clusters with empty positions
+        .map((cl, idx) => ({ cl, idx, area: cl.w * cl.h }))
+        .sort((a, b) => b.area - a.area);
+
+      // Build anchor index: first tile (partId + flip) -> candidate clusters
+      const anchorIndex = new Map();
+      for (const entry of sortedClusters) {
+        const cl = entry.cl;
+        const anchorFlip = cl.flips ? cl.flips[0] : 0;
+        const aKey = `${cl.ids[0]}_${anchorFlip}`;
+        if (!anchorIndex.has(aKey)) anchorIndex.set(aKey, []);
+        anchorIndex.get(aKey).push(entry);
+      }
+
+      for (const [posKey, posTile] of map) {
+        const [pxStr, pyStr] = posKey.split(',');
+        const px = parseInt(pxStr), py = parseInt(pyStr);
+        if (px >= renderRight || py >= renderBottom) continue;
+        if (coveredPositions.has(posKey)) continue;
+
+        // Check if this position's tile matches any cluster anchor
+        const flipVal = (posTile.flipH ? 1 : 0) | (posTile.flipV ? 2 : 0);
+        const aKey = `${posTile.partId}_${flipVal}`;
+        const candidates = anchorIndex.get(aKey);
+        if (!candidates) continue;
+
+        for (const { cl } of candidates) {
+          // Check bounds: cluster must fit within render area
+          if (px + (cl.w - 1) * 32 >= renderRight) continue;
+          if (py + (cl.h - 1) * 32 >= renderBottom) continue;
+
+          // Verify all cluster tiles match the tilemap
+          let match = true;
+          for (let dy = 0; dy < cl.h && match; dy++) {
+            for (let dx = 0; dx < cl.w && match; dx++) {
+              if (dy === 0 && dx === 0) continue; // anchor already matched
+              const mKey = `${px + dx * 32},${py + dy * 32}`;
+              if (coveredPositions.has(mKey)) { match = false; break; }
+              const mTile = map.get(mKey);
+              if (!mTile) { match = false; break; }
+              const expectedId = cl.ids[dy * cl.w + dx];
+              const expectedFlip = cl.flips ? cl.flips[dy * cl.w + dx] : 0;
+              const mFlip = (mTile.flipH ? 1 : 0) | (mTile.flipV ? 2 : 0);
+              if (mTile.partId !== expectedId || mFlip !== expectedFlip) { match = false; }
+            }
+          }
+
+          if (match) {
+            // Draw whole cluster image in one call — zero seams within cluster
+            const toX = (px - mapLeft) * hdScale;
+            const toY = (py - mapTop) * hdScale;
+            ctx.drawImage(cl.image, 0, 0, cl.image.width, cl.image.height,
+              toX, toY, cl.w * ts, cl.h * ts);
+
+            // Mark all positions as covered
+            for (let dy = 0; dy < cl.h; dy++) {
+              for (let dx = 0; dx < cl.w; dx++) {
+                coveredPositions.add(`${px + dx * 32},${py + dy * 32}`);
+              }
+            }
+            break; // anchor covered, next position
+          }
+        }
+      }
+    }
+
     for (const [key, tile] of map) {
       const [ixStr, iyStr] = key.split(',');
       const ix = parseInt(ixStr);
       const iy = parseInt(iyStr);
       if (ix >= renderRight || iy >= renderBottom) continue;
+      if (coveredPositions.has(key)) continue; // already drawn by whole-cluster rendering
 
       // Scale canvas coordinates to HD resolution
       const toX = (ix - mapLeft) * hdScale;
@@ -6350,7 +6425,7 @@ async function exportCatalogAsZip() {
 
     const manifest = {
       exportDate: new Date().toISOString(),
-      exportVersion: 3,
+      exportVersion: 4,
       gfxSetIndex: catalogData.gfxSetIndex ?? null,
       mode: catalogMode,
       scaleFactor: 1, // original scale; HD import will set this to 4 etc.
@@ -6370,32 +6445,79 @@ async function exportCatalogAsZip() {
     let exported = 0;
     const totalItems = catalogData.bg1Tiles.length + allClusters.length + 2;
 
-    // === Step 3: Export Clusters (primary upscaling units) ===
+    // === Step 3: Export Clusters with 1-tile padding ring ===
     btn.textContent = 'Exporting clusters...';
     await new Promise(r => setTimeout(r, 0));
 
-    // Export auto-detected clusters (clean only, no padding — cluster itself provides context)
+    // Helper: build a padded cluster canvas with 1-tile context ring.
+    // The ring gives the AI upscaler full neighbor context at cluster edges,
+    // eliminating smoothing artifacts that cause visible tile seams.
+    function buildPaddedClusterCanvas(ids, w, h, flips) {
+      const pw = w + 2, ph = h + 2;
+      const canvas = new OffscreenCanvas(pw * 32, ph * 32);
+      const ctx = canvas.getContext('2d');
+
+      // Draw actual cluster tiles offset by 1 tile
+      for (let dy = 0; dy < h; dy++) {
+        for (let dx = 0; dx < w; dx++) {
+          const idx = dy * w + dx;
+          drawTile(ctx, ids[idx], (dx + 1) * 32, (dy + 1) * 32, flips[idx]);
+        }
+      }
+
+      // Padding: top row
+      for (let dx = 0; dx < w; dx++) {
+        const padId = bestNeighbor(ids[dx], 'T');
+        drawTile(ctx, padId, (dx + 1) * 32, 0);
+      }
+      // Padding: bottom row
+      for (let dx = 0; dx < w; dx++) {
+        const padId = bestNeighbor(ids[(h - 1) * w + dx], 'B');
+        drawTile(ctx, padId, (dx + 1) * 32, (h + 1) * 32);
+      }
+      // Padding: left column
+      for (let dy = 0; dy < h; dy++) {
+        const padId = bestNeighbor(ids[dy * w], 'L');
+        drawTile(ctx, padId, 0, (dy + 1) * 32);
+      }
+      // Padding: right column
+      for (let dy = 0; dy < h; dy++) {
+        const padId = bestNeighbor(ids[dy * w + (w - 1)], 'R');
+        drawTile(ctx, padId, (w + 1) * 32, (dy + 1) * 32);
+      }
+
+      // Corners (transitive via bestNeighbor chains)
+      const tlTop = bestNeighbor(ids[0], 'T');
+      drawTile(ctx, tlTop >= 0 ? bestNeighbor(tlTop, 'L') : -1, 0, 0);
+      const trTop = bestNeighbor(ids[w - 1], 'T');
+      drawTile(ctx, trTop >= 0 ? bestNeighbor(trTop, 'R') : -1, (w + 1) * 32, 0);
+      const blBot = bestNeighbor(ids[(h - 1) * w], 'B');
+      drawTile(ctx, blBot >= 0 ? bestNeighbor(blBot, 'L') : -1, 0, (h + 1) * 32);
+      const brBot = bestNeighbor(ids[(h - 1) * w + (w - 1)], 'B');
+      drawTile(ctx, brBot >= 0 ? bestNeighbor(brBot, 'R') : -1, (w + 1) * 32, (h + 1) * 32);
+
+      return canvas;
+    }
+
+    // Export auto-detected clusters (with 1-tile padding ring for AI context)
     if (!expClusters) { /* skip clusters */ } else
     for (let ci = 0; ci < (catalogData.clusters || []).length; ci++) {
       const cluster = catalogData.clusters[ci];
+      const clFlips = cluster.flips || cluster.ids.map(() => 0);
       const filename = `cluster_${ci}_${cluster.w}x${cluster.h}.png`;
 
-      const cleanCanvas = new OffscreenCanvas(cluster.widthPx, cluster.heightPx);
-      const cCtx = cleanCanvas.getContext('2d');
-      for (let dy = 0; dy < cluster.h; dy++) {
-        for (let dx = 0; dx < cluster.w; dx++) {
-          const idx = dy * cluster.w + dx;
-          drawTile(cCtx, cluster.ids[idx], dx * 32, dy * 32, cluster.flips ? cluster.flips[idx] : 0);
-        }
-      }
-      clustersFolder.file(filename, await canvasToBlob(cleanCanvas));
+      const paddedCanvas = buildPaddedClusterCanvas(cluster.ids, cluster.w, cluster.h, clFlips);
+      clustersFolder.file(filename, await canvasToBlob(paddedCanvas));
 
       manifest.clusters.push({
         file: `clusters/${filename}`,
         w: cluster.w, h: cluster.h,
         widthPx: cluster.widthPx, heightPx: cluster.heightPx,
+        paddingTiles: 1,
+        paddedWidthPx: (cluster.w + 2) * 32,
+        paddedHeightPx: (cluster.h + 2) * 32,
         ids: cluster.ids,
-        flips: cluster.flips || cluster.ids.map(() => 0),
+        flips: clFlips,
         uniqueTiles: cluster.uniqueTiles,
         occurrences: cluster.count,
         visibleRatio: cluster.visiblePixelRatio,
@@ -6409,28 +6531,25 @@ async function exportCatalogAsZip() {
       }
     }
 
-    // Export manual clusters (clean only, same as auto)
+    // Export manual clusters (with 1-tile padding ring)
     if (!expClusters) { /* skip */ } else
     for (let mi = 0; mi < manualClusters.length; mi++) {
       const mc = manualClusters[mi];
+      const mcFlips = mc.flips || mc.ids.map(() => 0);
       const filename = `manual_${mi}_${mc.w}x${mc.h}.png`;
 
-      const cleanCanvas = new OffscreenCanvas(mc.w * 32, mc.h * 32);
-      const cCtx = cleanCanvas.getContext('2d');
-      for (let dy = 0; dy < mc.h; dy++) {
-        for (let dx = 0; dx < mc.w; dx++) {
-          const idx = dy * mc.w + dx;
-          drawTile(cCtx, mc.ids[idx], dx * 32, dy * 32, mc.flips ? mc.flips[idx] : 0);
-        }
-      }
-      clustersFolder.file(filename, await canvasToBlob(cleanCanvas));
+      const paddedCanvas = buildPaddedClusterCanvas(mc.ids, mc.w, mc.h, mcFlips);
+      clustersFolder.file(filename, await canvasToBlob(paddedCanvas));
 
       manifest.manualClusters.push({
         file: `clusters/${filename}`,
         w: mc.w, h: mc.h,
         widthPx: mc.w * 32, heightPx: mc.h * 32,
+        paddingTiles: 1,
+        paddedWidthPx: (mc.w + 2) * 32,
+        paddedHeightPx: (mc.h + 2) * 32,
         ids: mc.ids,
-        flips: mc.flips || mc.ids.map(() => 0),
+        flips: mcFlips,
         uniqueTiles: mc.uniqueTiles,
         levelId: mc.levelId, levelName: mc.levelName,
         tileIds: [...new Set(mc.ids.filter(id => id >= 0))],
@@ -6560,7 +6679,7 @@ async function exportCatalogAsZip() {
 
     const sizeMB = (zipBlob.size / 1024 / 1024).toFixed(1);
     btn.textContent = `Done! (${sizeMB} MB)`;
-    console.log(`Export v2: ${manifest.stats.totalTiles} tiles (${coveredCount} covered, ${uncoveredCount} uncovered), ${manifest.stats.totalClusters} auto + ${manifest.stats.manualClusters} manual clusters, ${sizeMB} MB`);
+    console.log(`Export v4: ${manifest.stats.totalTiles} tiles (${coveredCount} covered, ${uncoveredCount} uncovered), ${manifest.stats.totalClusters} auto + ${manifest.stats.manualClusters} manual clusters, padded clusters, ${sizeMB} MB`);
     setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 3000);
 
   } catch (err) {
@@ -6974,8 +7093,25 @@ async function importHDPack(file) {
     btn.textContent = 'Loading tiles...';
     await new Promise(r => setTimeout(r, 0));
     
+    // === Score-based tile selection (v4) ===
+    // Instead of first-wins, collect ALL candidates per tile with quality scores.
+    // Phase 2 picks the best version — inner cluster tiles beat edge tiles,
+    // padded sources beat unpadded, larger clusters beat smaller ones.
+    const PADDED_INDIVIDUAL_SCORE = 12;
+    function tileScore(clusterArea, exposedEdges, hasPadding) {
+      const realContext = 4 - exposedEdges;  // 0-4 real neighbors in cluster
+      const sizeBonus = Math.min(Math.floor(clusterArea / 4), 6);  // 0-6
+      const paddingBonus = hasPadding ? 10 : 0;
+      return paddingBonus + sizeBonus + realContext;
+    }
+    
+    const tileCandidates = new Map(); // tileKey -> [{ img, score, source }]
+    function addCandidate(tileKey, img, score, source) {
+      if (!tileCandidates.has(tileKey)) tileCandidates.set(tileKey, []);
+      tileCandidates.get(tileKey).push({ img, score, source });
+    }
+    
     // Load individual tile HD textures
-    const hdTiles = new Map();
     let scaleDetected = false;
     
     for (const tileInfo of manifest.tiles) {
@@ -6985,7 +7121,7 @@ async function importHDPack(file) {
       let img = await loadImage(tileInfo.file);
       if (!img) continue;
       
-      const isPadded = tileInfo.padded !== false; // v3: tiles are padded (96x96 at 1x)
+      const isPadded = tileInfo.padded !== false; // v3+: tiles are padded (96x96 at 1x)
       
       // Auto-detect scale factor from first image
       if (!scaleDetected) {
@@ -6999,7 +7135,6 @@ async function importHDPack(file) {
       }
       
       // Extract center tile from padded image
-      // Key includes gfxSetIndex to prevent collision between different gfxsets
       const hdTileKey = manifest.gfxSetIndex !== undefined ? `${manifest.gfxSetIndex}_${tileInfo.id}` : tileInfo.id;
       if (isPadded) {
         const tileSize = scaleFactor * 32;
@@ -7007,16 +7142,16 @@ async function importHDPack(file) {
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, tileSize, tileSize, tileSize, tileSize, 0, 0, tileSize, tileSize);
         img.close();
-        hdTiles.set(hdTileKey, await createImageBitmap(canvas));
+        addCandidate(hdTileKey, await createImageBitmap(canvas), PADDED_INDIVIDUAL_SCORE, 'individual_padded');
       } else {
-        hdTiles.set(hdTileKey, img);
+        addCandidate(hdTileKey, img, 8, 'individual_unpadded');
       }
     }
     
     btn.textContent = 'Loading clusters...';
     await new Promise(r => setTimeout(r, 0));
     
-    // Load cluster HD textures
+    // Load cluster HD textures with score-based tile extraction
     const hdClusters = [];
     const allClusterEntries = [...(manifest.clusters || []), ...(manifest.manualClusters || [])];
     
@@ -7024,49 +7159,105 @@ async function importHDPack(file) {
       let img = await loadImage(clInfo.file);
       if (!img) continue;
       
-      // Auto-detect scale if not done yet
+      const hasPadding = (clInfo.paddingTiles || 0) > 0;
+      const padTiles = clInfo.paddingTiles || 0;
+      
+      // Auto-detect scale: account for padding in image dimensions
       if (!scaleDetected) {
-        scaleFactor = Math.round(img.width / (clInfo.w * 32));
+        const imgLogicalW = hasPadding ? (clInfo.w + 2 * padTiles) * 32 : clInfo.w * 32;
+        scaleFactor = Math.round(img.width / imgLogicalW);
         if (scaleFactor < 1) scaleFactor = 1;
         scaleDetected = true;
       }
       
-      const clusterImg = img;
-      
-      // Also extract individual tiles from the cluster image for tile-level rendering
       const tileSize = scaleFactor * 32;
-      const tileIds = clInfo.tileIds || [...new Set((clInfo.ids || []).filter(id => id >= 0))];
+      const padOffset = padTiles * tileSize;
+      
+      // Crop padded image to get clean cluster content for whole-cluster rendering
+      let clusterImg;
+      if (hasPadding) {
+        const cropW = clInfo.w * tileSize;
+        const cropH = clInfo.h * tileSize;
+        const cropCanvas = new OffscreenCanvas(cropW, cropH);
+        const cropCtx = cropCanvas.getContext('2d');
+        cropCtx.drawImage(img, padOffset, padOffset, cropW, cropH, 0, 0, cropW, cropH);
+        clusterImg = await createImageBitmap(cropCanvas);
+      } else {
+        clusterImg = img;
+      }
+      
+      // Extract individual tiles with quality scoring
+      const clusterArea = clInfo.w * clInfo.h;
       for (let dy = 0; dy < clInfo.h; dy++) {
         for (let dx = 0; dx < clInfo.w; dx++) {
           const tileId = clInfo.ids[dy * clInfo.w + dx];
+          if (tileId < 0) continue;
           const clTileKey = manifest.gfxSetIndex !== undefined ? `${manifest.gfxSetIndex}_${tileId}` : tileId;
-          if (tileId < 0 || hdTiles.has(clTileKey)) continue;
-          // Extract this tile from the cluster, un-flipping if the cluster stored it flipped.
-          // Cluster PNGs are built with flip transforms applied, so we must invert them here
-          // to get the canonical base tile — the render loop re-applies flips at draw time.
+          
+          // Count exposed edges at this position
+          let exposedEdges = 0;
+          if (dy === 0) exposedEdges++;
+          if (dy === clInfo.h - 1) exposedEdges++;
+          if (dx === 0) exposedEdges++;
+          if (dx === clInfo.w - 1) exposedEdges++;
+          
+          const score = tileScore(clusterArea, exposedEdges, hasPadding);
+          
+          // Extract tile from image (with padding offset), un-flipping to get canonical base tile
           const flipVal = clInfo.flips ? clInfo.flips[dy * clInfo.w + dx] : 0;
           const fH = !!(flipVal & 1), fV = !!(flipVal & 2);
+          const srcX = padOffset + dx * tileSize;
+          const srcY = padOffset + dy * tileSize;
           const tc = new OffscreenCanvas(tileSize, tileSize);
           const tcCtx = tc.getContext('2d');
           if (fH || fV) {
             tcCtx.save();
             tcCtx.translate(fH ? tileSize : 0, fV ? tileSize : 0);
             tcCtx.scale(fH ? -1 : 1, fV ? -1 : 1);
-            tcCtx.drawImage(clusterImg, dx * tileSize, dy * tileSize, tileSize, tileSize, 0, 0, tileSize, tileSize);
+            tcCtx.drawImage(img, srcX, srcY, tileSize, tileSize, 0, 0, tileSize, tileSize);
             tcCtx.restore();
           } else {
-            tcCtx.drawImage(clusterImg, dx * tileSize, dy * tileSize, tileSize, tileSize, 0, 0, tileSize, tileSize);
+            tcCtx.drawImage(img, srcX, srcY, tileSize, tileSize, 0, 0, tileSize, tileSize);
           }
-          hdTiles.set(clTileKey, await createImageBitmap(tc));
+          
+          addCandidate(clTileKey, await createImageBitmap(tc), score,
+            `cluster_${clInfo.w}x${clInfo.h}_pos${dx},${dy}_edges${exposedEdges}`);
         }
       }
       
       hdClusters.push({
         ids: clInfo.ids,
+        flips: clInfo.flips || clInfo.ids.map(() => 0),
         w: clInfo.w,
         h: clInfo.h,
         image: clusterImg,
       });
+      
+      // Free the original padded image (we have the cropped clusterImg + extracted tiles)
+      if (hasPadding) {
+        img.close();
+      }
+    }
+    
+    // Phase 2: Select best candidate per tile, close losers to free memory
+    const hdTiles = new Map();
+    let scoringChoices = 0;
+    for (const [tileKey, candidates] of tileCandidates) {
+      candidates.sort((a, b) => b.score - a.score);
+      const best = candidates[0];
+      hdTiles.set(tileKey, best.img);
+      
+      for (let i = 1; i < candidates.length; i++) {
+        candidates[i].img.close();
+      }
+      
+      if (candidates.length > 1) {
+        scoringChoices++;
+        console.log(`HD tile ${tileKey}: chose ${best.source} (score ${best.score}) over ${candidates.length - 1} alt(s)`);
+      }
+    }
+    if (scoringChoices > 0) {
+      console.log(`HD scoring: resolved ${scoringChoices} tiles with multiple candidates`);
     }
     
     // Load BG2/BG3 HD

@@ -1,5 +1,61 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-03b] — Tile Seam Elimination (3 Interconnected Improvements)
+
+### Problem
+
+HD-upscaled tiles showed visible seams at tile boundaries because:
+1. **Edge tiles** in clusters had no outer context for the AI upscaler, causing
+   smoothing/anti-aliasing artifacts at cluster edges
+2. **First-wins import** — if a tile appeared in multiple clusters, the first
+   processed version won regardless of quality (edge vs inner tile)
+3. **Covered tiles** in clusters were never exported individually with padding,
+   removing the fallback for edge cases
+
+### Improvement 1: Padded Cluster Export (Export v4)
+
+- `buildPaddedClusterCanvas()` — Creates `(w+2)×(h+2)` tile canvas with a 1-tile
+  padding ring using `bestNeighbor()` statistics from tilemap analysis
+- **Padding ring**: top/bottom rows, left/right columns, 4 corners (transitive via
+  bestNeighbor chains) — gives the AI upscaler full neighbor context at every edge
+- Both auto-detected and manual clusters get padding
+- Manifest entries include `paddingTiles: 1`, `paddedWidthPx`, `paddedHeightPx`
+- Backwards compatible: old manifests without `paddingTiles` default to 0
+
+### Improvement 2: Score-Based Tile Import
+
+- Replaced first-wins `hdTiles.has()` check with quality scoring system
+- `tileScore(clusterArea, exposedEdges, hasPadding)`:
+  - `realContext = 4 - exposedEdges` (0-4 real neighbors)
+  - `sizeBonus = min(floor(area/4), 6)` (larger clusters = better context)
+  - `paddingBonus = hasPadding ? 10 : 0`
+- Individual padded tiles: `PADDED_INDIVIDUAL_SCORE = 12`
+- Score examples: large padded cluster inner=20, 1-edge=19, corner=18;
+  small padded 2×2 corner=13; padded individual=12; unpadded cluster inner=10
+- Phase 1: collect all candidates per tile; Phase 2: pick highest score, close() losers
+- Debug logging shows scoring decisions for tiles with multiple candidates
+- Padding offset: `padOffset = paddingTiles * tileSize` for correct tile extraction
+  from padded cluster images
+
+### Improvement 3: Whole-Cluster Rendering
+
+- Before the tile-by-tile loop in `renderLevel()`, pattern-matches the tilemap against
+  known cluster patterns
+- **Anchor index**: `(partId, flip)` → candidate clusters for O(1) lookup
+- Clusters sorted by area descending (larger clusters take priority)
+- When a match is found, renders the WHOLE upscaled cluster image in one `drawImage()`
+  call — zero seams within the cluster
+- `coveredPositions` Set prevents double-drawing in the tile-by-tile fallback loop
+- Clusters with empty positions (id < 0) are skipped for whole-cluster rendering
+- `flips` array stored in `hdClusters` for flip-aware pattern matching
+
+### Technical Details
+
+- Export version bumped: 3 → 4
+- `hdClusters` now includes `flips` array (previously missing)
+- Cluster images cropped from padded source at import time for whole-cluster rendering
+- Original padded images freed after tile extraction to save memory
+
 ## [2026-07-03] — BG1 Foreground Overlay + SSB Fine-Tuning + Syntax Fix
 
 ### Critical Bug Fix
