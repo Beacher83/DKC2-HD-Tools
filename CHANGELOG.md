@@ -1,5 +1,63 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-03] — BG1 Foreground Overlay + SSB Fine-Tuning + Syntax Fix
+
+### Critical Bug Fix
+
+- **Missing closing brace in `loadLevelBackground()`** — A missing `}` that closed the
+  `if (ppu.bg3.enabled)` block caused a syntax error preventing ROM loading entirely.
+
+### New Feature: BG1 Foreground Overlay Detection
+
+DKC2 uses three distinct foreground layer types. Previously only SSB (Sub-Screen-Blend)
+and standard color math (BG3 fog) were supported. This adds the third type:
+
+**BG1 Overlay** — e.g., Gusty Glade (ppuConfig 0x1D):
+- BG3 = background (sky/trees), BG2 = terrain (platforms), BG1 = foreground overlay (wind leaves)
+- BG1 has a **separate chrBase** ($7000) from BG2 terrain ($2000) and its own VRAM tilemap ($5800)
+- No color math involved — fully opaque overlay (alpha=1.0)
+- Previously, BG1 leaves were incorrectly composited into the background image
+
+**Detection heuristic** (`bg1IsSeparateOverlay`):
+```
+bg1TmLoaded && !isSubScreenBlend && ppu.bg2.enabled && (ppu.bg1.chrBase !== ppu.bg2.chrBase)
+```
+
+**Distinction from Hot Head Hop foreground tiles:**
+Hot Head Hop foreground elements are Map32 tiles (tileArrangement) with priority bit 13 —
+same chrBase as terrain. Gusty Glade leaves are on a separate BG1 VRAM tilemap with a
+different chrBase — structurally a different SNES layer.
+
+### Changes
+
+- **`loadLevelBackground()`**: New `bg1IsSeparateOverlay` flag; BG1 excluded from bgData
+  when true; new block renders BG1 as `fgData` with `mode: 'bg1overlay'`, `source: 'bg1'`,
+  `alpha: 1.0`
+- **`buildCatalog()`**: Mode check extended to accept `'colormath' || 'bg1overlay'`;
+  `mode` field added to ssbFgImage metadata
+- **`buildCatalogByGfxSet()`**: Same mode check extension + `mode` field propagation
+- **`renderCatalog()`**: Dynamic label — "BG1 Foreground Overlay (priority, opaque)" for
+  bg1overlay vs "Color Math Foreground - BG1/BG3 (...)" for colormath
+- **`saveCurrentHDToContainer()`**: Mode gate updated to `mode === 'colormath' || mode === 'bg1overlay'`
+- **`refreshContainerSetMetadata()`**: Same mode gate update
+- **Console logging**: Uses "FG-Overlay" and "FG overlay cached" labels for bg1overlay
+
+### Three BG1 Foreground Layer Types (Summary)
+
+| Type | Example | fgData.mode | fgData.source | Alpha | Color Math |
+|------|---------|-------------|---------------|-------|------------|
+| SSB (Sub-Screen-Blend) | Rambi Rumble | `colormath` | `bg1` | 0.35/0.25 | Yes |
+| BG1 Overlay | Gusty Glade | `bg1overlay` | `bg1` | 1.0 | No |
+| Standard Color Math | Mainbrace Mayhem | `colormath` | `bg3` | 0.25/0.20 | Yes |
+
+### Pipeline Compatibility
+
+All downstream pipeline checks use `source === 'bg1'` (not `mode === 'colormath'`),
+so bg1overlay flows through the existing cmFg pipeline automatically. Only the mode-gate
+checks at pipeline entry points needed updating.
+
+---
+
 ## [2026-06-22b] — Single-Best-ChrBase Detection (Fix v2 for Issue B)
 
 ### Problem with Previous Approach

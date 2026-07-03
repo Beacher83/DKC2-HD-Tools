@@ -739,7 +739,7 @@ class GrowBuffer {
 // ============================================================
 // Rare Decompression (from decompress.cpp)
 // ============================================================
-function rareDecompress(rom) {
+function rareDecompress(rom, label = '') {
   const dst = new GrowBuffer(65536);
   const startPos = rom.getPosition();
   rom.skip(1); // skip first byte
@@ -782,7 +782,9 @@ function rareDecompress(rom) {
       case 0x3F: {
         d = rom.readByte();
         const times = d >> 4;
-        if (times === 0) return dst;
+        if (times === 0) {
+          return dst;
+        }
         for (let i = 0; i < times; i++) {
           const b = rom.readByte();
           dst.writeByte(((d & 0x0F) << 4) | (b >> 4));
@@ -903,7 +905,9 @@ function rareDecompress(rom) {
       }
       case 0x00: {
         const times = d & 0x0F;
-        if (times === 0) return dst;
+        if (times === 0) {
+          return dst;
+        }
         for (let i = 0; i < times; i++) {
           d = rom.readByte();
           dst.writeByte(d);
@@ -1011,11 +1015,11 @@ function rareDecompress(rom) {
         break;
       }
       default:
-        console.warn('Unknown decompress opcode:', t.toString(16), 'at rom pos', rom.getPosition().toString(16));
+        console.warn(`[DECOMP] ${label} unknown opcode t=0x${t.toString(16)}, ${dst.getPosition()} bytes output`);
         return dst;
     }
   }
-  console.warn('Decompress: max iterations reached');
+  console.warn(`[DECOMP] ${label} hit MAX_ITER (${MAX_ITER}), ${dst.getPosition()} bytes output`);
   return dst;
 }
 
@@ -1421,6 +1425,231 @@ function renderBgLayer(vram, bgConfig, palette, is4bpp, imgData, widthPx, height
   }
 }
 
+// Render BG3 foreground for ShipDeck levels (Pirate Panic, Gangplank Galley, etc.)
+// The ShipDeck BG3 uses a two-level metatile system streamed by the scroll engine:
+//   - DATA_F52087: 49 metatile definitions, each = 4×4 grid of SNES tilemap words (32 bytes)
+//   - DATA_F526A7: 40×16 metatile map (rows=horizontal scroll, cols=vertical extent)
+// This function reads both from ROM, expands metatiles, and renders the full 1280×512px map.
+// priorityFilter: null=all tiles, 0=only pri-0 tiles, 1=only pri-1 tiles
+function loadBg3ShipDeckMap(rom, vram, chrBaseWord, palette, priorityFilter) {
+  // ROM addresses (HiROM offsets, SMC header already stripped)
+  const METATILE_DEFS_ADDR = 0x352087;  // DATA_F52087 = incbin Layer3_ShipDeck.bin
+  const METATILE_MAP_ADDR  = 0x3526A7;  // DATA_F526A7 = inline metatile map
+  const NUM_METATILES = 49;              // indices 0-48 ($00-$30)
+  const BYTES_PER_METATILE = 32;         // 4×4 grid × 2 bytes per tile word
+  const MAP_ROWS = 40;                   // horizontal scroll extent (X scroll $B6 indexes rows)
+  const MAP_COLS = 16;                   // vertical extent (Y scroll $17C0 indexes columns)
+
+  // Read metatile definitions: each = 16 SNES tilemap words in 4×4 row-major order
+  //   word[0..3] = row 0, word[4..7] = row 1, word[8..11] = row 2, word[12..15] = row 3
+  const metatileDefs = [];
+  for (let m = 0; m < NUM_METATILES; m++) {
+    const words = new Uint16Array(16);
+    for (let w = 0; w < 16; w++) {
+      words[w] = rom.readWordAt(METATILE_DEFS_ADDR + m * BYTES_PER_METATILE + w * 2);
+    }
+    metatileDefs.push(words);
+  }
+
+  // Read metatile map: 40 rows × 16 columns of metatile index words
+  // Word format: vh0iiiii iiiiiiii (bit15=V-flip, bit14=H-flip, bits 0-12=metatile index)
+  const metatileMap = [];
+  for (let row = 0; row < MAP_ROWS; row++) {
+    const rowData = new Uint16Array(MAP_COLS);
+    for (let col = 0; col < MAP_COLS; col++) {
+      rowData[col] = rom.readWordAt(METATILE_MAP_ADDR + (row * MAP_COLS + col) * 2);
+    }
+    metatileMap.push(rowData);
+  }
+
+  // Output image: rows → X axis (horizontal scroll), cols → Y axis (vertical)
+  const widthPx = MAP_ROWS * 32;   // 1280
+  const heightPx = MAP_COLS * 32;  // 512
+  const imgData = new ImageData(widthPx, heightPx);
+
+  const chrBase = chrBaseWord * 2;  // word address → byte address in VRAM
+  const bytesPerTile = 16;          // 2bpp: 16 bytes per 8×8 tile
+  const colorsPerRow = 4;           // 2bpp: 4 colors per palette row
+
+  let tilesRendered = 0;
+  let metatilesRendered = 0;
+  let pri0Count = 0, pri1Count = 0;
+
+  for (let row = 0; row < MAP_ROWS; row++) {
+    for (let col = 0; col < MAP_COLS; col++) {
+      const entry = metatileMap[row][col];
+      if (entry === 0) continue;  // $0000 = empty/transparent
+
+      const metaIdx = entry & 0x1FFF;        // bits 0-12: metatile index
+      const metaFlipH = !!(entry & 0x4000);  // bit 14: H-flip entire metatile
+      const metaFlipV = !!(entry & 0x8000);  // bit 15: V-flip entire metatile
+
+      if (metaIdx >= NUM_METATILES) {
+        console.warn(`  BG3 ShipDeck: metatile index ${metaIdx} out of range at row=${row}, col=${col}`);
+        continue;
+      }
+
+      const metaDef = metatileDefs[metaIdx];
+      metatilesRendered++;
+
+      // Metatile pixel position: rows→X, cols→Y
+      const metaX = row * 32;
+      const metaY = col * 32;
+
+      // Expand 4×4 metatile grid to individual 8×8 tiles
+      for (let my = 0; my < 4; my++) {
+        for (let mx = 0; mx < 4; mx++) {
+          // When metatile is flipped, read sub-tiles in reversed order
+          const srcMx = metaFlipH ? (3 - mx) : mx;
+          const srcMy = metaFlipV ? (3 - my) : my;
+          let tileWord = metaDef[srcMy * 4 + srcMx];
+
+          // XOR flip bits of individual tile with metatile flip (hardware behavior)
+          if (metaFlipH) tileWord ^= 0x4000;
+          if (metaFlipV) tileWord ^= 0x8000;
+
+          const tileNum = tileWord & 0x03FF;
+          const palRow = (tileWord >> 10) & 7;
+          const tilePri = (tileWord >> 13) & 1;
+          const flipH = !!(tileWord & 0x4000);
+          const flipV = !!(tileWord & 0x8000);
+
+          // Count priorities for diagnostics
+          if (tileNum !== 0 || palRow !== 0) {
+            if (tilePri) pri1Count++; else pri0Count++;
+          }
+
+          // Apply priority filter
+          if (priorityFilter !== null && priorityFilter !== undefined && tilePri !== priorityFilter) continue;
+
+          // Skip empty tiles (tile 0 with palette row 0)
+          if (tileNum === 0 && palRow === 0) continue;
+
+          const chrOffset = chrBase + tileNum * bytesPerTile;
+          if (chrOffset + bytesPerTile > vram.length) continue;
+
+          const px = metaX + mx * 8;
+          const py = metaY + my * 8;
+
+          // Render 8×8 2bpp tile (identical logic to renderBgLayer)
+          for (let tileRow = 0; tileRow < 8; tileRow++) {
+            const bp1 = vram[chrOffset + tileRow * 2];
+            const bp2 = vram[chrOffset + tileRow * 2 + 1];
+            for (let tileCol = 0; tileCol < 8; tileCol++) {
+              const shift = 7 - tileCol;
+              const c = ((bp1 >> shift) & 1) | (((bp2 >> shift) & 1) << 1);
+              if (c === 0) continue;  // color 0 = transparent
+
+              const fx = flipH ? (7 - tileCol) : tileCol;
+              const fy = flipV ? (7 - tileRow) : tileRow;
+              const dstX = px + fx;
+              const dstY = py + fy;
+              if (dstX >= widthPx || dstY >= heightPx) continue;
+
+              const palIdx = palRow * colorsPerRow + c;
+              if (palIdx >= palette.length) continue;
+              const [r, g, b] = snesColorToRGBA(palette[palIdx]);
+              const idx = (dstY * widthPx + dstX) * 4;
+              imgData.data[idx] = r;
+              imgData.data[idx + 1] = g;
+              imgData.data[idx + 2] = b;
+              imgData.data[idx + 3] = 255;
+            }
+          }
+          tilesRendered++;
+        }
+      }
+    }
+  }
+
+  console.log(`  BG3 ShipDeck: ${metatilesRendered} metatiles, ${tilesRendered} tiles rendered (${widthPx}x${heightPx}px, pri0=${pri0Count}, pri1=${pri1Count}, filter=${priorityFilter ?? 'all'})`);
+  return { imgData, widthPx, heightPx, tilesRendered, metatilesRendered, pri0Count, pri1Count };
+}
+
+// Generate a "virtual tilemap" for ShipDeck BG3 by expanding all metatiles into a flat
+// 160×64 tilemap array.  This replaces the all-zeros VRAM tilemap ($7800) so the
+// entire existing HD-pack export pipeline (per-tile PNG, hashes, dedup, un-flip) works
+// without any changes.
+//
+// Layout matches the 1280×512px bg3.png image produced by loadBg3ShipDeckMap():
+//   tileX = row*4 + mx   (0..159,  rows = horizontal scroll extent)
+//   tileY = col*4 + my   (0..63,   cols = vertical extent)
+//   tilemapData[(tileY * 160 + tileX) * 2 ...] = LE tile word
+//
+// Returns { tilemapData: Array<number>, tilesW: 160, tilesH: 64 }
+// tilemapData is a byte array (low byte first per word), same format as bg3TilemapData
+// used throughout the export pipeline.
+function expandShipDeckMetatilesToTilemap(rom) {
+  const METATILE_DEFS_ADDR = 0x352087;
+  const METATILE_MAP_ADDR  = 0x3526A7;
+  const NUM_METATILES = 49;
+  const BYTES_PER_METATILE = 32;
+  const MAP_ROWS = 40;   // horizontal scroll extent → tileX
+  const MAP_COLS = 16;   // vertical extent → tileY
+
+  const TILES_W = MAP_ROWS * 4;  // 160
+  const TILES_H = MAP_COLS * 4;  // 64
+
+  // Read metatile definitions (same as loadBg3ShipDeckMap)
+  const metatileDefs = [];
+  for (let m = 0; m < NUM_METATILES; m++) {
+    const words = new Uint16Array(16);
+    for (let w = 0; w < 16; w++) {
+      words[w] = rom.readWordAt(METATILE_DEFS_ADDR + m * BYTES_PER_METATILE + w * 2);
+    }
+    metatileDefs.push(words);
+  }
+
+  // Read metatile map
+  const metatileMap = [];
+  for (let row = 0; row < MAP_ROWS; row++) {
+    const rowData = new Uint16Array(MAP_COLS);
+    for (let col = 0; col < MAP_COLS; col++) {
+      rowData[col] = rom.readWordAt(METATILE_MAP_ADDR + (row * MAP_COLS + col) * 2);
+    }
+    metatileMap.push(rowData);
+  }
+
+  // Build flat tilemap: TILES_W × TILES_H words, stored as LE byte array
+  const tilemapData = new Array(TILES_W * TILES_H * 2).fill(0);
+
+  for (let row = 0; row < MAP_ROWS; row++) {
+    for (let col = 0; col < MAP_COLS; col++) {
+      const entry = metatileMap[row][col];
+      if (entry === 0) continue;  // $0000 = empty/transparent
+
+      const metaIdx = entry & 0x1FFF;
+      const metaFlipH = !!(entry & 0x4000);
+      const metaFlipV = !!(entry & 0x8000);
+      if (metaIdx >= NUM_METATILES) continue;
+
+      const metaDef = metatileDefs[metaIdx];
+
+      for (let my = 0; my < 4; my++) {
+        for (let mx = 0; mx < 4; mx++) {
+          // When metatile is flipped, read sub-tiles in reversed order
+          const srcMx = metaFlipH ? (3 - mx) : mx;
+          const srcMy = metaFlipV ? (3 - my) : my;
+          let tileWord = metaDef[srcMy * 4 + srcMx];
+
+          // XOR flip bits with metatile flip (matches hardware behavior)
+          if (metaFlipH) tileWord ^= 0x4000;
+          if (metaFlipV) tileWord ^= 0x8000;
+
+          const tileX = row * 4 + mx;
+          const tileY = col * 4 + my;
+          const byteIdx = (tileY * TILES_W + tileX) * 2;
+          tilemapData[byteIdx]     = tileWord & 0xFF;        // low byte
+          tilemapData[byteIdx + 1] = (tileWord >> 8) & 0xFF; // high byte
+        }
+      }
+    }
+  }
+
+  console.log(`  BG3 ShipDeck virtual tilemap: ${TILES_W}x${TILES_H} tiles (${tilemapData.length} bytes)`);
+  return { tilemapData, tilesW: TILES_W, tilesH: TILES_H };
+}
+
 // Load VRAM payload and render background layers (BG3 behind BG2)
 function loadLevelBackground(rom, style, palette) {
   const ppu = readPpuConfig(rom, style.ppuConfig);
@@ -1442,8 +1671,14 @@ function loadLevelBackground(rom, style, palette) {
     let data;
     if (entry.compressed) {
       rom.seek(entry.addr);
-      const decompressed = rareDecompress(rom);
+      const label = `ROM=0x${entry.addr.toString(16)}→VRAM=0x${entry.vram.toString(16)}`;
+      const decompressed = rareDecompress(rom, label);
       data = decompressed.getSlice(0, decompressed.getPosition());
+      // Real SNES DMA only transfers entry.size bytes; truncate to match hardware
+      if (data.length > entry.size) {
+        console.log(`    DMA truncation: decompressed ${data.length} → ${entry.size} bytes`);
+        data = data.slice(0, entry.size);
+      }
     } else {
       data = new Uint8Array(entry.size);
       rom.seek(entry.addr);
@@ -1463,8 +1698,58 @@ function loadLevelBackground(rom, style, palette) {
   // (e.g. gfxset 0x25 / Mainbrace Mayhem, vblankType 13) produce wrong hashes → 0% match in Mesen.
   injectAnimatedTilesIntoVram(rom, vram, style.vblankType);
   
-  // Determine output size from BG2 (primary) or BG3 (fallback)
-  const primaryBg = ppu.bg2.enabled ? ppu.bg2 : ppu.bg3;
+  // Detect and render BG3 ShipDeck foreground metatile map.
+  // ShipDeck levels (mapId=3) use a dynamic metatile scroll engine instead of a static VRAM tilemap.
+  // The VRAM tilemap at BG3 base ($7800) remains empty — we reconstruct the full map from ROM.
+  let bg3ShipDeckData = null;
+  if (style.mapId === 3 && ppu.bg3.enabled) {
+    bg3ShipDeckData = loadBg3ShipDeckMap(rom, vram, ppu.bg3.chrBase, palette, null);
+  }
+  
+  // Detect which BG tilemaps were explicitly loaded by gfxSet entries.
+  // Loaded tilemaps = static background content (ship wall, scenery, etc.).
+  // Unloaded tilemaps = dynamic terrain (filled at runtime by scroll engine).
+  // This correctly handles swapped VRAM layouts like ppuConfig 0x03 where
+  // BG1 carries static background and BG2 is dynamic terrain.
+  const bg1TmLoaded = entries.some(e => e.vram === ppu.bg1.tilemapBase);
+  const bg2TmLoaded = ppu.bg2.enabled && entries.some(e => e.vram === ppu.bg2.tilemapBase);
+  const bg3TmLoaded = ppu.bg3.enabled && entries.some(e => e.vram === ppu.bg3.tilemapBase);
+  if (bg1TmLoaded) console.log(`  BG1 static background: tilemap at $${ppu.bg1.tilemapBase.toString(16)}, chr @$${ppu.bg1.chrBase.toString(16)}`);
+  if (!bg2TmLoaded && ppu.bg2.enabled) console.log(`  BG2 tilemap at $${ppu.bg2.tilemapBase.toString(16)} not loaded (dynamic terrain)`);
+  if (!bg3TmLoaded && ppu.bg3.enabled) console.log(`  BG3 tilemap at $${ppu.bg3.tilemapBase.toString(16)} not loaded`);
+  
+  // Detect sub-screen color math blend: BG3 on sub screen, used as blend source for main screen.
+  // Covers 35 levels across 6 ppuConfig values (0x03, 0x24, 0x29, 0x2C, 0x31, 0x35).
+  // In this pattern the SNES ADDs the sub screen (containing BG3) INTO the main screen via color math.
+  // Example: Rambi Rumble (ppuCfg 0x03) - BG3 honey overlay blended into BG1 beehive background.
+  const bg3OnSub = !!(ppu.subScreen & 0x04);
+  const bg3NotOnMain = !(ppu.mainScreen & 0x04);
+  const isSubScreenBlend = ppu.bg3.enabled && bg3OnSub && bg3NotOnMain
+      && ppu.colorMath.useSubScreen
+      && (ppu.colorMath.bg1 || ppu.colorMath.bg2 || ppu.colorMath.backdrop);
+  if (isSubScreenBlend) {
+    console.log('  BG3 sub-screen blend detected: BG3 on sub, blended INTO main via color math');
+  }
+  
+  // Detect ship wall tilemap: gfxSet entries at bg2.tilemapBase + 0x800/0xC00
+  // These are screens 2+3 of a conceptual 64×64 BG2 tilemap.
+  // In ship-hold levels (Lockjaw's Locker, Lava Lagoon, Glimmer's Galleon),
+  // the SNES uses HDMA to scroll BG2 between ceiling (screens 0+1) and wall (screens 2+3).
+  const wallScreen2Addr = ppu.bg2.tilemapBase + 0x800;
+  const wallScreen3Addr = ppu.bg2.tilemapBase + 0xC00;
+  const hasWallScreen2 = bg2TmLoaded && entries.some(e => e.vram === wallScreen2Addr);
+  const hasWallScreen3 = bg2TmLoaded && entries.some(e => e.vram === wallScreen3Addr);
+  if (hasWallScreen2 || hasWallScreen3) {
+    console.log(`  BG2 wall tilemap detected: screen2=$${wallScreen2Addr.toString(16)}(${hasWallScreen2}), screen3=$${wallScreen3Addr.toString(16)}(${hasWallScreen3})`);
+  }
+  
+  // Determine output size from background BGs with loaded tilemaps.
+  // Prefer BG2 (standard layout), fall back to BG1 or BG3 for swapped configs.
+  let primaryBg;
+  if (bg2TmLoaded && ppu.bg2.enabled) primaryBg = ppu.bg2;
+  else if (bg1TmLoaded) primaryBg = ppu.bg1;
+  else if (bg3TmLoaded && ppu.bg3.enabled) primaryBg = ppu.bg3;
+  else primaryBg = ppu.bg2.enabled ? ppu.bg2 : ppu.bg3;
   const tilesWide = primaryBg.wide ? 64 : 32;
   const tilesTall = primaryBg.tall ? 64 : 32;
   const widthPx = tilesWide * 8;
@@ -1518,17 +1803,43 @@ function loadLevelBackground(rom, style, palette) {
     console.log(`  BG3 tile priorities: ${bg3Pri0Count} pri-0, ${bg3Pri1Count} pri-1 (${bg3TilesW}x${bg3TilesH} tilemap)`);
   }
   
-  // Render BG3 background (priority 0 only) - always 2bpp in Mode 1
-  if (ppu.bg3.enabled) {
-    console.log(`  BG3: ${ppu.bg3.wide?64:32}x${ppu.bg3.tall?64:32} tiles, tilemap @$${ppu.bg3.tilemapBase.toString(16)}, chr @$${ppu.bg3.chrBase.toString(16)}, 2bpp`);
-    renderBgLayer(vram, ppu.bg3, palette, false, imgData, widthPx, heightPx, 0);
+  // Render background layers with static tilemaps (SNES Mode 1 priority order).
+  // Only render layers whose tilemaps were loaded by the gfxSet (static background).
+  // Layers with unloaded tilemaps are dynamic terrain, handled by loadTileParts().
+  
+  // BG3 background - always 2bpp in Mode 1
+  if (bg3TmLoaded && ppu.bg3.enabled) {
+    if (isSubScreenBlend) {
+      // Sub-screen blend: BG3 is the background layer (e.g., honeycomb pattern in beehive levels).
+      // Render all tiles (all priorities) since BG3 forms the full background here.
+      console.log(`  BG3: ${ppu.bg3.wide?64:32}x${ppu.bg3.tall?64:32} tiles, tilemap @$${ppu.bg3.tilemapBase.toString(16)}, chr @$${ppu.bg3.chrBase.toString(16)}, 2bpp [sub-screen-blend background]`);
+      renderBgLayer(vram, ppu.bg3, palette, false, imgData, widthPx, heightPx, null);
+    } else {
+      // Normal: only priority-0 tiles as background (pri-1 handled as foreground overlay below)
+      console.log(`  BG3: ${ppu.bg3.wide?64:32}x${ppu.bg3.tall?64:32} tiles, tilemap @$${ppu.bg3.tilemapBase.toString(16)}, chr @$${ppu.bg3.chrBase.toString(16)}, 2bpp`);
+      renderBgLayer(vram, ppu.bg3, palette, false, imgData, widthPx, heightPx, 0);
+    }
   }
   
-  // Render BG2 on top - 4bpp in Mode 1
-  if (ppu.bg2.enabled) {
+  // BG2 - 4bpp in Mode 1
+  if (bg2TmLoaded && ppu.bg2.enabled) {
     const bg2is4bpp = (ppu.bgMode === 1);
     console.log(`  BG2: ${ppu.bg2.wide?64:32}x${ppu.bg2.tall?64:32} tiles, tilemap @$${ppu.bg2.tilemapBase.toString(16)}, chr @$${ppu.bg2.chrBase.toString(16)}, ${bg2is4bpp?'4bpp':'2bpp'}`);
     renderBgLayer(vram, ppu.bg2, palette, bg2is4bpp, imgData, widthPx, heightPx);
+  }
+  
+  // BG1 static background (only when tilemap was loaded by gfxSet).
+  // Two sub-cases when bg1TmLoaded and not SSB:
+  // A) BG1 chrBase === BG2 chrBase → static background scenery (same tiles), render into bgData.
+  // B) BG1 chrBase !== BG2 chrBase → separate foreground overlay (e.g. Gusty Glade wind leaves).
+  //    BG1 has its own tile graphics at a different VRAM address. Rendered as fgData below.
+  // Skip for sub-screen blend: BG1 foreground is handled separately with color math alpha.
+  const bg1IsSeparateOverlay = bg1TmLoaded && !isSubScreenBlend
+      && ppu.bg2.enabled && (ppu.bg1.chrBase !== ppu.bg2.chrBase);
+  if (bg1TmLoaded && !isSubScreenBlend && !bg1IsSeparateOverlay) {
+    const bg1is4bpp = (ppu.bgMode >= 1);  // Mode 1+: BG1 is 4bpp
+    console.log(`  BG1: ${ppu.bg1.wide?64:32}x${ppu.bg1.tall?64:32} tiles, tilemap @$${ppu.bg1.tilemapBase.toString(16)}, chr @$${ppu.bg1.chrBase.toString(16)}, ${bg1is4bpp?'4bpp':'2bpp'} [static background]`);
+    renderBgLayer(vram, ppu.bg1, palette, bg1is4bpp, imgData, widthPx, heightPx, null);
   }
   
   // Render BG3 foreground overlay
@@ -1542,62 +1853,165 @@ function loadLevelBackground(rom, style, palette) {
     const fgW = bg3TilesW * 8;
     const fgH = bg3TilesH * 8;
 
-    // First try priority-1 tiles
-    const fgImgPri1 = new ImageData(fgW, fgH);
-    renderBgLayer(vram, ppu.bg3, palette, false, fgImgPri1, fgW, fgH, 1);
-    let hasPri1 = false;
-    for (let i = 3; i < fgImgPri1.data.length; i += 4) {
-      if (fgImgPri1.data[i] > 0) { hasPri1 = true; break; }
-    }
-
-    if (hasPri1) {
-      // Standard priority-1 foreground
-      fgData = { imgData: fgImgPri1, widthPx: fgW, heightPx: fgH, colorMathAlpha: 1.0, mode: 'priority' };
-      console.log(`  BG3 foreground: priority-1 tiles found (${fgW}x${fgH}px)`);
-    } else {
-      // Check for color math foreground overlay
-      // Decision order: 1) empty tilemap → skip, 2) BG2 on main + BG1 on sub → BG3 is background,
-      // 3) BG3 on main + color math → foreground overlay (fog, mist, honey)
-      const bg1OnMain = !!(ppu.mainScreen & 0x01);
-      const bg2OnMain = !!(ppu.mainScreen & 0x02);
-      const bg3OnMain = !!(ppu.mainScreen & 0x04);
-      const cm = ppu.colorMath;
-      const hasColorMath = cm.bg1 || cm.bg2 || cm.bg3 || cm.backdrop;
-      
-      if (bg3TmNonZero === 0) {
-        // Tilemap completely empty (e.g. Pirate Panic) - BG3 chr overlap is noise
-        console.log('  BG3 foreground: SKIP - tilemap is empty (0 non-zero bytes)');
-      } else if (bg3OnMain && bg2OnMain && !bg1OnMain && hasColorMath) {
-        // BG2+BG3 on main, BG1 on sub only (e.g. Ghostly Grove): color math blends BG1 INTO BG2+BG3
-        // BG3 is part of the background alongside BG2, NOT a foreground overlay
-        console.log(`  BG3 foreground: SKIP - BG2+BG3 on main, BG1 on sub (color math makes BG1 semi-transparent, BG3 is background)`);
-      } else if (bg3OnMain && hasColorMath) {
-        // BG3 on main + color math active = translucent foreground overlay (fog, mist, honey)
-        const fgImgAll = new ImageData(fgW, fgH);
-        renderBgLayer(vram, ppu.bg3, palette, false, fgImgAll, fgW, fgH, null);
-        let hasPixels = false;
-        for (let i = 3; i < fgImgAll.data.length; i += 4) {
-          if (fgImgAll.data[i] > 0) { hasPixels = true; break; }
-        }
-        if (hasPixels) {
-          const alpha = cm.half ? 0.5 : 0.7;
-          fgData = {
-            imgData: fgImgAll, widthPx: fgW, heightPx: fgH,
-            colorMathAlpha: alpha,
-            colorMathSubtract: cm.subtract,
-            mode: 'colormath'
-          };
-          console.log(`  BG3 foreground: COLOR MATH overlay (${cm.subtract ? 'subtract' : 'add'}, ${cm.half ? 'half' : 'full'}, alpha=${alpha}) ${fgW}x${fgH}px`);
-        } else {
-          console.log('  BG3 foreground: color math active but no BG3 pixels rendered');
-        }
-      } else {
-        console.log(`  BG3 foreground: no pri-1 tiles, no applicable color math (bg1OnMain=${bg1OnMain}, bg3OnMain=${bg3OnMain}, colorMath=${hasColorMath})`);
+    if (isSubScreenBlend && bg1TmLoaded) {
+      // Sub-screen blend: BG1 (main screen, e.g. honey effect) is the foreground overlay.
+      // BG3 (sub screen, e.g. honeycomb pattern) is already rendered as background above.
+      // Render BG1 as semi-transparent overlay on top of terrain.
+      const bg1is4bpp = (ppu.bgMode >= 1);
+      const bg1W = (ppu.bg1.wide ? 64 : 32) * 8;
+      const bg1H = (ppu.bg1.tall ? 64 : 32) * 8;
+      const fgImgAll = new ImageData(bg1W, bg1H);
+      renderBgLayer(vram, ppu.bg1, palette, bg1is4bpp, fgImgAll, bg1W, bg1H, null);
+      let hasPixels = false;
+      for (let i = 3; i < fgImgAll.data.length; i += 4) {
+        if (fgImgAll.data[i] > 0) { hasPixels = true; break; }
       }
+      if (hasPixels) {
+        const cm = ppu.colorMath;
+        // SSB alpha: lower than standard color-math because sub-screen blend
+        // layers are swapped in the viewer (BG3=background, BG1=overlay).
+        // Adjustable: raise for more visible honey, lower for more transparent.
+        const alpha = cm.half ? 0.25 : 0.35;
+        fgData = {
+          imgData: fgImgAll, widthPx: bg1W, heightPx: bg1H,
+          colorMathAlpha: alpha,
+          colorMathSubtract: cm.subtract,
+          mode: 'colormath',
+          source: 'bg1'
+        };
+        console.log(`  BG1 foreground: SUB-SCREEN BLEND overlay (${cm.subtract ? 'subtract' : 'add'}, ${cm.half ? 'half' : 'full'}, alpha=${alpha}) ${bg1W}x${bg1H}px`);
+      } else {
+        console.log('  BG1 foreground: sub-screen blend active but no BG1 pixels rendered');
+      }
+    } else {
+      // Standard path: check priority-1 tiles first, then main-screen color math
+      // First try priority-1 tiles
+      const fgImgPri1 = new ImageData(fgW, fgH);
+      renderBgLayer(vram, ppu.bg3, palette, false, fgImgPri1, fgW, fgH, 1);
+      let hasPri1 = false;
+      for (let i = 3; i < fgImgPri1.data.length; i += 4) {
+        if (fgImgPri1.data[i] > 0) { hasPri1 = true; break; }
+      }
+
+      if (hasPri1) {
+        // Standard priority-1 foreground
+        fgData = { imgData: fgImgPri1, widthPx: fgW, heightPx: fgH, colorMathAlpha: 1.0, mode: 'priority' };
+        console.log(`  BG3 foreground: priority-1 tiles found (${fgW}x${fgH}px)`);
+      } else {
+        // Check for color math foreground overlay
+        // Decision order: 1) empty tilemap -> skip, 2) BG2 on main + BG1 on sub -> BG3 is background,
+        // 3) BG3 on main + color math -> foreground overlay (fog, mist, honey)
+        const bg1OnMain = !!(ppu.mainScreen & 0x01);
+        const bg2OnMain = !!(ppu.mainScreen & 0x02);
+        const bg3OnMain = !!(ppu.mainScreen & 0x04);
+        const cm = ppu.colorMath;
+        const hasColorMath = cm.bg1 || cm.bg2 || cm.bg3 || cm.backdrop;
+        
+        if (bg3TmNonZero === 0 && bg3ShipDeckData && bg3ShipDeckData.tilesRendered > 0) {
+          // ShipDeck: VRAM tilemap is empty but metatile map was reconstructed from ROM
+          fgData = {
+            imgData: bg3ShipDeckData.imgData,
+            widthPx: bg3ShipDeckData.widthPx,
+            heightPx: bg3ShipDeckData.heightPx,
+            colorMathAlpha: 1.0,
+            mode: 'shipdeck'
+          };
+          console.log(`  BG3 foreground: ShipDeck metatile map (${bg3ShipDeckData.widthPx}x${bg3ShipDeckData.heightPx}px, ${bg3ShipDeckData.tilesRendered} tiles, pri0=${bg3ShipDeckData.pri0Count}, pri1=${bg3ShipDeckData.pri1Count})`);
+        } else if (bg3TmNonZero === 0) {
+          // Tilemap completely empty and no ShipDeck data - BG3 chr overlap is noise
+          console.log('  BG3 foreground: SKIP - tilemap is empty (0 non-zero bytes)');
+        } else if (bg3OnMain && bg2OnMain && !bg1OnMain && hasColorMath) {
+          // BG2+BG3 on main, BG1 on sub only (e.g. Ghostly Grove): color math blends BG1 INTO BG2+BG3
+          // BG3 is part of the background alongside BG2, NOT a foreground overlay
+          console.log(`  BG3 foreground: SKIP - BG2+BG3 on main, BG1 on sub (color math makes BG1 semi-transparent, BG3 is background)`);
+        } else if (bg3OnMain && hasColorMath) {
+          // BG3 on main + color math active = translucent foreground overlay (fog, mist, honey)
+          const fgImgAll = new ImageData(fgW, fgH);
+          renderBgLayer(vram, ppu.bg3, palette, false, fgImgAll, fgW, fgH, null);
+          let hasPixels = false;
+          for (let i = 3; i < fgImgAll.data.length; i += 4) {
+            if (fgImgAll.data[i] > 0) { hasPixels = true; break; }
+          }
+          if (hasPixels) {
+            // Standard color math alpha (fog, mist): kept subtle to avoid obscuring terrain.
+            // Adjustable: raise for denser fog, lower for more transparent.
+            const alpha = cm.half ? 0.20 : 0.25;
+            fgData = {
+              imgData: fgImgAll, widthPx: fgW, heightPx: fgH,
+              colorMathAlpha: alpha,
+              colorMathSubtract: cm.subtract,
+              mode: 'colormath',
+              source: 'bg3'
+            };
+            console.log(`  BG3 foreground: COLOR MATH overlay (${cm.subtract ? 'subtract' : 'add'}, ${cm.half ? 'half' : 'full'}, alpha=${alpha}) ${fgW}x${fgH}px`);
+          } else {
+            console.log('  BG3 foreground: color math active but no BG3 pixels rendered');
+          }
+        } else {
+          console.log(`  BG3 foreground: no pri-1 tiles, no applicable color math (bg1OnMain=${bg1OnMain}, bg3OnMain=${bg3OnMain}, colorMath=${hasColorMath})`);
+        }
+        }
+      }
+  }
+
+  // BG1 separate foreground overlay (e.g. Gusty Glade wind leaves):
+  // BG1 has a static VRAM tilemap with its own chrBase, drawn ON TOP of terrain (BG2).
+  // SNES Mode 1 priority: BG1 > BG2. No color math — fully opaque where pixels exist.
+  // Only activates when no BG3 foreground was already detected (avoid double overlay).
+  if (bg1IsSeparateOverlay && !fgData) {
+    const bg1is4bpp = (ppu.bgMode >= 1);
+    const bg1W = (ppu.bg1.wide ? 64 : 32) * 8;
+    const bg1H = (ppu.bg1.tall ? 64 : 32) * 8;
+    const bg1Img = new ImageData(bg1W, bg1H);
+    renderBgLayer(vram, ppu.bg1, palette, bg1is4bpp, bg1Img, bg1W, bg1H, null);
+    let hasPixels = false;
+    for (let i = 3; i < bg1Img.data.length; i += 4) {
+      if (bg1Img.data[i] > 0) { hasPixels = true; break; }
+    }
+    if (hasPixels) {
+      fgData = {
+        imgData: bg1Img, widthPx: bg1W, heightPx: bg1H,
+        colorMathAlpha: 1.0,
+        colorMathSubtract: false,
+        mode: 'bg1overlay',
+        source: 'bg1'
+      };
+      console.log(`  BG1 foreground overlay: ${bg1W}x${bg1H}px, chrBase @$${ppu.bg1.chrBase.toString(16)} [separate from terrain @$${ppu.bg2.chrBase.toString(16)}]`);
+    }
+  }
+
+  // Render ship wall as separate image (if wall tilemap entries were detected).
+  // The wall uses the same BG2 CHR data but a different tilemap region (screens 2+3).
+  // Rendered as a standalone image so the viewer can display it separately from the ceiling.
+  let wallData = null;
+  if (hasWallScreen2 || hasWallScreen3) {
+    const wallConfig = {
+      tilemapBase: wallScreen2Addr,   // word 0x7800 for ppuConfig 0x02
+      chrBase: ppu.bg2.chrBase,        // same CHR as BG2 ceiling
+      wide: hasWallScreen2 && hasWallScreen3,
+      tall: false,
+      enabled: true
+    };
+    const wallTilesW = wallConfig.wide ? 64 : 32;
+    const wallTilesH = 32;
+    const wallW = wallTilesW * 8;
+    const wallH = wallTilesH * 8;
+    const wallImgData = new ImageData(wallW, wallH);
+    const bg2is4bpp = (ppu.bgMode === 1);
+    renderBgLayer(vram, wallConfig, palette, bg2is4bpp, wallImgData, wallW, wallH, null);
+    let hasWallPixels = false;
+    for (let i = 3; i < wallImgData.data.length; i += 4) {
+      if (wallImgData.data[i] > 0) { hasWallPixels = true; break; }
+    }
+    if (hasWallPixels) {
+      wallData = { imgData: wallImgData, widthPx: wallW, heightPx: wallH, tilesW: wallTilesW, tilesH: wallTilesH };
+      console.log(`  BG2 wall: ${wallW}x${wallH}px (${wallTilesW}x${wallTilesH} tiles)`);
+    } else {
+      console.log('  BG2 wall tilemap entries present but no pixels rendered');
     }
   }
   
-  return { imgData, widthPx, heightPx, ppu, fgData, vram };
+  return { imgData, widthPx, heightPx, ppu, fgData, vram, bg1TmLoaded, wallData, bg3ShipDeckData };
 }
 
 // Collect unique background configurations across all regular levels
@@ -1652,6 +2066,10 @@ function loadOverworldLevel(rom, levelId) {
         rom.seek(entry.addr);
         const decompressed = rareDecompress(rom);
         data = decompressed.getSlice(0, decompressed.getPosition());
+        // Real SNES DMA only transfers entry.size bytes; truncate to match hardware
+        if (data.length > entry.size) {
+          data = data.slice(0, entry.size);
+        }
       } else {
         data = new Uint8Array(entry.size);
         rom.seek(entry.addr);
@@ -2068,13 +2486,23 @@ function loadTileParts(rom, style) {
 
   // ── Generic VRAM loading (replaces hardcoded 3-case DMA switch) ──
   // Uses readGfxSetEntries() to load ALL DMA entries into a full VRAM array,
-  // then extracts BG1 character data at the PPU-configured chrBase offset.
+  // then extracts terrain character data at the correct BG's chrBase offset.
   // This is the same proven approach used by loadLevelBackground().
   const ppu = readPpuConfig(rom, style.ppuConfig);
-  const bg1ChrBase = ppu.bg1.chrBase;           // VRAM word address (e.g. 0x2000)
-  const bg1ChrByteAddr = bg1ChrBase * 2;        // VRAM byte offset  (e.g. 0x4000)
-
   const entries = readGfxSetEntries(rom, style.graphics);
+
+  // Determine which BG is the terrain layer (dynamic tilemap NOT loaded by gfxSet).
+  // Standard: BG1 is terrain (tilemap filled at runtime by scroll engine).
+  // Swapped (e.g. ppuConfig 0x03 / Rambi Rumble): BG1 has a loaded tilemap
+  // (static ship wall), so BG2 is the terrain layer with chrBase at $2000.
+  const bg1TmLoaded = entries.some(e => e.vram === ppu.bg1.tilemapBase);
+  const terrainBg = bg1TmLoaded ? ppu.bg2 : ppu.bg1;
+  const terrainChrBase = terrainBg.chrBase;       // VRAM word address
+  const terrainChrByteAddr = terrainChrBase * 2;  // VRAM byte offset
+  if (bg1TmLoaded) {
+    console.log(`  Terrain on BG2 (BG1 tilemap loaded at $${ppu.bg1.tilemapBase.toString(16)}): chrBase=$${terrainChrBase.toString(16)}`);
+  }
+
   const vram = new Uint8Array(0x20000);          // 128KB VRAM
 
   let gfxSize = 0;
@@ -2084,6 +2512,10 @@ function loadTileParts(rom, style) {
       rom.seek(entry.addr);
       const decompressed = rareDecompress(rom);
       data = decompressed.getSlice(0, decompressed.getPosition());
+      // Real SNES DMA only transfers entry.size bytes; truncate to match hardware
+      if (data.length > entry.size) {
+        data = data.slice(0, entry.size);
+      }
     } else {
       data = new Uint8Array(entry.size);
       rom.seek(entry.addr);
@@ -2093,25 +2525,25 @@ function loadTileParts(rom, style) {
     for (let i = 0; i < data.length && (vramByteAddr + i) < vram.length; i++) {
       vram[vramByteAddr + i] = data[i];
     }
-    // Track BG1 character data extent (capped at 32KB = max 1024 4bpp tiles)
-    if (entry.vram >= bg1ChrBase) {
-      const end = (entry.vram - bg1ChrBase) * 2 + data.length;
+    // Track terrain character data extent (capped at 32KB = max 1024 4bpp tiles)
+    if (entry.vram >= terrainChrBase) {
+      const end = (entry.vram - terrainChrBase) * 2 + data.length;
       if (end > gfxSize) gfxSize = Math.min(end, 0x8000);
     }
   }
   // Align to 32 bytes (4bpp tile boundary)
   gfxSize = Math.ceil(gfxSize / 32) * 32;
-  if (gfxSize === 0) throw new Error('No BG1 graphics data found (chrBase=$' + bg1ChrBase.toString(16) + ')');
+  if (gfxSize === 0) throw new Error('No terrain graphics data found (chrBase=$' + terrainChrBase.toString(16) + ')');
 
-  // Extract gfxData from VRAM at BG1 character base offset
+  // Extract gfxData from VRAM at terrain BG character base offset
   const gfxData = new GrowBuffer(gfxSize + 1024);
   for (let i = 0; i < gfxSize; i++) {
-    gfxData.writeByte(vram[bg1ChrByteAddr + i]);
+    gfxData.writeByte(vram[terrainChrByteAddr + i]);
   }
   const gfxCount = gfxSize / 32;
 
   // Inject animated tile data (frame 0) based on VBlank type
-  injectAnimatedTiles(rom, gfxData, gfxSize, style.vblankType, bg1ChrBase);
+  injectAnimatedTiles(rom, gfxData, gfxSize, style.vblankType, terrainChrBase);
 
   // Load palette
   let palette = new Uint16Array(128);
@@ -2168,7 +2600,7 @@ function loadTileParts(rom, style) {
     }
   }
 
-  return { tilePartsImg, tileCount, palette, tileArrangement, gfxData, gfxCount };
+  return { tilePartsImg, tileCount, palette, tileArrangement, gfxData, gfxCount, terrainChrBase };
 }
 
 // ============================================================
@@ -4152,9 +4584,19 @@ function buildCatalogByGfxSet(gfxSetIndex) {
   if (!rom || !graphicsSetsMap || !graphicsSetsMap.has(gfxSetIndex)) return null;
   const setInfo = graphicsSetsMap.get(gfxSetIndex);
   
-  // Pick the first level in this set to load the graphics data
-  // (graphics data is identical for all levels in the same gfxSet)
-  const refLevel = setInfo.levels[0];
+  // Pick the reference level for palette/ppuConfig/vblankType.
+  // CHR tile graphics are identical for all levels in the same gfxSet, BUT
+  // palette (routine1 override), ppuConfig (color math), and vblankType
+  // (animated tiles) are per-level properties. If the user has a level
+  // loaded that belongs to this gfxSet, use THAT level's style so the
+  // catalog matches what the user sees in level view.
+  let refLevel = setInfo.levels[0];
+  if (currentStyle && currentLevelId != null) {
+    const match = setInfo.levels.find(l => l.id === currentLevelId);
+    if (match) {
+      refLevel = match;
+    }
+  }
   const style = refLevel.style;
   
   // Load tile parts using the reference style
@@ -4259,7 +4701,10 @@ function buildCatalogByGfxSet(gfxSetIndex) {
   let catalogPpuConfig = null;
   let catalogBg2TilemapData = null;
   let catalogBg3TilemapData = null;
+  let catalogWallTilemapData = null;
+  let catalogBg1TilemapData = null;
   let catalogVram = null;
+  let catalogSsbFgImage = null;
   try {
     const bgData = loadLevelBackground(rom, style, palette);
     if (bgData && bgData.vram && bgData.ppu) {
@@ -4273,10 +4718,18 @@ function buildCatalogByGfxSet(gfxSetIndex) {
         bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,
         bg2ChrBase: ppu.bg2 ? ppu.bg2.chrBase : 0,
         bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
+        // terrainChrBase: terrain BG's chrBase (swapped if bg1TmLoaded)
+        terrainChrBase: bgData.bg1TmLoaded
+          ? (ppu.bg2 ? ppu.bg2.chrBase : 0)
+          : (ppu.bg1 ? ppu.bg1.chrBase : 0),
         bg2TilesW,
         bg2TilesH,
         bg3TilesW,
         bg3TilesH,
+        // Wall tilemap dimensions (BG2 screens 2+3, ship-hold levels only)
+        wallTilesW: bgData.wallData ? bgData.wallData.tilesW : 0,
+        wallTilesH: bgData.wallData ? bgData.wallData.tilesH : 0,
+        wallTilemapBase: bgData.wallData && ppu.bg2 ? (ppu.bg2.tilemapBase + 0x800) : 0,
       };
       if (ppu.bg2 && ppu.bg2.enabled) {
         const tmByteOffset = ppu.bg2.tilemapBase * 2;
@@ -4296,17 +4749,87 @@ function buildCatalogByGfxSet(gfxSetIndex) {
           console.log(`  BG3 tilemap cached: ${tmByteLength} bytes at 0x${tmByteOffset.toString(16)}`);
         }
       }
+      // ShipDeck BG3 override: replace empty VRAM tilemap with virtual metatile expansion
+      if (style.mapId === 3) {
+        const isEmpty = !catalogBg3TilemapData || catalogBg3TilemapData.every(b => b === 0);
+        if (isEmpty) {
+          const vt = expandShipDeckMetatilesToTilemap(rom);
+          catalogBg3TilemapData = vt.tilemapData;
+          if (catalogPpuConfig) {
+            catalogPpuConfig.bg3TilesW = vt.tilesW;  // 160
+            catalogPpuConfig.bg3TilesH = vt.tilesH;  // 64
+          }
+          console.log(`  [catalog] ShipDeck BG3: virtual tilemap (${vt.tilesW}x${vt.tilesH} tiles, ${vt.tilemapData.length} bytes)`);
+        }
+      }
+      // Cache wall tilemap (BG2 screens 2+3) if present
+      if (bgData.wallData && ppu.bg2 && ppu.bg2.enabled) {
+        const wallTmBase = (ppu.bg2.tilemapBase + 0x800) * 2;
+        const wallTilesW = bgData.wallData.tilesW;
+        const wallTilesH = bgData.wallData.tilesH;
+        const wallTmLength = wallTilesW * wallTilesH * 2;
+        if (wallTmBase >= 0 && wallTmBase + wallTmLength <= bgData.vram.length) {
+          catalogWallTilemapData = [];
+          for (let i = 0; i < wallTmLength; i++) catalogWallTilemapData.push(bgData.vram[wallTmBase + i] || 0);
+          console.log(`  Wall tilemap cached: ${wallTmLength} bytes at 0x${wallTmBase.toString(16)}`);
+        }
+      }
       // Store full VRAM snapshot for use by saveCurrentHDToContainer() in catalog mode.
       // This ensures correct vramSnapshot even when no level is loaded (currentBgData null).
       catalogVram = bgData.vram;
+
+      // Foreground overlay (color math blend or BG1 priority overlay from loadLevelBackground)
+      if (bgData.fgData && (bgData.fgData.mode === 'colormath' || bgData.fgData.mode === 'bg1overlay')) {
+        const fg = bgData.fgData;
+        const fgCanvas = new OffscreenCanvas(fg.widthPx, fg.heightPx);
+        fgCanvas.getContext('2d').putImageData(fg.imgData, 0, 0);
+        catalogSsbFgImage = {
+          canvas: fgCanvas, widthPx: fg.widthPx, heightPx: fg.heightPx,
+          tilesW: Math.ceil(fg.widthPx / 8), tilesH: Math.ceil(fg.heightPx / 8), tileSize: 8,
+          colorMathAlpha: fg.colorMathAlpha,
+          colorMathSubtract: fg.colorMathSubtract,
+          source: fg.source || 'bg3',
+          mode: fg.mode,
+        };
+        console.log(`  FG overlay cached: ${fg.widthPx}x${fg.heightPx}px, mode=${fg.mode}, alpha=${fg.colorMathAlpha}, source=${fg.source}, ${fg.colorMathSubtract ? 'subtract' : 'add'}`);
+
+        // Cache BG1 tilemap for SSB levels (source='bg1') — needed for Mesen HD pack export
+        if (fg.source === 'bg1' && ppu.bg1 && ppu.bg1.enabled) {
+          const bg1TilesW = ppu.bg1.wide ? 64 : 32;
+          const bg1TilesH = ppu.bg1.tall ? 64 : 32;
+          const bg1TmByteOffset = ppu.bg1.tilemapBase * 2;
+          const bg1TmByteLength = bg1TilesW * bg1TilesH * 2;
+          if (bg1TmByteOffset >= 0 && bg1TmByteOffset + bg1TmByteLength <= bgData.vram.length) {
+            catalogBg1TilemapData = [];
+            for (let i = 0; i < bg1TmByteLength; i++) catalogBg1TilemapData.push(bgData.vram[bg1TmByteOffset + i] || 0);
+            console.log(`  BG1 tilemap cached (SSB): ${bg1TmByteLength} bytes at 0x${bg1TmByteOffset.toString(16)}`);
+          }
+          // Extend ppuConfig with SSB-specific fields
+          if (catalogPpuConfig) {
+            catalogPpuConfig.bg1TilesW = bg1TilesW;
+            catalogPpuConfig.bg1TilesH = bg1TilesH;
+            catalogPpuConfig.bg1TilemapBase = ppu.bg1.tilemapBase;
+            catalogPpuConfig.cmFgSource = 'bg1';
+            catalogPpuConfig.cmFgAlpha = fg.colorMathAlpha;
+            catalogPpuConfig.cmFgSubtract = fg.colorMathSubtract;
+          }
+        } else if (fg.source === 'bg3' && catalogPpuConfig) {
+          // Standard color math (BG3 fog) — mark in ppuConfig, no extra tilemap needed
+          catalogPpuConfig.cmFgSource = 'bg3';
+          catalogPpuConfig.cmFgAlpha = fg.colorMathAlpha;
+          catalogPpuConfig.cmFgSubtract = fg.colorMathSubtract;
+        }
+      }
     }
   } catch (e) {
     console.warn('  BG2/BG3 tilemap load failed for gfxset:', e.message);
   }
 
-  return { bg1Tiles, bg2Image: null, bg3Image: null, gfxSetIndex, setInfo, clusters,
+  return { bg1Tiles, bg2Image: null, bg3Image: null, wallImage: null, ssbFgImage: catalogSsbFgImage, gfxSetIndex, refLevelId: refLevel.id, setInfo, clusters,
            ppuConfig: catalogPpuConfig, bg2TilemapData: catalogBg2TilemapData,
-           bg3TilemapData: catalogBg3TilemapData, vram: catalogVram };
+           bg3TilemapData: catalogBg3TilemapData, wallTilemapData: catalogWallTilemapData,
+           bg1TilemapData: catalogBg1TilemapData,
+           vram: catalogVram };
 }
 
 // ============================================================
@@ -4849,7 +5372,7 @@ function loadLevel(levelId) {
     
     // Load tile parts
     console.time('  tileParts');
-    const { tilePartsImg, tileCount, palette, tileArrangement, gfxData, gfxCount } = loadTileParts(rom, style);
+    const { tilePartsImg, tileCount, palette, tileArrangement, gfxData, gfxCount, terrainChrBase } = loadTileParts(rom, style);
     currentPalette = palette;
     currentStyle = style;
     // Update gfx set selector to match current level
@@ -4858,7 +5381,7 @@ function loadLevel(levelId) {
       const gfxSel = document.getElementById('catGfxSet');
       if (gfxSel) gfxSel.value = style.graphics;
     }
-    currentTileRawData = { tileArrangement, gfxData, gfxCount, tileCount };
+    currentTileRawData = { tileArrangement, gfxData, gfxCount, tileCount, terrainChrBase };
     currentTileParts = tilePartsImg;
     console.timeEnd('  tileParts');
     
@@ -5192,6 +5715,21 @@ let catalogSelectedTile = null;
 // Works regardless of catalog view mode (per-level or per-gfxset).
 function buildBgImageFromCurrentLevel(layer) {
   if (!currentBgData || !currentBgData.ppu || !currentPalette) return null;
+  // Special handling for wall layer: use pre-rendered wallData from loadLevelBackground()
+  if (layer === 'wall') {
+    if (!currentBgData.wallData) return null;
+    const wd = currentBgData.wallData;
+    const canvas = new OffscreenCanvas(wd.widthPx, wd.heightPx);
+    canvas.getContext('2d').putImageData(wd.imgData, 0, 0);
+    return { canvas, widthPx: wd.widthPx, heightPx: wd.heightPx, tilesW: wd.tilesW, tilesH: wd.tilesH, tileSize: 8 };
+  }
+  // Special handling for BG3 ShipDeck: VRAM tilemap is empty, use metatile-reconstructed data
+  if (layer === 'bg3' && currentBgData.bg3ShipDeckData && currentBgData.bg3ShipDeckData.tilesRendered > 0) {
+    const sd = currentBgData.bg3ShipDeckData;
+    const canvas = new OffscreenCanvas(sd.widthPx, sd.heightPx);
+    canvas.getContext('2d').putImageData(sd.imgData, 0, 0);
+    return { canvas, widthPx: sd.widthPx, heightPx: sd.heightPx, tilesW: Math.ceil(sd.widthPx / 8), tilesH: Math.ceil(sd.heightPx / 8), tileSize: 8 };
+  }
   const ppu = currentBgData.ppu;
   const vram = currentBgData.vram;
   const bgCfg = ppu[layer]; // ppu.bg2 or ppu.bg3
@@ -5331,20 +5869,58 @@ function buildCatalog() {
     
     // Render BG3 as standalone composed image
     if (ppu.bg3.enabled && vram && bgPalette) {
-      const tilesW = ppu.bg3.wide ? 64 : 32;
-      const tilesH = ppu.bg3.tall ? 64 : 32;
-      const w = tilesW * 8, h = tilesH * 8;
-      const imgData = new ImageData(w, h);
-      renderBgLayer(vram, ppu.bg3, bgPalette, false, imgData, w, h);
-      let hasPixels = false;
-      for (let i = 3; i < imgData.data.length; i += 4) {
-        if (imgData.data[i] > 0) { hasPixels = true; break; }
+      // Check for ShipDeck metatile data first (VRAM tilemap is empty for these levels)
+      if (currentBgData.bg3ShipDeckData && currentBgData.bg3ShipDeckData.tilesRendered > 0) {
+        const sd = currentBgData.bg3ShipDeckData;
+        const canvas = new OffscreenCanvas(sd.widthPx, sd.heightPx);
+        canvas.getContext('2d').putImageData(sd.imgData, 0, 0);
+        bg3Image = { canvas, widthPx: sd.widthPx, heightPx: sd.heightPx, tilesW: Math.ceil(sd.widthPx / 8), tilesH: Math.ceil(sd.heightPx / 8), tileSize: 8 };
+      } else {
+        // Standard VRAM-based BG3 rendering
+        const tilesW = ppu.bg3.wide ? 64 : 32;
+        const tilesH = ppu.bg3.tall ? 64 : 32;
+        const w = tilesW * 8, h = tilesH * 8;
+        const imgData = new ImageData(w, h);
+        renderBgLayer(vram, ppu.bg3, bgPalette, false, imgData, w, h);
+        let hasPixels = false;
+        for (let i = 3; i < imgData.data.length; i += 4) {
+          if (imgData.data[i] > 0) { hasPixels = true; break; }
+        }
+        if (hasPixels) {
+          const canvas = new OffscreenCanvas(w, h);
+          canvas.getContext('2d').putImageData(imgData, 0, 0);
+          bg3Image = { canvas, widthPx: w, heightPx: h, tilesW, tilesH, tileSize: 8 };
+        }
       }
-      if (hasPixels) {
-        const canvas = new OffscreenCanvas(w, h);
-        canvas.getContext('2d').putImageData(imgData, 0, 0);
-        bg3Image = { canvas, widthPx: w, heightPx: h, tilesW, tilesH, tileSize: 8 };
-      }
+    }
+  }
+  
+  // Wall image: use wallData from loadLevelBackground() if available
+  let wallImage = null;
+  if (currentBgData && currentBgData.wallData) {
+    const wd = currentBgData.wallData;
+    const canvas = new OffscreenCanvas(wd.widthPx, wd.heightPx);
+    canvas.getContext('2d').putImageData(wd.imgData, 0, 0);
+    wallImage = { canvas, widthPx: wd.widthPx, heightPx: wd.heightPx, tilesW: wd.tilesW, tilesH: wd.tilesH, tileSize: 8 };
+  }
+
+  // Foreground overlay (color math blend or BG1 priority overlay, e.g. honey drips, leaves)
+  let ssbFgImage = null;
+  if (currentFgData && (currentFgData.mode === 'colormath' || currentFgData.mode === 'bg1overlay')) {
+    const fg = currentFgData;
+    const fgCanvas = new OffscreenCanvas(fg.widthPx, fg.heightPx);
+    fgCanvas.getContext('2d').putImageData(fg.imgData, 0, 0);
+    ssbFgImage = {
+      canvas: fgCanvas, widthPx: fg.widthPx, heightPx: fg.heightPx,
+      tilesW: Math.ceil(fg.widthPx / 8), tilesH: Math.ceil(fg.heightPx / 8), tileSize: 8,
+      colorMathAlpha: fg.colorMathAlpha,
+      colorMathSubtract: fg.colorMathSubtract,
+      source: fg.source || 'bg3',
+      mode: fg.mode,
+    };
+    // When color math foreground IS bg3, suppress the separate bg3Image (same content)
+    if (fg.source === 'bg3') {
+      bg3Image = null;
     }
   }
   
@@ -5358,8 +5934,8 @@ function buildCatalog() {
     }
     console.log(`Catalog debug: all palette rows used in tileset: [${[...allRows].sort().join(',')}], tileArrangement data length: ${currentTileRawData.tileArrangement.data.length}, tileCount: ${tileCount}`);
   }
-  console.log(`Catalog: ${bg1Tiles.length} BG1 tiles (${animCount} animated), BG2=${bg2Image ? bg2Image.widthPx+'x'+bg2Image.heightPx : 'none'}, BG3=${bg3Image ? bg3Image.widthPx+'x'+bg3Image.heightPx : 'none'}`);
-  return { bg1Tiles, bg2Image, bg3Image, clusters: [], gfxSetIndex: currentStyle?.graphics };
+  console.log(`Catalog: ${bg1Tiles.length} BG1 tiles (${animCount} animated), BG2=${bg2Image ? bg2Image.widthPx+'x'+bg2Image.heightPx : 'none'}, BG3=${bg3Image ? bg3Image.widthPx+'x'+bg3Image.heightPx : 'none'}, Wall=${wallImage ? wallImage.widthPx+'x'+wallImage.heightPx : 'none'}, FG-Overlay=${ssbFgImage ? ssbFgImage.widthPx+'x'+ssbFgImage.heightPx+' mode='+ssbFgImage.mode+' alpha='+ssbFgImage.colorMathAlpha : 'none'}`);
+  return { bg1Tiles, bg2Image, bg3Image, wallImage, ssbFgImage, clusters: [], gfxSetIndex: currentStyle?.graphics };
 }
 
 // Helper: draw a single 8x8 tile from raw CHR data (for catalog)
@@ -5486,10 +6062,29 @@ function renderCatalog() {
     renderBgImageSection(grid, catalogData.bg2Image, 'BG2', '#4fc3f7', scale, hdBg2);
   }
 
+  // Render ship wall (BG2 screens 2+3) as separate section
+  if (showBg2 && catalogData.wallImage) {
+    renderBgImageSection(grid, catalogData.wallImage, 'BG2 Wall (Schiffswand)', '#e57373', scale);
+  }
+
   // Render BG3 as composed background image with grid overlay
   if (showBg3 && catalogData.bg3Image) {
     const hdBg3 = (hdEnabled && hdPack && hdPack.bg3 && (hdPack.bg3GfxSet === undefined || hdPack.bg3GfxSet === catalogData?.gfxSetIndex)) ? hdPack.bg3 : null;
     renderBgImageSection(grid, catalogData.bg3Image, 'BG3', '#4caf50', scale, hdBg3);
+  }
+
+  // Render foreground overlay (color math blend or BG1 priority overlay)
+  if (catalogData.ssbFgImage) {
+    const ssb = catalogData.ssbFgImage;
+    const srcLayer = (ssb.source || 'bg3').toUpperCase();
+    let label;
+    if (ssb.mode === 'bg1overlay') {
+      label = `BG1 Foreground Overlay (priority, opaque)`;
+    } else {
+      const blendMode = ssb.colorMathSubtract ? 'subtract' : 'add';
+      label = `Color Math Foreground - ${srcLayer} (${blendMode}, alpha=${ssb.colorMathAlpha.toFixed(2)})`;
+    }
+    renderBgImageSection(grid, ssb, label, '#ffab40', scale);
   }
   
   // Render Tile Clusters (composites for upscaling) - auto-detected + manual
@@ -5921,11 +6516,16 @@ async function exportCatalogAsZip() {
     const expBg3 = document.getElementById('expBg3')?.checked === true;
     const bg2Src = catalogData.bg2Image || (expBg2 ? buildBgImageFromCurrentLevel('bg2') : null);
     const bg3Src = catalogData.bg3Image || (expBg3 ? buildBgImageFromCurrentLevel('bg3') : null);
+    const wallSrc = catalogData.wallImage || (expBg2 ? buildBgImageFromCurrentLevel('wall') : null);
     if (expBg2 && bg2Src && bg2Src.canvas) {
       rootFolder.file('bg2.png', await canvasToBlob(bg2Src.canvas));
       manifest.bg2 = { file: 'bg2.png', widthPx: bg2Src.widthPx, heightPx: bg2Src.heightPx };
     } else if (expBg2) {
       console.warn('BG2 export skipped: kein BG2-Layer im aktuellen Level verfügbar.');
+    }
+    if (expBg2 && wallSrc && wallSrc.canvas) {
+      rootFolder.file('bg2_wall.png', await canvasToBlob(wallSrc.canvas));
+      manifest.bg2_wall = { file: 'bg2_wall.png', widthPx: wallSrc.widthPx, heightPx: wallSrc.heightPx };
     }
     if (expBg3 && bg3Src && bg3Src.canvas) {
       rootFolder.file('bg3.png', await canvasToBlob(bg3Src.canvas));
@@ -6723,9 +7323,50 @@ async function saveCurrentHDToContainer(containerName) {
   if (skippedForeignTiles > 0) {
     console.log(`[save] Filtered out ${skippedForeignTiles} tiles from other gfxsets (keeping only gfxset ${currentGfxIdx})`);
   }
-  let bg2Blob = null, bg3Blob = null;
+  let bg2Blob = null, bg3Blob = null, wallBlob = null;
   if (hdPack.bg2) bg2Blob = await bitmapToBlob(hdPack.bg2);
   if (hdPack.bg3) bg3Blob = await bitmapToBlob(hdPack.bg3);
+  // Wall blob: convert wallData ImageData to PNG blob (no HD version yet, always native res)
+  if (currentBgData && currentBgData.wallData) {
+    const wd = currentBgData.wallData;
+    const c = new OffscreenCanvas(wd.widthPx, wd.heightPx);
+    c.getContext('2d').putImageData(wd.imgData, 0, 0);
+    wallBlob = await c.convertToBlob({ type: 'image/png' });
+  } else if (catalogData && catalogData.wallImage && catalogData.wallImage.canvas) {
+    wallBlob = await catalogData.wallImage.canvas.convertToBlob({ type: 'image/png' });
+  }
+
+  // Foreground overlay blob: SSB (source='bg1', color math), BG1 overlay (source='bg1', opaque),
+  // or standard CM (source='bg3').
+  // For SSB and BG1-overlay levels this is the BG1 foreground overlay which uses
+  // a different chrBase than terrain and needs its own export pipeline.
+  // For standard CM (source='bg3'), the existing BG3 pipeline handles everything — no
+  // separate blob needed.  We still save the metadata for viewer restore.
+  let cmFgBlob = null;
+  let cmFgSource = null;
+  let cmFgAlpha = null;
+  let cmFgSubtract = false;
+  if (currentFgData && (currentFgData.mode === 'colormath' || currentFgData.mode === 'bg1overlay')) {
+    cmFgSource = currentFgData.source || 'bg3';
+    cmFgAlpha = currentFgData.colorMathAlpha;
+    cmFgSubtract = !!currentFgData.colorMathSubtract;
+    if (cmFgSource === 'bg1') {
+      // SSB: save composed BG1 foreground image as PNG blob
+      const fg = currentFgData;
+      const c = new OffscreenCanvas(fg.widthPx, fg.heightPx);
+      c.getContext('2d').putImageData(fg.imgData, 0, 0);
+      cmFgBlob = await c.convertToBlob({ type: 'image/png' });
+    }
+    // source='bg3': no cmFgBlob needed — bg3Blob already covers it
+  } else if (catalogData && catalogData.ssbFgImage) {
+    const sfg = catalogData.ssbFgImage;
+    cmFgSource = sfg.source || 'bg3';
+    cmFgAlpha = sfg.colorMathAlpha;
+    cmFgSubtract = !!sfg.colorMathSubtract;
+    if (cmFgSource === 'bg1' && sfg.canvas) {
+      cmFgBlob = await sfg.canvas.convertToBlob({ type: 'image/png' });
+    }
+  }
 
   // Collect tile arrangement and PPU data for texture pack export
   let tileArrangementData = null;
@@ -6760,10 +7401,28 @@ async function saveCurrentHDToContainer(containerName) {
       bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,    // VRAM word address of BG1 character data
       bg2ChrBase: ppu.bg2 ? ppu.bg2.chrBase : 0,
       bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
+      // terrainChrBase: VRAM word address of the terrain BG's character data.
+      // Standard layout: terrain on BG1. Swapped (bg1TmLoaded): terrain on BG2.
+      terrainChrBase: (currentBgData && currentBgData.bg1TmLoaded)
+        ? (ppu.bg2 ? ppu.bg2.chrBase : 0)
+        : (ppu.bg1 ? ppu.bg1.chrBase : 0),
       bg2TilesW,
       bg2TilesH,
       bg3TilesW,
       bg3TilesH,
+      // Wall tilemap dimensions (BG2 screens 2+3, ship-hold levels only)
+      wallTilesW: currentBgData.wallData ? currentBgData.wallData.tilesW : 0,
+      wallTilesH: currentBgData.wallData ? currentBgData.wallData.tilesH : 0,
+      // Wall tilemap VRAM word base address (screen 2 start)
+      wallTilemapBase: currentBgData.wallData && ppu.bg2 ? (ppu.bg2.tilemapBase + 0x800) : 0,
+      // BG1 tilemap dimensions (needed for SSB cmFg export pipeline)
+      bg1TilesW: ppu.bg1 ? (ppu.bg1.wide ? 64 : 32) : 32,
+      bg1TilesH: ppu.bg1 ? (ppu.bg1.tall ? 64 : 32) : 32,
+      bg1TilemapBase: ppu.bg1 ? ppu.bg1.tilemapBase : 0,
+      // Color Math Foreground metadata
+      cmFgSource: cmFgSource,    // 'bg1' (SSB) or 'bg3' (standard) or null
+      cmFgAlpha: cmFgAlpha,      // compositing alpha (e.g. 0.35)
+      cmFgSubtract: cmFgSubtract, // color math mode (true=subtract, false=add)
     };
   } else if (catalogData && catalogData.ppuConfig) {
     // Fallback: use PPU config cached by buildCatalogByGfxSet (available in gfxset catalog mode)
@@ -6803,6 +7462,59 @@ async function saveCurrentHDToContainer(containerName) {
     bg3TilemapData = catalogData.bg3TilemapData;
   }
 
+  // ShipDeck BG3 override: the VRAM tilemap at $7800 is all zeros because the
+  // scroll engine streams metatiles dynamically.  Replace with a virtual tilemap
+  // expanded from ROM metatile data so the export pipeline can produce per-tile
+  // PNGs and content hashes for BG3.
+  if (currentStyle?.mapId === 3 && rom) {
+    const isEmpty = !bg3TilemapData || bg3TilemapData.every(b => b === 0);
+    if (isEmpty) {
+      const vt = expandShipDeckMetatilesToTilemap(rom);
+      bg3TilemapData = vt.tilemapData;
+      if (ppuConfig) {
+        ppuConfig.bg3TilesW = vt.tilesW;  // 160
+        ppuConfig.bg3TilesH = vt.tilesH;  // 64
+      }
+      console.log(`[save] ShipDeck BG3: replaced empty VRAM tilemap with virtual tilemap (${vt.tilesW}x${vt.tilesH} tiles, ${vt.tilemapData.length} bytes)`);
+    }
+  }
+
+  // Extract wall tilemap (BG2 screens 2+3) for ship-hold levels.
+  // Uses same chrBase as BG2 but different tilemap region (tilemapBase + 0x800 words).
+  let wallTilemapData = null;
+  if (currentBgData && currentBgData.wallData && currentBgData.vram &&
+      currentBgData.ppu && currentBgData.ppu.bg2 && ppuConfig && ppuConfig.wallTilesW > 0) {
+    const vram = currentBgData.vram;
+    const wallTmByteOffset = ppuConfig.wallTilemapBase * 2;
+    const wallTmByteLength = ppuConfig.wallTilesW * ppuConfig.wallTilesH * 2;
+    if (wallTmByteOffset >= 0 && wallTmByteOffset + wallTmByteLength <= vram.length) {
+      wallTilemapData = [];
+      for (let i = 0; i < wallTmByteLength; i++) wallTilemapData.push(vram[wallTmByteOffset + i] || 0);
+    }
+  } else if (catalogData && catalogData.wallTilemapData) {
+    wallTilemapData = catalogData.wallTilemapData;
+  }
+
+  // Extract BG1 tilemap from VRAM (needed for SSB cmFg export pipeline).
+  // In SSB levels, BG1 carries the foreground overlay (honey drips) and its tiles
+  // use bg1ChrBase — different from terrainChrBase.  The BG1 tilemap is a standard
+  // VRAM tilemap (like BG2/BG3), NOT a Map32 tileArrangement.
+  let bg1TilemapData = null;
+  if (cmFgSource === 'bg1' && currentBgData && currentBgData.vram && currentBgData.ppu &&
+      currentBgData.ppu.bg1 && ppuConfig) {
+    const ppu = currentBgData.ppu;
+    const vram = currentBgData.vram;
+    const tmByteOffset = ppu.bg1.tilemapBase * 2;
+    const tmByteLength = ppuConfig.bg1TilesW * ppuConfig.bg1TilesH * 2;
+    if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
+      bg1TilemapData = [];
+      for (let i = 0; i < tmByteLength; i++) bg1TilemapData.push(vram[tmByteOffset + i] || 0);
+      console.log(`[save] BG1 tilemap extracted: ${tmByteLength} bytes at 0x${tmByteOffset.toString(16)} (${ppuConfig.bg1TilesW}x${ppuConfig.bg1TilesH} tiles, cmFg source=bg1)`);
+    }
+  } else if (catalogData && catalogData.bg1TilemapData) {
+    bg1TilemapData = catalogData.bg1TilemapData;
+  }
+
   // Store full VRAM snapshot for content-hash computation at export time.
   // Sources (in priority order):
   // 1. currentBgData.vram — set by loadLevelBackground() when a level is loaded
@@ -6833,9 +7545,9 @@ async function saveCurrentHDToContainer(containerName) {
     const gfxset = currentStyle?.graphics ?? 0;  // gfxset index for this save
     tileChecksums = [];
 
-    // BG1: iterate tileArrangement sub-tile entries
-    if (tileArrangementData && ppuConfig.bg1ChrBase !== undefined) {
-      const chrBase = ppuConfig.bg1ChrBase;
+    // Terrain: iterate tileArrangement sub-tile entries using terrain BG's chrBase
+    if (tileArrangementData && ppuConfig.terrainChrBase !== undefined) {
+      const chrBase = ppuConfig.terrainChrBase;
       const seen = new Set();
       for (let i = 0; i * 2 + 1 < tileArrangementData.length; i++) {
         const tileInfo = tileArrangementData[i * 2] | (tileArrangementData[i * 2 + 1] << 8);
@@ -6881,13 +7593,15 @@ async function saveCurrentHDToContainer(containerName) {
   await hdSaveSet(containerName, 'level', setId, {
     scaleFactor: hdPack.scaleFactor,
     tileCount: tiles.length,
-    tiles, clusters, bg2Blob, bg3Blob,
+    tiles, clusters, bg2Blob, bg3Blob, wallBlob, cmFgBlob,
     tileArrangementData: tileArrangementData ? Array.from(tileArrangementData) : null,
     tileArrangementTileCount: currentTileRawData ? currentTileRawData.tileCount : 0,
     gfxCount,
     ppuConfig,
     bg2TilemapData,
     bg3TilemapData,
+    wallTilemapData,
+    bg1TilemapData,
     tileChecksums,
     chrRawData,        // BG1 CHR bytes for content-hash (new)
     vramSnapshot,      // Full VRAM for BG2 content-hash (new)
@@ -6968,7 +7682,7 @@ async function loadContainerToHDPack(containerName) {
     return;
   }
 
-  hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, gfxSetIndex: null, sprites: new Map() };
+  hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, cmFg: null, gfxSetIndex: null, sprites: new Map() };
 
   let totalTiles = 0;
   for (const set of levelSets) {
@@ -6984,6 +7698,15 @@ async function loadContainerToHDPack(containerName) {
     }
     if (set.bg2Blob) { hdPack.bg2 = await createImageBitmap(set.bg2Blob); hdPack.bg2GfxSet = set.gfxSetIndex; }
     if (set.bg3Blob) { hdPack.bg3 = await createImageBitmap(set.bg3Blob); hdPack.bg3GfxSet = set.gfxSetIndex; }
+    if (set.wallBlob) { hdPack.wall = await createImageBitmap(set.wallBlob); hdPack.wallGfxSet = set.gfxSetIndex; }
+    // Restore color math foreground (SSB overlay — source='bg1')
+    if (set.cmFgBlob) {
+      hdPack.cmFg = await createImageBitmap(set.cmFgBlob);
+      hdPack.cmFgGfxSet = set.gfxSetIndex;
+      hdPack.cmFgSource = set.ppuConfig?.cmFgSource || 'bg1';
+      hdPack.cmFgAlpha = set.ppuConfig?.cmFgAlpha || 0.35;
+      hdPack.cmFgSubtract = !!set.ppuConfig?.cmFgSubtract;
+    }
     const existingClusterKeys = new Set(hdPack.clusters.map(c => c.ids.join(',')));
     for (const c of (set.clusters || [])) {
       const key = c.ids.join(',');
@@ -7057,6 +7780,8 @@ async function exportContainerAsZip(containerName) {
       }
       if (set.bg2Blob) { folder.file('bg2.png', set.bg2Blob); summary.totalFiles++; }
       if (set.bg3Blob) { folder.file('bg3.png', set.bg3Blob); summary.totalFiles++; }
+      if (set.wallBlob) { folder.file('wall.png', set.wallBlob); summary.totalFiles++; }
+      if (set.cmFgBlob) { folder.file('cmfg.png', set.cmFgBlob); summary.totalFiles++; }
       if (set.ppuConfig) {
         folder.file('ppu_config.json', JSON.stringify(set.ppuConfig, null, 2));
         summary.totalFiles++;
@@ -7071,6 +7796,14 @@ async function exportContainerAsZip(containerName) {
       }
       if (set.bg3TilemapData && set.bg3TilemapData.length > 0) {
         folder.file('bg3_tilemap.bin', new Uint8Array(set.bg3TilemapData));
+        summary.totalFiles++;
+      }
+      if (set.wallTilemapData && set.wallTilemapData.length > 0) {
+        folder.file('wall_tilemap.bin', new Uint8Array(set.wallTilemapData));
+        summary.totalFiles++;
+      }
+      if (set.bg1TilemapData && set.bg1TilemapData.length > 0) {
+        folder.file('bg1_tilemap.bin', new Uint8Array(set.bg1TilemapData));
         summary.totalFiles++;
       }
       if (set.chrRawData && set.chrRawData.length > 0) {
@@ -7336,12 +8069,12 @@ async function exportAsTexturePack(containerName) {
     const tileArr = new Uint8Array(set.tileArrangementData);
     const arrTileCount = set.tileArrangementTileCount || (tileArr.length / 32);
     const ppuCfg = set.ppuConfig;
-    const chrBase = ppuCfg.bg1ChrBase || 0;  // VRAM word address
+    const chrBase = ppuCfg.terrainChrBase ?? ppuCfg.bg1ChrBase ?? 0;  // VRAM word address
     const is4bpp = (ppuCfg.bgMode === 1);  // Mode 1: BG1 = 4bpp
     const wordsPerTile = is4bpp ? 16 : 8;  // 4bpp = 32 bytes = 16 words; 2bpp = 16 bytes = 8 words
     const scaleFactor = set.scaleFactor || scale;
 
-    // Determine the correct BG1 chrBase for this gfxset.
+    // Determine the correct terrain chrBase for this gfxset.
     // The ROM ppuConfig table stores the INITIAL BG12NBA value, but DKC2 often
     // changes it at runtime.  VRAM-based detection identifies the actual chrBase
     // by finding where tile data actually lives.  To avoid cross-layer hash
@@ -7606,6 +8339,94 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  // ---- Wall (Schiffswand) tile export ----
+  // Wall tiles share BG2's chrBase and layer but use different tile indices
+  // (578-652), so their vramAddrs never collide with ceiling tiles (1-577).
+  // Output goes to the same bg/bg2/gfxset_XX/ folder as ceiling tiles.
+  let wallExportedTiles = 0;
+
+  const setsWithWall = levelSets.filter(s => {
+    if (!s.wallBlob) return false;
+    const hasPpu  = !!(s.ppuConfig || (livePpu && s.gfxSetIndex === catalogData?.gfxSetIndex));
+    const hasTmap = !!(s.wallTilemapData && s.wallTilemapData.length > 0 ||
+                      (catalogData && catalogData.wallTilemapData && catalogData.wallTilemapData.length > 0
+                       && s.gfxSetIndex === catalogData.gfxSetIndex));
+    return hasPpu && hasTmap;
+  });
+
+  for (const set of setsWithWall) {
+    const ppuCfg   = set.ppuConfig || livePpu;
+    const tilemapRaw = (set.wallTilemapData && set.wallTilemapData.length > 0)
+      ? set.wallTilemapData
+      : (catalogData && catalogData.wallTilemapData ? catalogData.wallTilemapData : null);
+    if (!tilemapRaw || !ppuCfg) continue;
+
+    // Same folder as BG2 ceiling tiles — same layer, same chrBase
+    const wallGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
+    const wallGfxIdStr = String(wallGfxIdx).padStart(2, '0');
+    const wallFolder = root.folder(`bg/bg2/gfxset_${wallGfxIdStr}`);
+    const wallExportedKeys = new Set();
+
+    const chrBase  = ppuCfg.bg2ChrBase || 0;
+    const is4bpp   = (ppuCfg.bgMode === 1);
+    const wordsPerTile = is4bpp ? 16 : 8;
+    const tilesW   = ppuCfg.wallTilesW || 64;
+    const tilesH   = ppuCfg.wallTilesH || 32;
+
+    // Load composed wall image
+    const wallBitmap = await createImageBitmap(set.wallBlob);
+    const srcTileSize = Math.round(wallBitmap.width / tilesW);
+
+    // Read tilemap as 16-bit LE words
+    const tilemapWords = [];
+    const td = tilemapRaw;
+    for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
+
+    for (let tileY = 0; tileY < tilesH; tileY++) {
+      for (let tileX = 0; tileX < tilesW; tileX++) {
+        const entry = tilemapWords[tileY * tilesW + tileX];
+        if (entry === undefined) continue;
+        const tileNum = entry & 0x3FF;
+        if (tileNum === 0) continue;  // skip empty tilemap entries
+        const palRow  = (entry >> 10) & 7;
+        const flipH   = !!(entry & 0x4000);
+        const flipV   = !!(entry & 0x8000);
+
+        const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+        const addrHex = vramWordAddr.toString(16).padStart(4, '0');
+        const palStr  = 'P' + String(palRow).padStart(2, '0');
+        const fileKey = `${addrHex}_${palStr}`;
+
+        if (wallExportedKeys.has(fileKey)) continue;
+        wallExportedKeys.add(fileKey);
+
+        // Extract tile region from wall.png and scale to 32×32 output.
+        // Un-flip to store the canonical un-flipped version.
+        const srcX = tileX * srcTileSize, srcY = tileY * srcTileSize;
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = 32; outCanvas.height = 32;
+        const ctx = outCanvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+
+        if (flipH || flipV) {
+          ctx.save();
+          if (flipH) { ctx.scale(-1, 1); ctx.translate(-32, 0); }
+          if (flipV) { ctx.scale(1, -1); ctx.translate(0, -32); }
+        }
+        ctx.drawImage(wallBitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
+        if (flipH || flipV) ctx.restore();
+
+        const dataUrl = outCanvas.toDataURL('image/png');
+        const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+        const raw = atob(b64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        wallFolder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
+        wallExportedTiles++;
+      }
+    }
+  }
+
   // ---- BG3 tile export ----
   // BG3 in Mode 1 is 2bpp. Extracts unique 8x8 tiles from the composed bg3.png
   // using the saved tilemap, scales them 4x to 32x32, stores un-flipped.
@@ -7692,6 +8513,94 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  // ---- Color Math Foreground (SSB) tile export ----
+  // SSB (Sub-Screen-Blend) levels have a BG1 foreground overlay (e.g., honey in Rambi Rumble).
+  // These tiles live at bg1ChrBase (NOT terrainChrBase) and use layer 0.
+  // VRAM addresses never collide with terrain tiles since bg1ChrBase ≠ terrainChrBase in SSB.
+  let cmFgExportedTiles = 0;
+
+  const setsWithCmFg = levelSets.filter(s => {
+    if (!s.cmFgBlob) return false;
+    const hasPpu  = !!(s.ppuConfig || (livePpu && s.gfxSetIndex === catalogData?.gfxSetIndex));
+    const hasTmap = !!(s.bg1TilemapData && s.bg1TilemapData.length > 0 ||
+                      (catalogData && catalogData.bg1TilemapData && catalogData.bg1TilemapData.length > 0
+                       && s.gfxSetIndex === catalogData.gfxSetIndex));
+    const isSsb = (s.ppuConfig?.cmFgSource === 'bg1');
+    return hasPpu && hasTmap && isSsb;
+  });
+
+  for (const set of setsWithCmFg) {
+    const ppuCfg   = set.ppuConfig || livePpu;
+    const tilemapRaw = (set.bg1TilemapData && set.bg1TilemapData.length > 0)
+      ? set.bg1TilemapData
+      : (catalogData && catalogData.bg1TilemapData ? catalogData.bg1TilemapData : null);
+    if (!tilemapRaw || !ppuCfg) continue;
+
+    // Same folder as terrain tiles — same layer (0), but different chrBase = no collision
+    const cmFgGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
+    const cmFgGfxIdStr = String(cmFgGfxIdx).padStart(2, '0');
+    const cmFgFolder = root.folder(`bg/bg1/gfxset_${cmFgGfxIdStr}`);
+    const cmFgExportedKeys = new Set();
+
+    const chrBase  = ppuCfg.bg1ChrBase || 0;
+    const is4bpp   = (ppuCfg.bgMode === 1);
+    const wordsPerTile = is4bpp ? 16 : 8;
+    const tilesW   = ppuCfg.bg1TilesW || 32;
+    const tilesH   = ppuCfg.bg1TilesH || 32;
+
+    // Load composed cmFg image
+    const cmFgBitmap = await createImageBitmap(set.cmFgBlob);
+    const srcTileSize = Math.round(cmFgBitmap.width / tilesW);
+
+    // Read tilemap as 16-bit LE words
+    const tilemapWords = [];
+    const td = tilemapRaw;
+    for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
+
+    for (let tileY = 0; tileY < tilesH; tileY++) {
+      for (let tileX = 0; tileX < tilesW; tileX++) {
+        const entry = tilemapWords[tileY * tilesW + tileX];
+        if (entry === undefined) continue;
+        const tileNum = entry & 0x3FF;
+        if (tileNum === 0) continue;  // skip empty tilemap entries
+        const palRow  = (entry >> 10) & 7;
+        const flipH   = !!(entry & 0x4000);
+        const flipV   = !!(entry & 0x8000);
+
+        const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+        const addrHex = vramWordAddr.toString(16).padStart(4, '0');
+        const palStr  = 'P' + String(palRow).padStart(2, '0');
+        const fileKey = `${addrHex}_${palStr}`;
+
+        if (cmFgExportedKeys.has(fileKey)) continue;
+        cmFgExportedKeys.add(fileKey);
+
+        // Extract tile, scale to 32x32, un-flip
+        const srcX = tileX * srcTileSize, srcY = tileY * srcTileSize;
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = 32; outCanvas.height = 32;
+        const ctx = outCanvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+
+        if (flipH || flipV) {
+          ctx.save();
+          if (flipH) { ctx.scale(-1, 1); ctx.translate(-32, 0); }
+          if (flipV) { ctx.scale(1, -1); ctx.translate(0, -32); }
+        }
+        ctx.drawImage(cmFgBitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
+        if (flipH || flipV) ctx.restore();
+
+        const dataUrl = outCanvas.toDataURL('image/png');
+        const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+        const raw = atob(b64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        cmFgFolder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
+        cmFgExportedTiles++;
+      }
+    }
+  }
+
   // --- VBlank DMA injection into stored VRAM snapshots ---
   // Containers saved before the VBlank injection fix have vramSnapshots that lack
   // animated tile data (e.g. pirate flag for gfxset 0x25, vblankType 13).
@@ -7729,7 +8638,7 @@ async function exportAsTexturePack(containerName) {
     const dedupKey = new Set();
 
 
-    const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3];
+    const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3, ...setsWithCmFg];
     console.log(`[hashes] Processing ${allHashSets.length} set(s) for hashes.bin`);
     for (const set of allHashSets) {
       const ppuCfg = set.ppuConfig;
@@ -7749,9 +8658,9 @@ async function exportAsTexturePack(containerName) {
         const vram = set.vramSnapshot instanceof Uint8Array
           ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
         const tileArr = new Uint8Array(set.tileArrangementData);
-        const storedChrBase = ppuCfg.bg1ChrBase || 0;
+        const storedChrBase = ppuCfg.terrainChrBase ?? ppuCfg.bg1ChrBase ?? 0;
 
-        // Determine the correct BG1 chrBase for this gfxset.
+        // Determine the correct terrain chrBase for this gfxset.
         // Use VRAM detection to find the single best chrBase.  This avoids
         // cross-layer hash collisions from generating entries at wrong addresses.
         const hashChrBases = new Set();
@@ -7814,6 +8723,32 @@ async function exportAsTexturePack(containerName) {
         }
       }
 
+      // Wall (Schiffswand) hashes — same chrBase and layer as BG2, different tile indices
+      if (set.vramSnapshot && set.wallTilemapData && set.wallTilemapData.length > 1) {
+        const vram = set.vramSnapshot instanceof Uint8Array
+          ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        const chrBase = ppuCfg.bg2ChrBase || 0;
+        const td = set.wallTilemapData;
+
+        for (let i = 0; i + 1 < td.length; i += 2) {
+          const entry = td[i] | (td[i + 1] << 8);
+          const tileNum = entry & 0x3FF;
+          if (tileNum === 0) continue;  // skip empty tilemap entries
+          const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+          const dk = `${gfxset}_1_${vramWordAddr}`;
+          if (dedupKey.has(dk)) continue;
+          dedupKey.add(dk);
+
+          const byteOff = vramWordAddr * 2;
+          if (byteOff + bytesPerTile <= vram.length) {
+            const hash = fnv1a_64(vram, byteOff, bytesPerTile);
+            hashEntries.push({ vramAddr: vramWordAddr, layer: 1, gfxset, hash });
+          }
+        }
+        const wallCount = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 1).length;
+        console.log(`[hashes] gfxset ${gfxset}: BG2+Wall → ${wallCount} total layer-1 hash entries`);
+      }
+
       // BG3 hashes from vramSnapshot (2bpp in Mode 1)
       if (set.vramSnapshot && set.bg3TilemapData && set.bg3TilemapData.length > 1) {
         const vram = set.vramSnapshot instanceof Uint8Array
@@ -7839,6 +8774,35 @@ async function exportAsTexturePack(containerName) {
           }
         }
       }
+
+      // Color Math Foreground (SSB) hashes — BG1 overlay tiles at bg1ChrBase
+      // Only for SSB levels (cmFgSource='bg1'): uses bg1ChrBase, layer=0.
+      // VRAM addresses don't collide with terrain tiles (different chrBase).
+      if (set.vramSnapshot && set.bg1TilemapData && set.bg1TilemapData.length > 1
+          && ppuCfg.cmFgSource === 'bg1') {
+        const vram = set.vramSnapshot instanceof Uint8Array
+          ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        const cmFgChrBase = ppuCfg.bg1ChrBase || 0;
+        const td = set.bg1TilemapData;
+
+        for (let i = 0; i + 1 < td.length; i += 2) {
+          const entry = td[i] | (td[i + 1] << 8);
+          const tileNum = entry & 0x3FF;
+          if (tileNum === 0) continue;
+          const vramWordAddr = (cmFgChrBase + tileNum * wordsPerTile) & 0x7FFF;
+          const dk = `${gfxset}_0_${vramWordAddr}`;
+          if (dedupKey.has(dk)) continue;
+          dedupKey.add(dk);
+
+          const byteOff = vramWordAddr * 2;
+          if (byteOff + bytesPerTile <= vram.length) {
+            const hash = fnv1a_64(vram, byteOff, bytesPerTile);
+            hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
+          }
+        }
+        const cmFgHashCount = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 0).length;
+        console.log(`[hashes] gfxset ${gfxset}: BG1+cmFg → ${cmFgHashCount} total layer-0 hash entries`);
+      }
     }
 
     // Summary of hash entries per gfxset
@@ -7859,9 +8823,9 @@ async function exportAsTexturePack(containerName) {
         if (snapshotsByGfx.has(gs) || !set.vramSnapshot) continue;
         const vram = set.vramSnapshot instanceof Uint8Array
           ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
-        const chrBase = (set.ppuConfig?.bg1ChrBase || 0);
+        const chrBase = (set.ppuConfig?.terrainChrBase ?? set.ppuConfig?.bg1ChrBase ?? 0);
         const byteOff = chrBase * 2;
-        // Hash first 512 bytes at BG1 CHR base as fingerprint
+        // Hash first 512 bytes at terrain CHR base as fingerprint
         let fp = 0n;
         for (let b = 0; b < 512 && (byteOff + b) < vram.length; b++) {
           fp = ((fp ^ BigInt(vram[byteOff + b])) * 0x100000001b3n) & 0xFFFFFFFFFFFFFFFFn;
@@ -8035,7 +8999,9 @@ async function exportAsTexturePack(containerName) {
     flip_handling: 'runtime',
     total_bg1_tiles: exportedTiles,
     total_bg2_tiles: bg2ExportedTiles,
+    total_wall_tiles: wallExportedTiles,
     total_bg3_tiles: bg3ExportedTiles,
+    total_cmfg_tiles: cmFgExportedTiles,
     has_fingerprints: fpEntries && fpEntries.size > 0,
     notes: `Exported from DKC2 Viewer container "${containerName}"`
   }, null, 2));
@@ -8052,13 +9018,15 @@ async function exportAsTexturePack(containerName) {
   URL.revokeObjectURL(url);
 
   const bg2Msg = bg2ExportedTiles > 0 ? `\n${bg2ExportedTiles} unique BG2-Tiles` : '';
+  const wallMsg = wallExportedTiles > 0 ? `\n${wallExportedTiles} unique Wall-Tiles (Schiffswand)` : '';
   const bg3Msg = bg3ExportedTiles > 0 ? `\n${bg3ExportedTiles} unique BG3-Tiles` : '';
+  const cmFgMsg = cmFgExportedTiles > 0 ? `\n${cmFgExportedTiles} unique Color Math FG-Tiles (SSB)` : '';
   const fpMsg = (typeof fpEntries !== 'undefined' && fpEntries && fpEntries.size > 0)
     ? `\n${fpEntries.size} Gfxset-Fingerprints` : '';
   const palMsg = bg1PaletteVariants > 0
     ? `\n(davon ${bg1PaletteVariants} Palette-Varianten via ROM-Scan)` : '';
-  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${bg2Msg}${bg3Msg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
-  return { exportedTiles, bg2ExportedTiles, bg3ExportedTiles, sets: setsWithArrangement.length };
+  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${bg2Msg}${wallMsg}${bg3Msg}${cmFgMsg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
+  return { exportedTiles, bg2ExportedTiles, wallExportedTiles, bg3ExportedTiles, cmFgExportedTiles, sets: setsWithArrangement.length };
 
   } catch(err) {
     console.error('[Mesen2 Export] Fehler:', err);
@@ -8116,11 +9084,15 @@ async function importContainerFromZip(file) {
         tiles.push({ id: tf.id, blob: await tf.entry.async('blob') });
       }
 
-      let bg2Blob = null, bg3Blob = null;
+      let bg2Blob = null, bg3Blob = null, wallBlob = null, cmFgBlob = null;
       const bg2File = zip.file(`${setPath}bg2.png`);
       if (bg2File) bg2Blob = await bg2File.async('blob');
       const bg3File = zip.file(`${setPath}bg3.png`);
       if (bg3File) bg3Blob = await bg3File.async('blob');
+      const wallFile = zip.file(`${setPath}wall.png`);
+      if (wallFile) wallBlob = await wallFile.async('blob');
+      const cmFgFile = zip.file(`${setPath}cmfg.png`);
+      if (cmFgFile) cmFgBlob = await cmFgFile.async('blob');
 
       let ppuConfig = null, tileArrangementData = null, bg2TilemapData = null;
       const ppuCfgFile = zip.file(`${setPath}ppu_config.json`);
@@ -8141,6 +9113,18 @@ async function importContainerFromZip(file) {
         const buf = await bg3TilemapFile.async('arraybuffer');
         bg3TilemapData = Array.from(new Uint8Array(buf));
       }
+      let wallTilemapData = null;
+      const wallTilemapFile = zip.file(`${setPath}wall_tilemap.bin`);
+      if (wallTilemapFile) {
+        const buf = await wallTilemapFile.async('arraybuffer');
+        wallTilemapData = Array.from(new Uint8Array(buf));
+      }
+      let bg1TilemapData = null;
+      const bg1TilemapFile = zip.file(`${setPath}bg1_tilemap.bin`);
+      if (bg1TilemapFile) {
+        const buf = await bg1TilemapFile.async('arraybuffer');
+        bg1TilemapData = Array.from(new Uint8Array(buf));
+      }
 
       let chrRawData = null, vramSnapshot = null;
       const chrRawFile = zip.file(`${setPath}chr_raw_data.bin`);
@@ -8156,8 +9140,8 @@ async function importContainerFromZip(file) {
 
       await hdSaveSet(containerName, 'level', setInfo.setId, {
         scaleFactor: setManifest.scaleFactor || 1,
-        tileCount: tiles.length, tiles, bg2Blob, bg3Blob,
-        ppuConfig, tileArrangementData, bg2TilemapData, bg3TilemapData,
+        tileCount: tiles.length, tiles, bg2Blob, bg3Blob, wallBlob, cmFgBlob,
+        ppuConfig, tileArrangementData, bg2TilemapData, bg3TilemapData, wallTilemapData, bg1TilemapData,
         chrRawData, vramSnapshot,
         tileArrangementTileCount: setManifest.tileArrangementTileCount || 0,
         gfxCount: setManifest.gfxCount || 0,
@@ -8380,11 +9364,30 @@ async function refreshContainerSetMetadata(containerName) {
       bg1ChrBase: ppu.bg1 ? ppu.bg1.chrBase : 0,
       bg2ChrBase: ppu.bg2 ? ppu.bg2.chrBase : 0,
       bg3ChrBase: ppu.bg3 ? ppu.bg3.chrBase : 0,
+      // terrainChrBase: terrain BG's chrBase (swapped if bg1TmLoaded)
+      terrainChrBase: (currentBgData && currentBgData.bg1TmLoaded)
+        ? (ppu.bg2 ? ppu.bg2.chrBase : 0)
+        : (ppu.bg1 ? ppu.bg1.chrBase : 0),
       bg2TilesW: ppu.bg2 && ppu.bg2.wide ? 64 : 32,
       bg2TilesH: ppu.bg2 && ppu.bg2.tall ? 64 : 32,
       bg3TilesW: ppu.bg3 && ppu.bg3.wide ? 64 : 32,
       bg3TilesH: ppu.bg3 && ppu.bg3.tall ? 64 : 32,
     };
+    // Add SSB / color math / BG1 overlay foreground fields to ppuConfig
+    if (currentFgData && (currentFgData.mode === 'colormath' || currentFgData.mode === 'bg1overlay')) {
+      if (currentFgData.source === 'bg1' && ppu.bg1) {
+        ppuConfig.bg1TilesW = ppu.bg1.wide ? 64 : 32;
+        ppuConfig.bg1TilesH = ppu.bg1.tall ? 64 : 32;
+        ppuConfig.bg1TilemapBase = ppu.bg1.tilemapBase;
+        ppuConfig.cmFgSource = 'bg1';
+        ppuConfig.cmFgAlpha = currentFgData.colorMathAlpha;
+        ppuConfig.cmFgSubtract = currentFgData.colorMathSubtract;
+      } else if (currentFgData.source === 'bg3') {
+        ppuConfig.cmFgSource = 'bg3';
+        ppuConfig.cmFgAlpha = currentFgData.colorMathAlpha;
+        ppuConfig.cmFgSubtract = currentFgData.colorMathSubtract;
+      }
+    }
   } else if (!ppuConfig && catalogData && catalogData.ppuConfig) {
     ppuConfig = catalogData.ppuConfig;
   }
@@ -8419,6 +9422,55 @@ async function refreshContainerSetMetadata(containerName) {
     bg3TilemapData = catalogData.bg3TilemapData;
   }
 
+  // ShipDeck BG3 override: replace empty VRAM tilemap with virtual metatile expansion
+  if (currentStyle?.mapId === 3 && rom) {
+    const isEmpty = !bg3TilemapData || bg3TilemapData.every(b => b === 0);
+    if (isEmpty) {
+      const vt = expandShipDeckMetatilesToTilemap(rom);
+      bg3TilemapData = vt.tilemapData;
+      if (ppuConfig) {
+        ppuConfig.bg3TilesW = vt.tilesW;  // 160
+        ppuConfig.bg3TilesH = vt.tilesH;  // 64
+      }
+      console.log(`[refresh] ShipDeck BG3: virtual tilemap (${vt.tilesW}x${vt.tilesH} tiles, ${vt.tilemapData.length} bytes)`);
+    }
+  }
+
+  // Wall tilemap refresh — uses ppuConfig.wallTilemapBase (word address of screen 2)
+  let wallTilemapData = existing.wallTilemapData;
+  if (currentBgData && currentBgData.vram && ppuConfig && ppuConfig.wallTilemapBase) {
+    const vram = currentBgData.vram;
+    const wallW = ppuConfig.wallTilesW || 64;
+    const wallH = ppuConfig.wallTilesH || 32;
+    // Wall tilemap starts one screen (0x800 words = 0x1000 bytes) before wallTilemapBase
+    const screen1WordBase = ppuConfig.wallTilemapBase - 0x800;
+    const tmByteOffset = screen1WordBase * 2;
+    const tmByteLength = wallW * wallH * 2;
+    if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
+      wallTilemapData = [];
+      for (let i = 0; i < tmByteLength; i++) wallTilemapData.push(vram[tmByteOffset + i] || 0);
+    }
+  } else if (!wallTilemapData && catalogData && catalogData.wallTilemapData) {
+    wallTilemapData = catalogData.wallTilemapData;
+  }
+
+  // BG1 tilemap refresh for SSB levels (cmFgSource='bg1')
+  let bg1TilemapData = existing.bg1TilemapData;
+  if (currentBgData && currentBgData.vram && ppuConfig && ppuConfig.cmFgSource === 'bg1' &&
+      ppuConfig.bg1TilemapBase !== undefined) {
+    const vram = currentBgData.vram;
+    const bg1W = ppuConfig.bg1TilesW || 32;
+    const bg1H = ppuConfig.bg1TilesH || 32;
+    const tmByteOffset = ppuConfig.bg1TilemapBase * 2;
+    const tmByteLength = bg1W * bg1H * 2;
+    if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
+      bg1TilemapData = [];
+      for (let i = 0; i < tmByteLength; i++) bg1TilemapData.push(vram[tmByteOffset + i] || 0);
+    }
+  } else if (!bg1TilemapData && catalogData && catalogData.bg1TilemapData) {
+    bg1TilemapData = catalogData.bg1TilemapData;
+  }
+
   let vramSnapshot = null;
   if (currentBgData && currentBgData.vram) {
     vramSnapshot = new Uint8Array(currentBgData.vram);
@@ -8435,8 +9487,8 @@ async function refreshContainerSetMetadata(containerName) {
     const wordsPerTile = is4bpp ? 16 : 8;
     const gfxset = currentStyle?.graphics ?? 0;
     tileChecksums = [];
-    if (tileArrangementData && ppuConfig.bg1ChrBase !== undefined) {
-      const chrBase = ppuConfig.bg1ChrBase;
+    if (tileArrangementData && ppuConfig.terrainChrBase !== undefined) {
+      const chrBase = ppuConfig.terrainChrBase;
       const seen = new Set();
       const tileArr = new Uint8Array(tileArrangementData);
       for (let i = 0; i * 2 + 1 < tileArr.length; i++) {
@@ -8475,6 +9527,20 @@ async function refreshContainerSetMetadata(containerName) {
         tileChecksums.push({ layer: 2, vramAddr: vramWordAddr, gfxset, checksum: computeVramChecksum(vram, vramWordAddr, bg3WordsPerTile) });
       }
     }
+    // Wall (Schiffswand) checksums — same chrBase and layer as BG2
+    if (wallTilemapData && wallTilemapData.length > 1 && ppuConfig.bg2ChrBase !== undefined) {
+      const chrBase = ppuConfig.bg2ChrBase;
+      const seen = new Set();
+      for (let i = 0; i + 1 < wallTilemapData.length; i += 2) {
+        const entry = wallTilemapData[i] | (wallTilemapData[i + 1] << 8);
+        const tileNum = entry & 0x3FF;
+        if (tileNum === 0) continue;  // skip empty entries
+        const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+        if (seen.has(vramWordAddr)) continue;
+        seen.add(vramWordAddr);
+        tileChecksums.push({ layer: 1, vramAddr: vramWordAddr, gfxset, checksum: computeVramChecksum(vram, vramWordAddr, wordsPerTile) });
+      }
+    }
   }
 
   // Re-save: keep existing tile bitmaps, update all metadata
@@ -8485,6 +9551,8 @@ async function refreshContainerSetMetadata(containerName) {
     clusters: existing.clusters || [],
     bg2Blob: existing.bg2Blob || null,
     bg3Blob: existing.bg3Blob || null,
+    wallBlob: existing.wallBlob || null,
+    cmFgBlob: existing.cmFgBlob || null,
     gfxSetIndex: existing.gfxSetIndex,
     tileArrangementData,
     tileArrangementTileCount,
@@ -8492,6 +9560,8 @@ async function refreshContainerSetMetadata(containerName) {
     ppuConfig,
     bg2TilemapData,
     bg3TilemapData,
+    wallTilemapData,
+    bg1TilemapData,
     tileChecksums,
     chrRawData,
     vramSnapshot,
@@ -10307,7 +11377,12 @@ function toggleCatalogView(show) {
     
     // Build catalog if needed
     if (catalogMode === 'gfxset') {
-      if (!catalogData || catalogData.gfxSetIndex !== selectedGfxSet) {
+      // Invalidate cache if gfxSet changed OR if the currently loaded level changed
+      // (same gfxSet but different level → different palette/colormath/vblankType)
+      const needsRebuild = !catalogData
+        || catalogData.gfxSetIndex !== selectedGfxSet
+        || (currentLevelId != null && catalogData.refLevelId !== currentLevelId);
+      if (needsRebuild) {
         catalogData = buildCatalogByGfxSet(selectedGfxSet);
       }
     } else {
