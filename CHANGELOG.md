@@ -1,5 +1,168 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-05d] — Ground Truth VRAM Must Be Authoritative, Not a Gap-Filler; Fallback Data Must Not Depend on UI Navigation
+
+### Problem with the 2026-07-05c fix
+
+That fix chose between `currentBgData.vram` and `catalogData.vram` — but **both**
+are the viewer's own ROM-based VRAM *simulation* (`loadLevelBackground()`), which
+is documented (`SNES_HD_PACK_PROJECT.md`, "VRAM Dump/Import Feature", 2026-06-15)
+to deviate from Mesen's real runtime VRAM for some gfxsets (e.g. 37 = Lava-Levels)
+due to VBlank DMA / init-code writes it doesn't fully replicate — this is exactly
+why the VRAM ground-truth dump pipeline (Lua-captured real VRAM, embedded for all
+25 gfxsets, commit `882f23a`) exists in the first place. The 2026-07-05c fix
+picked between two simulated sources without ever considering ground truth, so
+it could still produce content hashes that don't match Mesen's actual runtime
+even when gfxset identity was resolved correctly.
+
+Separately: the fallback to `catalogData` for `tileArrangementData`/`chrRawData`/
+`ppuConfig`/tilemaps assumed `catalogData` already matched the gfxset being
+saved. That's only true if the user actively switches the Catalog view's own
+gfxset dropdown. The viewer's actual primary navigation is the main Level
+dropdown — selecting a level there drives *both* the Per-Level and Per-GfxSet
+catalog views for that level, and the Catalog gfxset dropdown is a secondary,
+independent control. If the user imports several gfxsets' ZIPs while `catalogData`
+still reflects whatever level was loaded via the main dropdown, the "fallback to
+catalogData" safety net silently reuses the wrong gfxset's data — the same bug
+class as 2026-07-05c, just shifted one level down.
+
+### Fix
+
+- **`vramSnapshot`** (in both `saveCurrentHDToContainer()` and
+  `refreshContainerSetMetadata()`): now checks `VRAM_GROUND_TRUTH[gfxset_XX]`
+  **first, unconditionally** — not just as a last-resort gap-filler like
+  `applyGroundTruthVram()` does elsewhere — before falling back to simulated
+  `currentBgData.vram` (gated by `currentMatchesActive`) or `catalogData.vram`.
+  Ground truth covers all 25 playable gfxsets, so this is expected to be the hit
+  in the overwhelming majority of saves regardless of what's loaded in the UI.
+- **Everything else** (`tileArrangementData`, `gfxCount`, `chrRawData`,
+  `ppuConfig`, `bg2/bg3/bg1TilemapData`, `wallTilemapData`) has no ground-truth
+  equivalent (they're ROM tile-arrangement/PPU-config, not VRAM content), so
+  instead: both functions now rebuild `catalogData` fresh via
+  `buildCatalogByGfxSet(activeGfxIdx / targetGfxIdx)` whenever the cached
+  `catalogData.gfxSetIndex` doesn't already match the gfxset being saved —
+  `buildCatalogByGfxSet()` only needs `rom`/`graphicsSetsMap` (always available
+  once a ROM is loaded), so it produces correct data for *any* gfxset regardless
+  of what Level or Catalog-dropdown selection currently happens to be displayed.
+  The original `catalogData` is restored right before each function returns, so
+  this is invisible to whatever the user is actually looking at.
+
+### Net effect
+
+Importing an HD ZIP for a given gfxset no longer depends on having that gfxset
+"open" anywhere in the UI — main Level dropdown, Catalog gfxset dropdown, or
+otherwise. The pack's own `manifest.gfxSetIndex` (already the source of
+`hdPack.gfxSetIndex`/`activeGfxIdx`) is enough; ground truth and
+`buildCatalogByGfxSet()` supply the rest directly from ROM/embedded dump data.
+
+---
+
+## [2026-07-05c] — Critical: Stale currentBgData/currentTileRawData Corrupted Every Field saveCurrentHDToContainer() Writes Except Tiles
+
+### Problem
+
+After importing all 6 gfxsets into a freshly-rebuilt container (with every fix from
+2026-07-05/05b in place), the resulting Mesen HD Pack made **every level** render
+as a mix of unrelated tiles — including Pirate Panic, which had always worked
+before. Generating the pack also reported fingerprints for only 2 of 6 gfxsets.
+
+### Root Cause
+
+Confirmed empirically by cross-referencing the exported `hashes.bin`: BG1 content
+hashes for gfxsets 3, 4, 7, and 29 were **100% identical** (918/918 shared hash
+values) — impossible for genuinely different levels. This means the raw VRAM
+bytes those hashes were computed from were themselves identical across 4
+supposedly-different gfxsets.
+
+`saveCurrentHDToContainer()` builds `vramSnapshot`, `chrRawData`,
+`tileArrangementData`/`gfxCount`, `ppuConfig`, `bg2/bg3/bg1TilemapData`,
+`wallTilemapData`, the wall/cmFg blobs, and legacy `tileChecksums` from
+`currentBgData`/`currentTileRawData`/`currentFgData`/`currentStyle` **first**,
+falling back to `catalogData` only if those were falsy. But those `current*`
+globals are Level-load-scoped — only `loadLevel()` updates them. Switching
+gfxsets via the Catalog dropdown updates `catalogData`/`selectedGfxSet` but
+leaves `current*` frozen on whichever Level was loaded last. Since `current*`
+stays truthy for the rest of the session after the first Level load, it was
+**always** preferred over the correct, fresh `catalogData` — so importing
+several different gfxsets via the dropdown (the exact workflow enabled by
+2026-07-05's container-save fix) saved the **same stale Level's** VRAM/tile
+data under every gfxset's container entry, varying only by which tiles/BG2/BG3
+images happened to be attached (already fixed separately). `chrRawData` and
+`tileArrangementData` had no `catalogData` fallback at all — they'd be either
+wrong or entirely missing.
+
+This bug almost certainly predates today — it just never surfaced before
+because the setId/tile-filter bug (fixed earlier today) made every gfxset after
+the first collide into the same container key anyway, and because prior
+single-gfxset-at-a-time workflows likely always reloaded a real Level before
+importing. Today's fixes were the first time a "import 6 gfxsets in one session
+via the dropdown" workflow actually produced 6 *distinct* container entries —
+which is what finally exposed that their VRAM/tile metadata was identical.
+
+### Fix
+
+Added `currentMatchesActive = currentStyle && activeGfxIdx != null &&
+currentStyle.graphics === activeGfxIdx` in `saveCurrentHDToContainer()`. Every
+`current*`-preferring branch now requires this guard before trusting `current*`,
+falling through to `catalogData` otherwise:
+`wallBlob`, `cmFgBlob`, `tileArrangementData`/`gfxCount`, `chrRawData`,
+`ppuConfig`, `bg2TilemapData`, `bg3TilemapData`, the ShipDeck BG3 virtual-tilemap
+override, `wallTilemapData`, `bg1TilemapData`, `vramSnapshot`, and the legacy
+`tileChecksums`. `buildCatalogByGfxSet()` now also returns `tileArrangement`,
+`gfxData`, `gfxCount`, and `tileCount` so `chrRawData`/`tileArrangementData` have
+a real fallback (previously missing entirely).
+
+### Not yet audited
+
+`refreshContainerSetMetadata()` (the "Aktualisieren" button in the container
+manager) has the same `currentBgData`-preferring pattern in a few places (BG2/
+BG3/wall/cmFg tilemap refresh, ShipDeck override). Not fixed in this pass since
+it wasn't implicated in today's reported symptoms — worth applying the same
+`currentMatchesActive`-style guard there before relying on it for multi-gfxset
+sessions.
+
+### Recommended recovery
+
+Delete the container and re-import all 6 already-upscaled ZIPs once more now
+that this fix is in place, then re-export the Mesen HD Pack fresh. The ZIPs
+themselves were never affected (this bug is purely in how the viewer wrote
+container metadata) — no re-upscaling needed.
+
+### Follow-up: refreshContainerSetMetadata() had the same bug, worse
+
+The "Aktualisieren" button in the container manager — meant to refresh a set's
+VRAM-derived metadata without re-uploading its HD tiles — had the identical
+`currentBgData`-preferring pattern for every VRAM-derived field, **plus** an
+unguarded `setId` computed directly from `currentStyle?.graphics` with no
+match-check at all. Clicking it while `currentStyle` was stale (frozen on a
+different Level than whatever gfxset the Catalog view was showing) could
+silently refresh the **wrong** container entry with mismatched data — a
+plausible independent (or contributing) cause of the corruption, given this
+function's whole purpose is "patch VRAM data without a full re-upload."
+
+Fixed the same way: `setId` now derives from `selectedGfxSet` when
+`catalogView && catalogMode === 'gfxset'` (falls back to `currentStyle.graphics`
+only in Level mode), and a `currentMatchesActive` guard (same as
+`saveCurrentHDToContainer()`) gates every `current*`-preferring branch —
+`tileArrangementData`/`gfxCount`, `chrRawData` (previously no catalogData
+fallback, same gap), `ppuConfig`, `bg2/bg3/bg1TilemapData`, the ShipDeck
+override, `wallTilemapData`, `vramSnapshot`, and `tileChecksums` (which also
+used `currentStyle?.graphics` directly for its `gfxset` tag — now uses the
+resolved `targetGfxIdx`).
+
+### Note on age
+
+Verified via `git log -S` rather than assumed: the vulnerable
+`currentBgData`-preferring pattern in `saveCurrentHDToContainer()` dates to
+commit `885c867` (2026-06-16) — about 3 weeks before this was caught, not
+introduced today. It plausibly went unnoticed because the parallel setId/
+tile-filter bug (fixed earlier on 2026-07-05) made multi-gfxset-in-one-session
+imports collide into a single container key anyway, and/or because earlier
+single-gfxset workflows likely always reloaded a real Level before each import,
+which happened to keep `currentBgData` fresh by coincidence.
+
+---
+
 ## [2026-07-05b] — Revert Cluster Padding (Export v4 → clean clusters)
 
 ### Problem

@@ -4904,7 +4904,11 @@ function buildCatalogByGfxSet(gfxSetIndex) {
            ppuConfig: catalogPpuConfig, bg2TilemapData: catalogBg2TilemapData,
            bg3TilemapData: catalogBg3TilemapData, wallTilemapData: catalogWallTilemapData,
            bg1TilemapData: catalogBg1TilemapData,
-           vram: catalogVram };
+           vram: catalogVram,
+           // Needed by saveCurrentHDToContainer() as a gfxset-correct fallback for
+           // chrRawData/tileArrangementData when currentTileRawData is stale (see
+           // currentMatchesActive there).
+           tileArrangement, gfxData, gfxCount, tileCount };
 }
 
 // ============================================================
@@ -7508,6 +7512,38 @@ async function saveCurrentHDToContainer(containerName) {
   // earlier gfxsets' container entries (wrong BG2/BG3, missing tiles for later sets).
   const activeGfxIdx = hdPack.gfxSetIndex ?? selectedGfxSet ?? currentStyle?.graphics;
 
+  // Whether currentBgData/currentTileRawData/currentFgData/currentStyle actually
+  // describe the gfxset we're saving. These globals are Level-load-scoped — only
+  // loadLevel() updates them. Switching gfxsets via the Catalog dropdown updates
+  // catalogData/selectedGfxSet but leaves current* frozen on whatever Level was
+  // loaded last. Every block below used to check "if (currentXxx) use it, else fall
+  // back to catalogData" — since current* stays truthy for the rest of the session
+  // after the first Level load, it was ALWAYS preferred, so importing several
+  // different gfxsets via the dropdown (without reloading a Level each time) saved
+  // the SAME stale Level's vramSnapshot/tileArrangementData/chrRawData/ppuConfig/
+  // tilemaps under every gfxset's container entry.
+  // Confirmed empirically (2026-07-05): after such a session, 4 of 6 exported
+  // gfxsets had 100%-identical BG1 content hashes — impossible for distinct levels,
+  // and the direct cause of Mesen rendering a mix of unrelated tiles per level, plus
+  // fingerprint generation failing for those gfxsets (no tile hash is unique to a
+  // single gfxset when several gfxsets share the exact same underlying data).
+  const currentMatchesActive = currentStyle && activeGfxIdx != null && currentStyle.graphics === activeGfxIdx;
+
+  // Ensure catalogData (the fallback source for everything below that ISN'T covered
+  // by VRAM_GROUND_TRUTH — tileArrangementData, chrRawData, ppuConfig, tilemaps) is
+  // ACTUALLY for the gfxset we're saving, rebuilding it fresh from ROM if not. Without
+  // this, the "fallback to catalogData" safety net could silently reuse whatever OTHER
+  // gfxset's catalog happens to be cached — the exact same stale-data bug just shifted
+  // one level down, e.g. if the user navigates purely via the main Level dropdown and
+  // the Catalog view still shows an earlier gfxset. buildCatalogByGfxSet() only needs
+  // rom/graphicsSetsMap (always available) — it works for any gfxset regardless of
+  // what's currently displayed.
+  const originalCatalogDataForSave = catalogData;
+  if (activeGfxIdx != null && (!catalogData || catalogData.gfxSetIndex !== activeGfxIdx) && graphicsSetsMap?.has(activeGfxIdx)) {
+    catalogData = buildCatalogByGfxSet(activeGfxIdx);
+    console.log(`[save] Rebuilt catalogData for gfxset ${activeGfxIdx} from ROM (cached catalogData was for a different gfxset or missing)`);
+  }
+
   // Determine setId from current context
   const setId = catalogView
     ? `gfxset_${(activeGfxIdx || 0).toString(16).toUpperCase().padStart(2, '0')}`
@@ -7540,7 +7576,7 @@ async function saveCurrentHDToContainer(containerName) {
   if (hdPack.bg2) bg2Blob = await bitmapToBlob(hdPack.bg2);
   if (hdPack.bg3) bg3Blob = await bitmapToBlob(hdPack.bg3);
   // Wall blob: convert wallData ImageData to PNG blob (no HD version yet, always native res)
-  if (currentBgData && currentBgData.wallData) {
+  if (currentMatchesActive && currentBgData && currentBgData.wallData) {
     const wd = currentBgData.wallData;
     const c = new OffscreenCanvas(wd.widthPx, wd.heightPx);
     c.getContext('2d').putImageData(wd.imgData, 0, 0);
@@ -7559,7 +7595,7 @@ async function saveCurrentHDToContainer(containerName) {
   let cmFgSource = null;
   let cmFgAlpha = null;
   let cmFgSubtract = false;
-  if (currentFgData && (currentFgData.mode === 'colormath' || currentFgData.mode === 'bg1overlay')) {
+  if (currentMatchesActive && currentFgData && (currentFgData.mode === 'colormath' || currentFgData.mode === 'bg1overlay')) {
     cmFgSource = currentFgData.source || 'bg3';
     cmFgAlpha = currentFgData.colorMathAlpha;
     cmFgSubtract = !!currentFgData.colorMathSubtract;
@@ -7585,25 +7621,37 @@ async function saveCurrentHDToContainer(containerName) {
   let tileArrangementData = null;
   let ppuConfig = null;
   let gfxCount = 0;
-  if (currentTileRawData && currentTileRawData.tileArrangement) {
+  if (currentMatchesActive && currentTileRawData && currentTileRawData.tileArrangement) {
     const ta = currentTileRawData.tileArrangement;
     // Store raw tileArrangement bytes (32 bytes per Map32 tile, 16 words of sub-tile info)
     tileArrangementData = new Uint8Array(ta.data.buffer, 0, currentTileRawData.tileCount * 32);
     gfxCount = currentTileRawData.gfxCount || 0;
+  } else if (catalogData && catalogData.tileArrangement) {
+    // Fallback: gfxset catalog mode (buildCatalogByGfxSet) — currentTileRawData is either
+    // stale (belongs to a different gfxset) or was never populated this session.
+    const ta = catalogData.tileArrangement;
+    tileArrangementData = new Uint8Array(ta.data.buffer, 0, (catalogData.tileCount || 0) * 32);
+    gfxCount = catalogData.gfxCount || 0;
   }
 
   // Store raw BG1 CHR bytes for content-hash computation at export time.
   // gfxData is a GrowBuffer holding sequential 4bpp tile data (32 bytes per tile).
   let chrRawData = null;
-  if (currentTileRawData && currentTileRawData.gfxData) {
+  if (currentMatchesActive && currentTileRawData && currentTileRawData.gfxData) {
     const gd = currentTileRawData.gfxData;
     const byteLen = (currentTileRawData.gfxCount || 0) * 32;
     if (byteLen > 0 && gd.data && gd.data.length >= byteLen) {
       chrRawData = Array.from(gd.data.slice(0, byteLen));
     }
+  } else if (catalogData && catalogData.gfxData) {
+    const gd = catalogData.gfxData;
+    const byteLen = (catalogData.gfxCount || 0) * 32;
+    if (byteLen > 0 && gd.data && gd.data.length >= byteLen) {
+      chrRawData = Array.from(gd.data.slice(0, byteLen));
+    }
   }
 
-  if (currentBgData && currentBgData.ppu) {
+  if (currentMatchesActive && currentBgData && currentBgData.ppu) {
     const ppu = currentBgData.ppu;
     const bg2TilesW = ppu.bg2 && ppu.bg2.wide ? 64 : 32;
     const bg2TilesH = ppu.bg2 && ppu.bg2.tall ? 64 : 32;
@@ -7645,7 +7693,7 @@ async function saveCurrentHDToContainer(containerName) {
   // Extract raw BG2 tilemap from VRAM so exportAsTexturePack can identify unique tiles.
   // Prefer currentBgData (level mode); fall back to catalogData (gfxset catalog mode).
   let bg2TilemapData = null;
-  if (currentBgData && currentBgData.vram && currentBgData.ppu &&
+  if (currentMatchesActive && currentBgData && currentBgData.vram && currentBgData.ppu &&
       currentBgData.ppu.bg2 && currentBgData.ppu.bg2.enabled && ppuConfig) {
     const ppu = currentBgData.ppu;
     const vram = currentBgData.vram;
@@ -7661,7 +7709,7 @@ async function saveCurrentHDToContainer(containerName) {
 
   // Extract raw BG3 tilemap from VRAM (same approach as BG2)
   let bg3TilemapData = null;
-  if (currentBgData && currentBgData.vram && currentBgData.ppu &&
+  if (currentMatchesActive && currentBgData && currentBgData.vram && currentBgData.ppu &&
       currentBgData.ppu.bg3 && currentBgData.ppu.bg3.enabled && ppuConfig) {
     const ppu = currentBgData.ppu;
     const vram = currentBgData.vram;
@@ -7679,7 +7727,7 @@ async function saveCurrentHDToContainer(containerName) {
   // scroll engine streams metatiles dynamically.  Replace with a virtual tilemap
   // expanded from ROM metatile data so the export pipeline can produce per-tile
   // PNGs and content hashes for BG3.
-  if (currentStyle?.mapId === 3 && rom) {
+  if (currentMatchesActive && currentStyle?.mapId === 3 && rom) {
     const isEmpty = !bg3TilemapData || bg3TilemapData.every(b => b === 0);
     if (isEmpty) {
       const vt = expandShipDeckMetatilesToTilemap(rom);
@@ -7695,7 +7743,7 @@ async function saveCurrentHDToContainer(containerName) {
   // Extract wall tilemap (BG2 screens 2+3) for ship-hold levels.
   // Uses same chrBase as BG2 but different tilemap region (tilemapBase + 0x800 words).
   let wallTilemapData = null;
-  if (currentBgData && currentBgData.wallData && currentBgData.vram &&
+  if (currentMatchesActive && currentBgData && currentBgData.wallData && currentBgData.vram &&
       currentBgData.ppu && currentBgData.ppu.bg2 && ppuConfig && ppuConfig.wallTilesW > 0) {
     const vram = currentBgData.vram;
     const wallTmByteOffset = ppuConfig.wallTilemapBase * 2;
@@ -7713,7 +7761,7 @@ async function saveCurrentHDToContainer(containerName) {
   // use bg1ChrBase — different from terrainChrBase.  The BG1 tilemap is a standard
   // VRAM tilemap (like BG2/BG3), NOT a Map32 tileArrangement.
   let bg1TilemapData = null;
-  if (cmFgSource === 'bg1' && currentBgData && currentBgData.vram && currentBgData.ppu &&
+  if (currentMatchesActive && cmFgSource === 'bg1' && currentBgData && currentBgData.vram && currentBgData.ppu &&
       currentBgData.ppu.bg1 && ppuConfig) {
     const ppu = currentBgData.ppu;
     const vram = currentBgData.vram;
@@ -7730,16 +7778,30 @@ async function saveCurrentHDToContainer(containerName) {
 
   // Store full VRAM snapshot for content-hash computation at export time.
   // Sources (in priority order):
-  // 1. currentBgData.vram — set by loadLevelBackground() when a level is loaded
-  //    (includes VBlank DMA injection, matching Mesen's runtime VRAM)
-  // 2. catalogData.vram — built by buildCatalogByGfxSet() for the active gfxset
-  //    (fallback when user is in catalog mode without an active level load)
+  // 1. VRAM_GROUND_TRUTH[gfxset_XX] — real VRAM dumped directly from Mesen at
+  //    runtime (Lua script, all 25 playable gfxsets, embedded 2026-06-29, commit
+  //    882f23a). ALWAYS authoritative when available for this gfxset: the viewer's
+  //    own VRAM simulation (loadLevelBackground(), used by both currentBgData and
+  //    catalogData below) is KNOWN to deviate from real runtime VRAM for some
+  //    gfxsets (e.g. 37 = Lava-Levels) due to VBlank DMA / init-code writes it
+  //    doesn't fully replicate (SNES_HD_PACK_PROJECT.md, "VRAM Dump/Import
+  //    Feature", 2026-06-15). Checked FIRST, unconditionally — not just as a
+  //    last-resort gap-filler like applyGroundTruthVram() does elsewhere — so
+  //    vramSnapshot is correct regardless of which Level/gfxset the UI happens to
+  //    have loaded at import time.
+  // 2. currentBgData.vram — simulated; only trusted if it actually belongs to the
+  //    gfxset being saved (currentMatchesActive) — otherwise it's stale.
+  // 3. catalogData.vram — simulated fallback (gfxset catalog mode).
   let vramSnapshot = null;
-  if (currentBgData && currentBgData.vram) {
+  const gtKey = activeGfxIdx != null ? `gfxset_${activeGfxIdx.toString(16).toUpperCase().padStart(2, '0')}` : null;
+  if (gtKey && typeof VRAM_GROUND_TRUTH !== 'undefined' && VRAM_GROUND_TRUTH[gtKey]) {
+    vramSnapshot = _b64ToUint8Array(VRAM_GROUND_TRUTH[gtKey]);
+    console.log(`[save] Using VRAM_GROUND_TRUTH for ${gtKey} (authoritative real VRAM dump, not simulated)`);
+  } else if (currentMatchesActive && currentBgData && currentBgData.vram) {
     vramSnapshot = new Uint8Array(currentBgData.vram);  // 128KB copy
   } else if (catalogData && catalogData.vram) {
-    vramSnapshot = new Uint8Array(catalogData.vram);  // catalog-mode fallback
-    console.log('[save] Using catalogData.vram as vramSnapshot fallback (catalog mode, no active level)');
+    vramSnapshot = new Uint8Array(catalogData.vram);  // catalog-mode / stale-currentBgData fallback
+    console.log(`[save] Using catalogData.vram as vramSnapshot for ${gtKey || '?'} (no ground truth available, simulation only)`);
   }
 
   const clusters = [];
@@ -7751,7 +7813,7 @@ async function saveCurrentHDToContainer(containerName) {
   // Stores {layer, vramAddr, checksum} for every unique tile that will be exported.
   // Only possible when live VRAM is available (currentBgData.vram set during an active session).
   let tileChecksums = null;
-  if (currentBgData && currentBgData.vram && ppuConfig) {
+  if (currentMatchesActive && currentBgData && currentBgData.vram && ppuConfig) {
     const vram = currentBgData.vram;
     const is4bpp = (ppuConfig.bgMode === 1);
     const wordsPerTile = is4bpp ? 16 : 8;
@@ -7854,6 +7916,11 @@ async function saveCurrentHDToContainer(containerName) {
     // changes hdPack.gfxSetIndex.
     if (hdPack.gfxSetIndex === activeGfxIdx) hdPack.gfxSetIndex = null;
   }
+
+  // Restore whatever catalogData the UI was actually displaying — the rebuild above
+  // (if it happened) was only to guarantee correct fallback data for this save, not a
+  // permanent view switch.
+  catalogData = originalCatalogDataForSave;
 
   return tiles.length;
 }
@@ -9641,10 +9708,23 @@ document.getElementById('vramDumpInput').addEventListener('change', async (e) =>
 // The user must have the matching gfxset/level open for this to work.
 // Returns the number of sets updated.
 async function refreshContainerSetMetadata(containerName) {
-  // Determine which set to update based on current context
+  // Determine which set to update. Prefer selectedGfxSet (kept in sync by both the
+  // Level dropdown and the Catalog gfxset dropdown) over currentStyle.graphics, which
+  // only updates on a full Level (re)load — same stale-data class of bug fixed in
+  // saveCurrentHDToContainer() (see currentMatchesActive below). Using currentStyle
+  // directly here could silently target the WRONG container entry — e.g. update
+  // gfxset_07's metadata while the user is actually looking at gfxset_25 in the
+  // Catalog view, because no real Level was reloaded in between.
+  const targetGfxIdx = (catalogView && catalogMode === 'gfxset') ? selectedGfxSet : currentStyle?.graphics;
   const setId = catalogView
-    ? `gfxset_${(currentStyle?.graphics || 0).toString(16).toUpperCase().padStart(2, '0')}`
+    ? `gfxset_${(targetGfxIdx || 0).toString(16).toUpperCase().padStart(2, '0')}`
     : `level_${currentLevelId || 0}`;
+
+  // Whether currentBgData/currentTileRawData/currentStyle actually describe the
+  // gfxset we're refreshing (targetGfxIdx). If not, every VRAM-derived field below
+  // must fall back to catalogData instead of silently reusing stale data from
+  // whichever Level was loaded last (2026-07-05c regression).
+  const currentMatchesActive = currentStyle && targetGfxIdx != null && currentStyle.graphics === targetGfxIdx;
 
   const sets = await hdGetContainerSets(containerName);
   const existing = sets.find(s => s.setId === setId && s.type === 'level');
@@ -9659,29 +9739,48 @@ async function refreshContainerSetMetadata(containerName) {
     return 0;
   }
 
+  // Ensure catalogData actually matches targetGfxIdx before trusting it as a fallback
+  // — see the identical rebuild in saveCurrentHDToContainer() for why.
+  const originalCatalogDataForRefresh = catalogData;
+  if (targetGfxIdx != null && (!catalogData || catalogData.gfxSetIndex !== targetGfxIdx) && graphicsSetsMap?.has(targetGfxIdx)) {
+    catalogData = buildCatalogByGfxSet(targetGfxIdx);
+    console.log(`[refresh] Rebuilt catalogData for gfxset ${targetGfxIdx} from ROM (cached catalogData was for a different gfxset or missing)`);
+  }
+
   // --- Compute fresh metadata from current ROM data ---
 
   let tileArrangementData = existing.tileArrangementData;
   let gfxCount = existing.gfxCount || 0;
   let tileArrangementTileCount = existing.tileArrangementTileCount || 0;
-  if (currentTileRawData && currentTileRawData.tileArrangement) {
+  if (currentMatchesActive && currentTileRawData && currentTileRawData.tileArrangement) {
     const ta = currentTileRawData.tileArrangement;
     tileArrangementData = Array.from(new Uint8Array(ta.data.buffer, 0, currentTileRawData.tileCount * 32));
     gfxCount = currentTileRawData.gfxCount || 0;
     tileArrangementTileCount = currentTileRawData.tileCount;
+  } else if (catalogData && catalogData.tileArrangement) {
+    const ta = catalogData.tileArrangement;
+    tileArrangementData = Array.from(new Uint8Array(ta.data.buffer, 0, (catalogData.tileCount || 0) * 32));
+    gfxCount = catalogData.gfxCount || 0;
+    tileArrangementTileCount = catalogData.tileCount || 0;
   }
 
   let chrRawData = null;
-  if (currentTileRawData && currentTileRawData.gfxData) {
+  if (currentMatchesActive && currentTileRawData && currentTileRawData.gfxData) {
     const gd = currentTileRawData.gfxData;
     const byteLen = (currentTileRawData.gfxCount || 0) * 32;
+    if (byteLen > 0 && gd.data && gd.data.length >= byteLen) {
+      chrRawData = Array.from(gd.data.slice(0, byteLen));
+    }
+  } else if (catalogData && catalogData.gfxData) {
+    const gd = catalogData.gfxData;
+    const byteLen = (catalogData.gfxCount || 0) * 32;
     if (byteLen > 0 && gd.data && gd.data.length >= byteLen) {
       chrRawData = Array.from(gd.data.slice(0, byteLen));
     }
   }
 
   let ppuConfig = existing.ppuConfig;
-  if (currentBgData && currentBgData.ppu) {
+  if (currentMatchesActive && currentBgData && currentBgData.ppu) {
     const ppu = currentBgData.ppu;
     ppuConfig = {
       bgMode: ppu.bgMode,
@@ -9717,7 +9816,7 @@ async function refreshContainerSetMetadata(containerName) {
   }
 
   let bg2TilemapData = existing.bg2TilemapData;
-  if (currentBgData && currentBgData.vram && currentBgData.ppu &&
+  if (currentMatchesActive && currentBgData && currentBgData.vram && currentBgData.ppu &&
       currentBgData.ppu.bg2 && currentBgData.ppu.bg2.enabled && ppuConfig) {
     const ppu = currentBgData.ppu;
     const vram = currentBgData.vram;
@@ -9732,7 +9831,7 @@ async function refreshContainerSetMetadata(containerName) {
   }
 
   let bg3TilemapData = existing.bg3TilemapData;
-  if (currentBgData && currentBgData.vram && currentBgData.ppu &&
+  if (currentMatchesActive && currentBgData && currentBgData.vram && currentBgData.ppu &&
       currentBgData.ppu.bg3 && currentBgData.ppu.bg3.enabled && ppuConfig) {
     const ppu = currentBgData.ppu;
     const vram = currentBgData.vram;
@@ -9747,7 +9846,7 @@ async function refreshContainerSetMetadata(containerName) {
   }
 
   // ShipDeck BG3 override: replace empty VRAM tilemap with virtual metatile expansion
-  if (currentStyle?.mapId === 3 && rom) {
+  if (currentMatchesActive && currentStyle?.mapId === 3 && rom) {
     const isEmpty = !bg3TilemapData || bg3TilemapData.every(b => b === 0);
     if (isEmpty) {
       const vt = expandShipDeckMetatilesToTilemap(rom);
@@ -9762,7 +9861,7 @@ async function refreshContainerSetMetadata(containerName) {
 
   // Wall tilemap refresh — uses ppuConfig.wallTilemapBase (word address of screen 2)
   let wallTilemapData = existing.wallTilemapData;
-  if (currentBgData && currentBgData.vram && ppuConfig && ppuConfig.wallTilemapBase) {
+  if (currentMatchesActive && currentBgData && currentBgData.vram && ppuConfig && ppuConfig.wallTilemapBase) {
     const vram = currentBgData.vram;
     const wallW = ppuConfig.wallTilesW || 64;
     const wallH = ppuConfig.wallTilesH || 32;
@@ -9780,7 +9879,7 @@ async function refreshContainerSetMetadata(containerName) {
 
   // BG1 tilemap refresh for SSB levels (cmFgSource='bg1')
   let bg1TilemapData = existing.bg1TilemapData;
-  if (currentBgData && currentBgData.vram && ppuConfig && ppuConfig.cmFgSource === 'bg1' &&
+  if (currentMatchesActive && currentBgData && currentBgData.vram && ppuConfig && ppuConfig.cmFgSource === 'bg1' &&
       ppuConfig.bg1TilemapBase !== undefined) {
     const vram = currentBgData.vram;
     const bg1W = ppuConfig.bg1TilesW || 32;
@@ -9795,21 +9894,28 @@ async function refreshContainerSetMetadata(containerName) {
     bg1TilemapData = catalogData.bg1TilemapData;
   }
 
+  // Ground truth first — see saveCurrentHDToContainer() for why this must take
+  // priority over any simulated VRAM (loadLevelBackground() is known to deviate
+  // from real runtime VRAM for some gfxsets).
   let vramSnapshot = null;
-  if (currentBgData && currentBgData.vram) {
+  const gtKeyRefresh = targetGfxIdx != null ? `gfxset_${targetGfxIdx.toString(16).toUpperCase().padStart(2, '0')}` : null;
+  if (gtKeyRefresh && typeof VRAM_GROUND_TRUTH !== 'undefined' && VRAM_GROUND_TRUTH[gtKeyRefresh]) {
+    vramSnapshot = _b64ToUint8Array(VRAM_GROUND_TRUTH[gtKeyRefresh]);
+    console.log(`[refresh] Using VRAM_GROUND_TRUTH for ${gtKeyRefresh} (authoritative real VRAM dump, not simulated)`);
+  } else if (currentMatchesActive && currentBgData && currentBgData.vram) {
     vramSnapshot = new Uint8Array(currentBgData.vram);
   } else if (catalogData && catalogData.vram) {
     vramSnapshot = new Uint8Array(catalogData.vram);
-    console.log('[refresh] Using catalogData.vram as vramSnapshot fallback');
+    console.log('[refresh] Using catalogData.vram as vramSnapshot (no ground truth available, simulation only)');
   }
 
   // Recompute tileChecksums (deprecated but kept for legacy fallback)
   let tileChecksums = existing.tileChecksums;
-  if (currentBgData && currentBgData.vram && ppuConfig) {
+  if (currentMatchesActive && currentBgData && currentBgData.vram && ppuConfig) {
     const vram = currentBgData.vram;
     const is4bpp = (ppuConfig.bgMode === 1);
     const wordsPerTile = is4bpp ? 16 : 8;
-    const gfxset = currentStyle?.graphics ?? 0;
+    const gfxset = targetGfxIdx ?? 0;
     tileChecksums = [];
     if (tileArrangementData && ppuConfig.terrainChrBase !== undefined) {
       const chrBase = ppuConfig.terrainChrBase;
@@ -9893,6 +9999,7 @@ async function refreshContainerSetMetadata(containerName) {
   });
 
   console.log(`[Refresh] Set "${setId}" in Container "${containerName}" aktualisiert. chrRawData: ${chrRawData ? chrRawData.length + ' bytes' : 'n/a'}, vramSnapshot: ${vramSnapshot ? vramSnapshot.length + ' bytes' : 'n/a'}`);
+  catalogData = originalCatalogDataForRefresh;
   return 1;
 }
 
