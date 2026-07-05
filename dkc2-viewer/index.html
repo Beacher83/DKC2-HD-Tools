@@ -6474,77 +6474,44 @@ async function exportCatalogAsZip() {
     let exported = 0;
     const totalItems = catalogData.bg1Tiles.length + allClusters.length + 2;
 
-    // === Step 3: Export Clusters with 1-tile padding ring ===
+    // === Step 3: Export Clusters (clean, no padding ring) ===
+    // Padding was tried (2026-07-03/04, "Tile Seam Elimination") to give the AI
+    // upscaler neighbor context at cluster edges via bestNeighbor() — the same
+    // statistical "most common neighbor across all occurrences" heuristic used for
+    // individual-tile padding below. For clusters this backfired more visibly and
+    // more often than for single tiles: spot-checking several clusters (not just an
+    // isolated case) showed the padding ring frequently mismatching the real content
+    // right at the cluster/padding boundary (e.g. a waving-flag cluster in Mainbrace
+    // Mayhem where two different-looking neighbor picks met mid-graphic). Since a
+    // wrong padding neighbor is exactly the kind of inconsistent edge context an AI
+    // upscaler is sensitive to, this risked making the real seam-at-the-boundary
+    // problem worse rather than better. Reverted to plain cluster export (matches
+    // the pre-2026-07-03 behavior); individual-tile padding (Step 4 below, older and
+    // not reported as problematic) is unaffected.
     btn.textContent = 'Exporting clusters...';
     await new Promise(r => setTimeout(r, 0));
 
-    // Helper: build a padded cluster canvas with 1-tile context ring.
-    // The ring gives the AI upscaler full neighbor context at cluster edges,
-    // eliminating smoothing artifacts that cause visible tile seams.
-    function buildPaddedClusterCanvas(ids, w, h, flips) {
-      const pw = w + 2, ph = h + 2;
-      const canvas = new OffscreenCanvas(pw * 32, ph * 32);
-      const ctx = canvas.getContext('2d');
-
-      // Draw actual cluster tiles offset by 1 tile
-      for (let dy = 0; dy < h; dy++) {
-        for (let dx = 0; dx < w; dx++) {
-          const idx = dy * w + dx;
-          drawTile(ctx, ids[idx], (dx + 1) * 32, (dy + 1) * 32, flips[idx]);
-        }
-      }
-
-      // Padding: top row
-      for (let dx = 0; dx < w; dx++) {
-        const padId = bestNeighbor(ids[dx], 'T');
-        drawTile(ctx, padId, (dx + 1) * 32, 0);
-      }
-      // Padding: bottom row
-      for (let dx = 0; dx < w; dx++) {
-        const padId = bestNeighbor(ids[(h - 1) * w + dx], 'B');
-        drawTile(ctx, padId, (dx + 1) * 32, (h + 1) * 32);
-      }
-      // Padding: left column
-      for (let dy = 0; dy < h; dy++) {
-        const padId = bestNeighbor(ids[dy * w], 'L');
-        drawTile(ctx, padId, 0, (dy + 1) * 32);
-      }
-      // Padding: right column
-      for (let dy = 0; dy < h; dy++) {
-        const padId = bestNeighbor(ids[dy * w + (w - 1)], 'R');
-        drawTile(ctx, padId, (w + 1) * 32, (dy + 1) * 32);
-      }
-
-      // Corners (transitive via bestNeighbor chains)
-      const tlTop = bestNeighbor(ids[0], 'T');
-      drawTile(ctx, tlTop >= 0 ? bestNeighbor(tlTop, 'L') : -1, 0, 0);
-      const trTop = bestNeighbor(ids[w - 1], 'T');
-      drawTile(ctx, trTop >= 0 ? bestNeighbor(trTop, 'R') : -1, (w + 1) * 32, 0);
-      const blBot = bestNeighbor(ids[(h - 1) * w], 'B');
-      drawTile(ctx, blBot >= 0 ? bestNeighbor(blBot, 'L') : -1, 0, (h + 1) * 32);
-      const brBot = bestNeighbor(ids[(h - 1) * w + (w - 1)], 'B');
-      drawTile(ctx, brBot >= 0 ? bestNeighbor(brBot, 'R') : -1, (w + 1) * 32, (h + 1) * 32);
-
-      return canvas;
-    }
-
-    // Export auto-detected clusters (with 1-tile padding ring for AI context)
+    // Export auto-detected clusters (clean only, no padding — cluster itself provides context)
     if (!expClusters) { /* skip clusters */ } else
     for (let ci = 0; ci < (catalogData.clusters || []).length; ci++) {
       const cluster = catalogData.clusters[ci];
       const clFlips = cluster.flips || cluster.ids.map(() => 0);
       const filename = `cluster_${ci}_${cluster.w}x${cluster.h}.png`;
 
-      const paddedCanvas = buildPaddedClusterCanvas(cluster.ids, cluster.w, cluster.h, clFlips);
-      clustersFolder.file(filename, await canvasToBlob(paddedCanvas));
+      const cleanCanvas = new OffscreenCanvas(cluster.widthPx, cluster.heightPx);
+      const cCtx = cleanCanvas.getContext('2d');
+      for (let dy = 0; dy < cluster.h; dy++) {
+        for (let dx = 0; dx < cluster.w; dx++) {
+          const idx = dy * cluster.w + dx;
+          drawTile(cCtx, cluster.ids[idx], dx * 32, dy * 32, clFlips[idx]);
+        }
+      }
+      clustersFolder.file(filename, await canvasToBlob(cleanCanvas));
 
       manifest.clusters.push({
         file: `clusters/${filename}`,
         w: cluster.w, h: cluster.h,
         widthPx: cluster.widthPx, heightPx: cluster.heightPx,
-        paddingTiles: 1,
-        paddedWidthPx: (cluster.w + 2) * 32,
-        paddedHeightPx: (cluster.h + 2) * 32,
         ids: cluster.ids,
         flips: clFlips,
         uniqueTiles: cluster.uniqueTiles,
@@ -6560,23 +6527,27 @@ async function exportCatalogAsZip() {
       }
     }
 
-    // Export manual clusters (with 1-tile padding ring)
+    // Export manual clusters (clean only, same as auto)
     if (!expClusters) { /* skip */ } else
     for (let mi = 0; mi < manualClusters.length; mi++) {
       const mc = manualClusters[mi];
       const mcFlips = mc.flips || mc.ids.map(() => 0);
       const filename = `manual_${mi}_${mc.w}x${mc.h}.png`;
 
-      const paddedCanvas = buildPaddedClusterCanvas(mc.ids, mc.w, mc.h, mcFlips);
-      clustersFolder.file(filename, await canvasToBlob(paddedCanvas));
+      const cleanCanvas = new OffscreenCanvas(mc.w * 32, mc.h * 32);
+      const cCtx = cleanCanvas.getContext('2d');
+      for (let dy = 0; dy < mc.h; dy++) {
+        for (let dx = 0; dx < mc.w; dx++) {
+          const idx = dy * mc.w + dx;
+          drawTile(cCtx, mc.ids[idx], dx * 32, dy * 32, mcFlips[idx]);
+        }
+      }
+      clustersFolder.file(filename, await canvasToBlob(cleanCanvas));
 
       manifest.manualClusters.push({
         file: `clusters/${filename}`,
         w: mc.w, h: mc.h,
         widthPx: mc.w * 32, heightPx: mc.h * 32,
-        paddingTiles: 1,
-        paddedWidthPx: (mc.w + 2) * 32,
-        paddedHeightPx: (mc.h + 2) * 32,
         ids: mc.ids,
         flips: mcFlips,
         uniqueTiles: mc.uniqueTiles,

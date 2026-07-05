@@ -1,5 +1,34 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-05b] — Revert Cluster Padding (Export v4 → clean clusters)
+
+### Problem
+
+The 1-tile padding ring added to cluster exports (2026-07-03, "Tile Seam
+Elimination") was meant to give the AI upscaler neighbor context at cluster
+edges. Spot-checking several exported clusters (not an isolated case) showed the
+padding frequently mismatching the real content right at the cluster/padding
+boundary — e.g. a waving-flag cluster in Mainbrace Mayhem where the padding tile
+picked by `bestNeighbor()` visibly didn't continue the flag's pattern, producing
+a hard seam mid-graphic. Since a wrong padding neighbor is exactly the kind of
+inconsistent edge context an AI upscaler reacts to, this risked making the real
+seam-at-the-cluster-boundary problem worse instead of better.
+
+### Fix
+
+`exportCatalogAsZip()`'s cluster export (both auto-detected and manual clusters)
+reverted to plain, unpadded output — matches pre-2026-07-03 behavior.
+`buildPaddedClusterCanvas()` removed entirely (no remaining references).
+Individual-tile padding (a separate, older code path using the same
+`bestNeighbor()` helper, not reported as problematic) is untouched. Import-side
+(`importHDPack()`) already treated `paddingTiles` as optional/defaulting to 0, so
+no import changes were needed — clusters just come back through the "unpadded"
+branch again. Score-based tile selection is unaffected in principle; cluster-
+extracted tile candidates simply no longer get the padding bonus (correctly, since
+they're no longer padded).
+
+---
+
 ## [2026-07-05] — Container Save Regression Fix (Multi-GfxSet Import)
 
 ### Problem
