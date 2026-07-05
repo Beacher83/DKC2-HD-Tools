@@ -1,5 +1,130 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-05] — Container Save Regression Fix (Multi-GfxSet Import)
+
+### Problem
+
+Importing HD packs for several different gfxsets into the same container in one
+session (e.g. 6 sets: 07, 25, 03, 04, 20, 1D) silently corrupted the container:
+only 4 of 6 gfxsets ended up saved, a gfxset that displayed correct HD right after
+its own import reverted to native rendering once further gfxsets were imported, and
+some gfxsets (Rambi Rumble, Gusty Glade) ended up with zero HD tiles at all.
+
+### Root Cause
+
+`saveCurrentHDToContainer()` derived both the container key (`setId`) and the
+tile-filtering prefix from `currentStyle?.graphics`. That variable is only updated
+by `loadLevel()` when a full Level is (re)loaded — switching gfxsets via the
+Catalog view's gfxset dropdown only updates `selectedGfxSet`, leaving
+`currentStyle` frozen on whatever Level was last loaded (or `null`/`undefined` if
+none was loaded yet this session).
+
+Since `hdPack.tiles` intentionally accumulates across imports (to support
+importing tiles + BG2 as separate ZIPs for the *same* gfxset), every import after
+the first — for a *different* gfxset — got saved under the same stale
+`currentStyle.graphics`-derived key, silently overwriting the previous gfxset's
+container entry (including its BG2/BG3 images, which are unconditionally replaced
+per import) while its own newly-imported tiles were discarded by the (also stale)
+filter.
+
+### Fix
+
+- **`importHDPack()`**: `hdPack.gfxSetIndex` is now updated on *every* import (not
+  only the first) from the ZIP's own `manifest.gfxSetIndex` — always correct,
+  independent of any UI dropdown/Level state.
+- **`saveCurrentHDToContainer()`**: container key and tile filter now derive from
+  `hdPack.gfxSetIndex ?? selectedGfxSet ?? currentStyle?.graphics` instead of
+  `currentStyle?.graphics` alone.
+- **Memory**: after a successful save, that gfxset's tiles/BG2/BG3/wall/cmFg
+  bitmaps are `close()`d and removed from `hdPack` — they're durably in IndexedDB
+  now, no need to keep decoded bitmaps resident for the rest of the session
+  (relevant when importing many gfxsets back-to-back; uncompressed 4x tile sets
+  add up to hundreds of MB each).
+- **`ensureGfxSetHDLoaded(gfxIdx)`** (new): called from `loadLevel()` on every
+  level switch — if the level's gfxset isn't currently resident in `hdPack`
+  (because it was freed after saving), transparently reloads just that gfxset's
+  entry from the active container. No UI change needed — there's no "Laden"
+  button in the normal workflow; HD tiles keep appearing automatically when
+  picking a level from the dropdown, same as before.
+
+### Workflow after fix
+
+Import each gfxset's HD ZIP one after another into the same container — no need
+to reload a Level or touch the catalog dropdown carefully in between. Each import
+now always lands under its own correct `gfxset_XX` key. Existing containers built
+under the buggy code remain corrupted and should be rebuilt (delete + re-import
+all ZIPs, or re-import all ZIPs into the existing container to let the fix
+self-correct each entry) before re-exporting the Mesen HD Pack.
+
+### Follow-up fixes (same day) — introduced by the fix above
+
+User testing surfaced three further bugs, all in the new auto-load path itself:
+
+- **Stored `gfxSetIndex` metadata still stale**: `saveCurrentHDToContainer()` fixed
+  the container *key* and tile *filter* to use `activeGfxIdx`, but the persisted
+  `gfxSetIndex` field written to the IndexedDB entry was left as
+  `currentStyle?.graphics || null` — the very value just proven unreliable. Reload
+  paths (`ensureGfxSetHDLoaded`, `loadContainerToHDPack`) read this field to prefix
+  tile keys and stamp `bg2GfxSet`/`bg3GfxSet`, so a stale value here mistagged
+  everything on reload regardless of the key/filter fix. Now stores
+  `activeGfxIdx ?? null`.
+- **`ensureGfxSetHDLoaded()` residency check too narrow**: only checked whether
+  *any* tiles with the target gfxset's prefix existed in `hdPack.tiles`. Tiles are
+  safe to accumulate across gfxsets (prefixed, no collision), but `bg2`/`bg3`/
+  `wall`/`cmFg` are single image slots and `clusters` is a flat array with raw
+  (collision-prone) per-gfxset tile-ids — none of these are safe to merge across
+  gfxsets. Revisiting a level whose tiles were still resident (but whose bg2/bg3/
+  clusters had since been overwritten by a *different* gfxset visited in between)
+  kept the foreign background/clusters on screen. Fixed: residency check is now
+  `hdPack.gfxSetIndex === gfxIdx`, and bg2/bg3/wall/cmFg/clusters are always
+  swapped wholesale (closed + replaced) on a gfxset switch, never merged.
+  `saveCurrentHDToContainer()`'s memory-free step also now resets
+  `hdPack.gfxSetIndex` to `null` when it frees the active gfxset's data, so the
+  next visit to that same level correctly triggers a reload instead of trusting a
+  now-empty cache.
+- **Catalog view never called `ensureGfxSetHDLoaded()`**: only `loadLevel()`
+  (the Level dropdown) did. Switching gfxsets via the Catalog view's own gfxset
+  dropdown, its "Gfx Set" mode button, or opening Catalog view at all left
+  `hdPack` unrefreshed even though `renderCatalog()` gates BG2/BG3 HD on
+  `hdPack.bg2GfxSet/bg3GfxSet === catalogData.gfxSetIndex` — silently falling back
+  to native and dropping HD clusters. Hooked in at all three entry points
+  (`catModeLevel`, `catModeGfxSet`, `toggleCatalogView`).
+- **Pre-existing bug (not introduced today, but what made clusters seem permanently
+  broken during this testing round)**: `loadLevel()`'s "if catalog view is active,
+  rebuild" step unconditionally called `buildCatalog()` (the Per-Level builder,
+  which always returns `clusters: []`) on every level switch, regardless of whether
+  `catalogMode === 'gfxset'`. The mode buttons kept showing "Per Set" as active
+  while the actual catalog data silently reverted to Per-Level on every level
+  change — so clusters could never appear while browsing levels in Per-GfxSet mode.
+  Now branches on `catalogMode` like every other rebuild call site does.
+- **`loadContainerToHDPack()` (bulk "Load Container") left bg2/bg3/clusters
+  pointing at whichever set was iterated last**: it loops over every level set in
+  the container, and since bg2/bg3/clusters/gfxSetIndex are single-slot fields
+  (see above), each iteration overwrites the previous one — after the loop, they
+  reflect the container's last-iterated set, not whatever level happens to be on
+  screen (tiles are unaffected since they're gfxset-prefixed and correctly
+  accumulate, which is why BG1 always showed HD immediately while BG2/BG3
+  stayed native until a level switch happened to trigger `ensureGfxSetHDLoaded`).
+  Now calls `ensureGfxSetHDLoaded(currentStyle.graphics)` right after the bulk
+  load to sync bg2/bg3/clusters to the on-screen level immediately.
+- **`exportCatalogAsZip()` silently exported empty clusters depending on which
+  catalog sub-mode happened to be active**: the function reads the ambient
+  `catalogData` global directly. Per-Level mode's `buildCatalog()` always returns
+  `clusters: []`; if `catalogMode` was `'level'` at the moment "Export ZIP" was
+  clicked — e.g. right after a fresh page/ROM reload, since `catalogMode` is a
+  plain JS variable that always starts at `'level'` and only changes via an
+  explicit mode-button click — the exported ZIP silently had zero clusters, named
+  `gfxset_XX` regardless (both modes populate `gfxSetIndex` from the loaded
+  level), with `manifest.mode: "level"` the only tell. Confirmed via a real
+  export where clusters were visible natively in Per-GfxSet mode moments before
+  export, yet missing from the resulting ZIP. Fix: `exportCatalogAsZip()` now
+  always builds gfxset-scoped catalog data internally for the export (via
+  `buildCatalogByGfxSet`) regardless of the currently displayed catalog mode,
+  and restores the original `catalogData` in a `finally` block afterward so the
+  visible view is unaffected. `exportAsTexturePack()` (the Mesen HD Pack export)
+  was already unaffected — it reads directly from the IndexedDB container, not
+  the live `catalogData`.
+
 ## [2026-07-03b] — Tile Seam Elimination (3 Interconnected Improvements)
 
 ### Problem

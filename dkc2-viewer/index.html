@@ -5456,6 +5456,10 @@ function loadLevel(levelId) {
       const gfxSel = document.getElementById('catGfxSet');
       if (gfxSel) gfxSel.value = style.graphics;
     }
+    // Auto-load this level's gfxset HD tiles if they were freed from memory after an
+    // earlier container save (see saveCurrentHDToContainer). Fire-and-forget: it does
+    // its own redraw() once the data arrives, no need to block level loading on it.
+    ensureGfxSetHDLoaded(style.graphics);
     currentTileRawData = { tileArrangement, gfxData, gfxCount, tileCount, terrainChrBase };
     currentTileParts = tilePartsImg;
     console.timeEnd('  tileParts');
@@ -5518,9 +5522,14 @@ function loadLevel(levelId) {
     
     statusText.textContent = `Level 0x${levelId.toString(16).toUpperCase().padStart(2, '0')}: ${name} | ${tileMap.mapWidth}x${tileMap.mapHeight}px | ${tileCount} tile parts | ${prop.sprites.length} sprites`;
     
-    // If catalog view is active, rebuild and show catalog
+    // If catalog view is active, rebuild and show catalog — respecting whichever
+    // catalog sub-mode is active. Previously this always called buildCatalog() (Per
+    // Level), even while catalogMode === 'gfxset', silently reverting Per-GfxSet
+    // catalog data (and its clusters — buildCatalog() always returns clusters: [])
+    // back to Per-Level on every level switch, though the mode buttons kept showing
+    // "Per Set" as active.
     if (catalogView) {
-      catalogData = buildCatalog();
+      catalogData = (catalogMode === 'gfxset') ? buildCatalogByGfxSet(selectedGfxSet) : buildCatalog();
       if (catalogData) renderCatalog();
     }
     
@@ -6326,6 +6335,26 @@ async function exportCatalogAsZip() {
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded. Check internet connection.'); return; }
   if (!currentTileParts) { alert('No tile parts loaded. Load a level first.'); return; }
 
+  // The HD pipeline (clusters, container save, Mesen export) is fundamentally
+  // gfxset-scoped, but this function reads the ambient `catalogData` global — which
+  // silently reflects whichever catalog sub-mode happens to be active (Per Level vs
+  // Per GfxSet). Per-Level's buildCatalog() always returns clusters: [], so an export
+  // clicked while in Per-Level mode silently produced a "gfxset_XX"-named ZIP with zero
+  // clusters, even if clusters were visible moments earlier in Per-GfxSet mode (2026-07,
+  // reported after the catalogMode/loadLevel fix still left this export-time footgun).
+  // Fix: always build (and export from) gfxset-scoped catalog data here regardless of
+  // the currently displayed mode, then restore the original catalogData so the user's
+  // visible view is unaffected.
+  const originalCatalogData = catalogData;
+  const exportGfxIdx = currentStyle?.graphics ?? selectedGfxSet;
+  if (catalogMode !== 'gfxset' && exportGfxIdx != null && graphicsSetsMap?.has(exportGfxIdx)) {
+    const gfxCatalogData = buildCatalogByGfxSet(exportGfxIdx);
+    if (gfxCatalogData) {
+      catalogData = gfxCatalogData;
+      console.log(`[Export] Building gfxset-scoped catalog data for export (was in '${catalogMode}' mode) — gfxset 0x${exportGfxIdx.toString(16)}`);
+    }
+  }
+
   const btn = document.getElementById('catExportBtn');
   const origText = btn.textContent;
   btn.disabled = true;
@@ -6688,6 +6717,10 @@ async function exportCatalogAsZip() {
     btn.disabled = false;
     setTimeout(() => { btn.textContent = origText; }, 2000);
     alert('Export failed: ' + err.message);
+  } finally {
+    // Restore whatever catalogData the user was actually looking at — the gfxset-scoped
+    // rebuild above (if any) was only for this export, not a mode switch.
+    catalogData = originalCatalogData;
   }
 }
 
@@ -7283,6 +7316,13 @@ async function importHDPack(file) {
         sprites: new Map(),
       };
     }
+    // Track which gfxset this import belongs to — updated on EVERY import, not just
+    // the first. Regression (2026-07): when hdPack.gfxSetIndex was only set once,
+    // saveCurrentHDToContainer() (via currentStyle, an even staler signal) ended up
+    // saving later imports under an earlier gfxset's container key, silently
+    // overwriting it. The manifest's own gfxSetIndex is always correct regardless of
+    // UI dropdown/level state, so it's the source of truth here.
+    if (manifest.gfxSetIndex !== undefined) hdPack.gfxSetIndex = manifest.gfxSetIndex;
 
     // Merge tiles (new entries added; existing entries overwritten by newer import)
     let newTiles = 0, updatedTiles = 0;
@@ -7486,9 +7526,20 @@ async function bitmapToBlob(bmp) {
 async function saveCurrentHDToContainer(containerName) {
   if (!hdPack || hdPack.tiles.size === 0) return 0;
 
+  // Determine which gfxset this save belongs to. Prefer hdPack.gfxSetIndex — set from
+  // the just-imported ZIP's own manifest (see importHDPack), always correct regardless
+  // of UI state — over selectedGfxSet/currentStyle, which only update when the catalog
+  // gfxset dropdown changes or a full Level is (re)loaded.
+  // Regression (2026-07): this used to read currentStyle?.graphics only, which stays
+  // frozen on whichever Level was loaded last. Importing several different gfxsets in
+  // one session (switching only the catalog dropdown, no Level reload in between) made
+  // every import after the first save under the SAME stale key, silently overwriting
+  // earlier gfxsets' container entries (wrong BG2/BG3, missing tiles for later sets).
+  const activeGfxIdx = hdPack.gfxSetIndex ?? selectedGfxSet ?? currentStyle?.graphics;
+
   // Determine setId from current context
   const setId = catalogView
-    ? `gfxset_${(currentStyle?.graphics || 0).toString(16).toUpperCase().padStart(2, '0')}`
+    ? `gfxset_${(activeGfxIdx || 0).toString(16).toUpperCase().padStart(2, '0')}`
     : `level_${currentLevelId || 0}`;
 
   // Convert tiles to storable format — filter to current gfxset only.
@@ -7497,7 +7548,7 @@ async function saveCurrentHDToContainer(containerName) {
   // otherwise re-saving pollutes this set's entry with foreign tiles, causing
   // the export to produce PNGs with wrong pixel content (Bug: Level 2 showed
   // Level 1 graphics because gfxset_7 tiles overwrote gfxset_37's exports).
-  const currentGfxIdx = currentStyle?.graphics;
+  const currentGfxIdx = activeGfxIdx;
   const tiles = [];
   let skippedForeignTiles = 0;
   for (const [id, bmp] of hdPack.tiles) {
@@ -7796,9 +7847,42 @@ async function saveCurrentHDToContainer(containerName) {
     tileChecksums,
     chrRawData,        // BG1 CHR bytes for content-hash (new)
     vramSnapshot,      // Full VRAM for BG2 content-hash (new)
-    gfxSetIndex: currentStyle?.graphics || null,
+    // Must match the setId/tile-filter source above (activeGfxIdx), not currentStyle
+    // directly — this is the tag ensureGfxSetHDLoaded()/loadContainerToHDPack() use to
+    // prefix reloaded tile keys and stamp bg2GfxSet/bg3GfxSet. A mismatch here was the
+    // second half of the 2026-07 regression: the container entry landed under the
+    // right key but carried a stale gfxSetIndex tag, so tiles/BG2/BG3 came back
+    // mistagged (or matching some other level's gfxset) on reload.
+    gfxSetIndex: activeGfxIdx ?? null,
     savedAt: Date.now()
   });
+
+  // Free this gfxset's tiles/images from the in-session hdPack now that they're
+  // durably persisted in IndexedDB. Without this, hdPack accumulates every imported
+  // gfxset's decoded bitmaps for the whole session (uncompressed — a single 4x-scaled
+  // padded tile set can be a few hundred MB), which adds up fast when importing many
+  // gfxsets back-to-back (e.g. 6 sets in one sitting). Viewing a gfxset again later
+  // (e.g. selecting a level that uses it) auto-reloads just that entry on demand — see
+  // ensureGfxSetHDLoaded().
+  if (activeGfxIdx !== undefined && activeGfxIdx !== null) {
+    const freedPrefix = `${activeGfxIdx}_`;
+    for (const [id, bmp] of hdPack.tiles) {
+      if (String(id).startsWith(freedPrefix)) {
+        bmp.close();
+        hdPack.tiles.delete(id);
+      }
+    }
+    if (hdPack.bg2GfxSet === activeGfxIdx) { hdPack.bg2?.close(); hdPack.bg2 = null; hdPack.bg2GfxSet = null; }
+    if (hdPack.bg3GfxSet === activeGfxIdx) { hdPack.bg3?.close(); hdPack.bg3 = null; hdPack.bg3GfxSet = null; }
+    if (hdPack.wallGfxSet === activeGfxIdx) { hdPack.wall?.close(); hdPack.wall = null; hdPack.wallGfxSet = null; }
+    if (hdPack.cmFgGfxSet === activeGfxIdx) { hdPack.cmFg?.close(); hdPack.cmFg = null; hdPack.cmFgGfxSet = null; }
+    // Must also clear hdPack.gfxSetIndex — ensureGfxSetHDLoaded() uses it as its
+    // "already active, nothing to do" check. Leaving it pointed at the just-freed
+    // gfxset would make that check pass while tiles/bg2/bg3 are actually empty,
+    // showing no HD at all if this same level is viewed again before something else
+    // changes hdPack.gfxSetIndex.
+    if (hdPack.gfxSetIndex === activeGfxIdx) hdPack.gfxSetIndex = null;
+  }
 
   return tiles.length;
 }
@@ -7938,6 +8022,84 @@ async function loadContainerToHDPack(containerName) {
   if (catalogView) renderCatalog();
   if (spriteGalleryData) renderSpriteGallery();
   console.log(`Container "${containerName}" loaded: ${totalTiles} tiles, ${levelSets.length} level sets, ${hdPack.sprites.size} sprites (${totalSpriteFrames} frames)`);
+
+  // The loop above overwrites hdPack.bg2/bg3/clusters/gfxSetIndex once per level set —
+  // after it finishes, those single-slot fields hold whichever set was iterated LAST,
+  // which has nothing to do with whichever level happens to be on screen right now
+  // (e.g. Pirate Panic loaded, but the container's last entry was some other gfxset).
+  // Tiles are fine (gfxset-prefixed, all accumulated correctly) — that's why BG1 shows
+  // HD immediately while BG2/BG3/clusters stay native until a level switch happens to
+  // trigger ensureGfxSetHDLoaded(). Do that sync immediately instead of waiting for it.
+  if (currentStyle?.graphics != null) ensureGfxSetHDLoaded(currentStyle.graphics);
+}
+
+// --- Auto-load a single gfxset's HD data on demand ---
+// Companion to the memory-freeing step in saveCurrentHDToContainer(): once a gfxset's
+// tiles are saved to the container, they're closed and removed from hdPack to keep
+// memory bounded across a session that imports many gfxsets. This restores them
+// transparently — called from loadLevel() whenever the selected level's gfxset isn't
+// currently resident in hdPack, so HD tiles keep appearing automatically from the
+// level dropdown with no extra "Laden" step (there is no such button in normal use).
+// Scoped to one gfxset (unlike loadContainerToHDPack(), which reloads everything) —
+// cheap enough to call on every level switch.
+async function ensureGfxSetHDLoaded(gfxIdx) {
+  if (gfxIdx == null || !activeContainerName) return;
+  // hdPack.gfxSetIndex tracks which gfxset's bg2/bg3/wall/cmFg/clusters are currently
+  // active. Unlike hdPack.tiles (safe to accumulate across gfxsets — every key is
+  // gfxset-prefixed, so lookups can't collide), these are NOT gfxset-scoped: bg2/bg3
+  // are single image slots, and cluster tile-ids are raw per-gfxset partIds that can
+  // collide between unrelated gfxsets. A gfxset switch must swap these wholesale,
+  // never merge them.
+  // Checking only "are this gfxset's tiles already resident" (as before) missed the
+  // case where those tiles were still resident from an earlier visit while bg2/bg3/
+  // clusters had since been overwritten by a *different* gfxset in between — causing
+  // a revisited level to show a stale/foreign background or lose its HD clusters
+  // (2026-07 regression).
+  if (hdPack && hdPack.gfxSetIndex === gfxIdx) return; // this gfxset is already active
+
+  const setId = `gfxset_${gfxIdx.toString(16).toUpperCase().padStart(2, '0')}`;
+  const sets = await hdGetContainerSets(activeContainerName);
+  const set = sets.find(s => s.type === 'level' && s.setId === setId);
+  if (!set) return; // nothing saved for this gfxset yet
+
+  if (!hdPack) hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, cmFg: null, gfxSetIndex: null, sprites: new Map() };
+  if (set.scaleFactor) hdPack.scaleFactor = set.scaleFactor;
+  hdPack.gfxSetIndex = set.gfxSetIndex;
+
+  // Swap bg2/bg3/wall/cmFg/clusters wholesale — see comment above on why these can't
+  // be merged across gfxsets like tiles can.
+  hdPack.bg2?.close(); hdPack.bg2 = null; hdPack.bg2GfxSet = null;
+  hdPack.bg3?.close(); hdPack.bg3 = null; hdPack.bg3GfxSet = null;
+  hdPack.wall?.close(); hdPack.wall = null; hdPack.wallGfxSet = null;
+  hdPack.cmFg?.close(); hdPack.cmFg = null; hdPack.cmFgGfxSet = null;
+  for (const cl of hdPack.clusters) cl.image?.close?.();
+  hdPack.clusters = [];
+
+  let loadedTiles = 0;
+  for (const t of (set.tiles || [])) {
+    const key = (set.gfxSetIndex !== undefined && !String(t.id).includes('_')) ? `${set.gfxSetIndex}_${t.id}` : t.id;
+    hdPack.tiles.set(key, await createImageBitmap(t.blob));
+    loadedTiles++;
+  }
+  if (set.bg2Blob) { hdPack.bg2 = await createImageBitmap(set.bg2Blob); hdPack.bg2GfxSet = set.gfxSetIndex; }
+  if (set.bg3Blob) { hdPack.bg3 = await createImageBitmap(set.bg3Blob); hdPack.bg3GfxSet = set.gfxSetIndex; }
+  if (set.wallBlob) { hdPack.wall = await createImageBitmap(set.wallBlob); hdPack.wallGfxSet = set.gfxSetIndex; }
+  if (set.cmFgBlob) {
+    hdPack.cmFg = await createImageBitmap(set.cmFgBlob);
+    hdPack.cmFgGfxSet = set.gfxSetIndex;
+    hdPack.cmFgSource = set.ppuConfig?.cmFgSource || 'bg1';
+    hdPack.cmFgAlpha = set.ppuConfig?.cmFgAlpha || 0.35;
+    hdPack.cmFgSubtract = !!set.ppuConfig?.cmFgSubtract;
+  }
+  for (const c of (set.clusters || [])) {
+    hdPack.clusters.push({ ids: c.ids, flips: c.flips || [], w: c.w, h: c.h, image: await createImageBitmap(c.blob) });
+  }
+
+  hdEnabled = true;
+  updateHDToggleUI();
+  redraw();
+  if (catalogView) renderCatalog();
+  console.log(`[HD auto-load] gfxset 0x${gfxIdx.toString(16)}: ${loadedTiles} tiles loaded on demand from "${activeContainerName}"`);
 }
 
 // --- Export container as ZIP ---
@@ -11576,6 +11738,11 @@ function toggleCatalogView(show) {
       if (needsRebuild) {
         catalogData = buildCatalogByGfxSet(selectedGfxSet);
       }
+      // Catalog rendering gates BG2/BG3 HD on hdPack.bg2GfxSet/bg3GfxSet matching
+      // catalogData.gfxSetIndex (see renderCatalog()) — without this, switching into
+      // Catalog view for a gfxset other than whatever hdPack currently holds silently
+      // falls back to native BG2/BG3 and drops HD clusters (2026-07 regression).
+      ensureGfxSetHDLoaded(selectedGfxSet);
     } else {
       if (!catalogData) {
         catalogData = buildCatalog();
@@ -11683,6 +11850,9 @@ document.getElementById('catModeLevel').addEventListener('click', () => {
   document.getElementById('catGfxSetWrap').style.display = 'none';
   catalogData = buildCatalog();
   if (catalogData) renderCatalog();
+  // buildCatalog() tags catalogData.gfxSetIndex from currentStyle.graphics (the
+  // currently loaded level) — same HD-gating requirement as gfxset mode below.
+  ensureGfxSetHDLoaded(currentStyle?.graphics);
 });
 document.getElementById('catModeGfxSet').addEventListener('click', () => {
   catalogMode = 'gfxset';
@@ -11696,11 +11866,13 @@ document.getElementById('catModeGfxSet').addEventListener('click', () => {
   }
   catalogData = buildCatalogByGfxSet(selectedGfxSet);
   if (catalogData) renderCatalog();
+  ensureGfxSetHDLoaded(selectedGfxSet);
 });
 document.getElementById('catGfxSet').addEventListener('change', (e) => {
   selectedGfxSet = parseInt(e.target.value);
   catalogData = buildCatalogByGfxSet(selectedGfxSet);
   if (catalogData) renderCatalog();
+  ensureGfxSetHDLoaded(selectedGfxSet);
 });
 
 // Catalog filter buttons
