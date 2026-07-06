@@ -8929,10 +8929,13 @@ async function exportAsTexturePack(containerName) {
       : (catalogData && catalogData.bg1TilemapData ? catalogData.bg1TilemapData : null);
     if (!tilemapRaw || !ppuCfg) continue;
 
-    // Export to bg/bg1/ — runtime layer 0 (BG1 renders honey at chrBase=$5000)
+    // Export to cmFg/ folder — separate from bg/bg1/ so user can easily
+    // delete overlay tiles for testing.  Mesen's loader does NOT scan cmFg/,
+    // so these tiles are excluded from runtime matching by default.
+    // Future: add cmFg/ folder scanning in C++ to support HD honey overlays.
     const cmFgGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const cmFgGfxIdStr = String(cmFgGfxIdx).padStart(2, '0');
-    const cmFgFolder = root.folder(`bg/bg1/gfxset_${cmFgGfxIdStr}`);
+    const cmFgFolder = root.folder(`cmFg/gfxset_${cmFgGfxIdStr}`);
     const cmFgExportedKeys = new Set();
 
     const chrBase  = ppuCfg.bg1ChrBase || 0;

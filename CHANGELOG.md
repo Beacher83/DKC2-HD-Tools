@@ -1,5 +1,29 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-06c] — Issue O: cmFg Export-Ordner Separation
+
+### Änderung
+
+cmFg (Honig-Overlay) PNG-Export-Ordner geändert:
+- **Vorher:** `bg/bg1/gfxset_XX` — Honig-Tiles landeten im BG1-Ordner,
+  wurden vom Mesen Loader als reguläre BG1-Tiles geladen und deckten den
+  BG2-Terrain komplett ab (kein HD-Terrain sichtbar)
+- **Nachher:** `cmFg/gfxset_XX` — separater Ordner, wird vom Mesen Loader
+  NICHT gescannt (by design). Die cmFg-Tiles werden nicht als HD-Tiles geladen,
+  so dass der BG1 Overlay-Blend Pfad im C++ Code den BG2-Terrain darunter
+  nachschlagen und mit Honig-Tint rendern kann.
+
+### Betroffene Datei
+- `dkc2-viewer/index.html` (Zeile ~8935): Ordnerpfad-Änderung
+
+### Hinweis
+Die cmFg-Hashes in `hashes.bin` bleiben als harmlose Orphans bestehen.
+Der Mesen Loader findet keine PNGs dafür und ignoriert sie. Zukünftig
+könnte der Loader den `cmFg/`-Ordner scannen, um die Overlay-Tiles als
+eigene Kategorie zu laden.
+
+---
+
 ## [2026-07-06b] — Issue O: Revert wrong layer change, keep palette fix
 
 ### Problem with previous fix (2026-07-06)
