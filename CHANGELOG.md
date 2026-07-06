@@ -1,5 +1,71 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-06] — Issue O: Rambi Rumble 0% Match (Layer + Palette Fix for SSB cmFg Export)
+
+### Problem
+
+Rambi Rumble (gfxset 0x04) HD tiles were visually present in the exported Mesen
+HD pack but produced **0% match rate** at runtime.  Diagnostic log showed two
+distinct mismatch categories for every cmFg (honey overlay) tile:
+
+- `PAL MISMATCH`: `runtime_pal=6 pack_pal=2`
+- `LAYER MISMATCH`: `runtime_layer=1 pack_layer=0`
+
+### Root Cause 1: Layer Mismatch
+
+The viewer's ROM simulation models the honey overlay as BG1 (layer=0), because
+the ppuConfig table stores `$210B = $25` → BG1 chrBase=$5000 (honey).  At
+**runtime**, DKC2 reprograms $210B to `$52`, swapping chrBases:
+
+| Layer | ROM ($210B=$25) | Runtime ($210B=$52) |
+|-------|-----------------|---------------------|
+| BG1 (layer=0) | chrBase=$5000 (honey) | chrBase=$2000 (terrain) |
+| BG2 (layer=1) | chrBase=$2000 (terrain) | chrBase=$5000 (honey) |
+
+So the honey tiles are rendered by **BG2 (layer=1)** at runtime, not BG1.  The
+cmFg export wrote `layer: 0` in hashes.bin and placed PNGs in `bg/bg1/`, causing
+a layer mismatch on every tile.
+
+### Root Cause 2: Palette Mismatch
+
+The cmFg export extracted palette values from the BG1 tilemap (DMA-loaded from
+ROM).  Due to the chrBase swap, the **BG2 tilemap** at `bg2TilemapBase` in VRAM
+is what the runtime PPU actually uses — and it carries palette=6 for all honey
+tiles (confirmed: VRAM $6C00 = 1024 entries, all pal=6).  The BG1 tilemap had
+stale palette=2 values, producing a palette mismatch on every tile.
+
+### Fix
+
+**Layer** (2 locations):
+- Hash export: `layer: 0` → `layer: 1`, dedup key `_0_` → `_1_`
+- PNG export: folder `bg/bg1/gfxset_XX` → `bg/bg2/gfxset_XX`
+
+**Palette** (2 locations):
+- Added `bg2TilemapBase` to stored ppuConfig object
+- cmFg PNG export: extracts BG2 tilemap from ground truth VRAM at
+  `bg2TilemapBase`, overrides per-tile palette from BG1 tilemap entries with
+  correct BG2 runtime palette.  Includes diagnostic palette histogram logging.
+
+### Scope
+
+The fix is generic for all SSB (Sub-Screen-Blend) levels — any level where the
+runtime chrBase swap applies will benefit.  35 SSB levels across 6 ppuConfig
+values (0x03, 0x24, 0x29, 0x2C, 0x31, 0x35) are covered.
+
+### Known Limitation (Root Cause 3 — not addressed)
+
+~18 terrain tiles (BG1 at $2000) are updated by VBlank DMA within 2 frames of
+level load, changing their content hash.  The ground truth captures one animation
+frame; runtime may differ.  This affects a small subset of terrain tiles, not the
+honey overlay.  Low priority.
+
+### Testing Required
+
+Container must be re-exported after this fix.  Workflow: open viewer → load
+container → "Export HD Pack" → test in Mesen with Rambi Rumble.
+
+---
+
 ## [2026-07-05d] — Ground Truth VRAM Must Be Authoritative, Not a Gap-Filler; Fallback Data Must Not Depend on UI Navigation
 
 ### Problem with the 2026-07-05c fix

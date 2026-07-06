@@ -7680,6 +7680,7 @@ async function saveCurrentHDToContainer(containerName) {
       bg1TilesW: ppu.bg1 ? (ppu.bg1.wide ? 64 : 32) : 32,
       bg1TilesH: ppu.bg1 ? (ppu.bg1.tall ? 64 : 32) : 32,
       bg1TilemapBase: ppu.bg1 ? ppu.bg1.tilemapBase : 0,
+      bg2TilemapBase: ppu.bg2 ? ppu.bg2.tilemapBase : 0,
       // Color Math Foreground metadata
       cmFgSource: cmFgSource,    // 'bg1' (SSB) or 'bg3' (standard) or null
       cmFgAlpha: cmFgAlpha,      // compositing alpha (e.g. 0.35)
@@ -8905,9 +8906,10 @@ async function exportAsTexturePack(containerName) {
   }
 
   // ---- Color Math Foreground (SSB) tile export ----
-  // SSB (Sub-Screen-Blend) levels have a BG1 foreground overlay (e.g., honey in Rambi Rumble).
-  // These tiles live at bg1ChrBase (NOT terrainChrBase) and use layer 0.
-  // VRAM addresses never collide with terrain tiles since bg1ChrBase ≠ terrainChrBase in SSB.
+  // SSB (Sub-Screen-Blend) levels have a foreground overlay (e.g., honey in Rambi Rumble).
+  // At runtime, DKC2 swaps chrBases ($210B), so these tiles are rendered by BG2 (layer 1)
+  // from bg1ChrBase, NOT by BG1 as the viewer's simulation models it.
+  // Exported to bg/bg2/ so Mesen assigns layer=1 for correct runtime matching.
   let cmFgExportedTiles = 0;
 
   const setsWithCmFg = levelSets.filter(s => {
@@ -8927,10 +8929,10 @@ async function exportAsTexturePack(containerName) {
       : (catalogData && catalogData.bg1TilemapData ? catalogData.bg1TilemapData : null);
     if (!tilemapRaw || !ppuCfg) continue;
 
-    // Same folder as terrain tiles — same layer (0), but different chrBase = no collision
+    // Export to bg/bg2/ — runtime layer 1 (BG2 after chrBase swap)
     const cmFgGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const cmFgGfxIdStr = String(cmFgGfxIdx).padStart(2, '0');
-    const cmFgFolder = root.folder(`bg/bg1/gfxset_${cmFgGfxIdStr}`);
+    const cmFgFolder = root.folder(`bg/bg2/gfxset_${cmFgGfxIdStr}`);
     const cmFgExportedKeys = new Set();
 
     const chrBase  = ppuCfg.bg1ChrBase || 0;
@@ -8938,6 +8940,32 @@ async function exportAsTexturePack(containerName) {
     const wordsPerTile = is4bpp ? 16 : 8;
     const tilesW   = ppuCfg.bg1TilesW || 32;
     const tilesH   = ppuCfg.bg1TilesH || 32;
+
+    // SSB runtime palette fix: extract BG2 tilemap from ground truth VRAM.
+    // At runtime, DKC2 swaps chrBases ($210B), so the overlay is rendered by BG2.
+    // The BG2 tilemap at bg2TilemapBase has the correct palette (e.g. pal=6 for
+    // Rambi Rumble), while the DMA-loaded BG1 tilemap has a stale palette (pal=2).
+    let cmFgRuntimeTm = null;
+    if (set.vramSnapshot && ppuCfg.bg2TilemapBase != null) {
+      const gtVram = set.vramSnapshot instanceof Uint8Array
+        ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+      const bg2TmByte = (ppuCfg.bg2TilemapBase || 0) * 2;
+      const bg2TmLen = (ppuCfg.bg2TilesW || 32) * (ppuCfg.bg2TilesH || 32) * 2;
+      if (bg2TmByte >= 0 && bg2TmByte + bg2TmLen <= gtVram.length) {
+        cmFgRuntimeTm = [];
+        for (let i = 0; i < bg2TmLen; i += 2) {
+          cmFgRuntimeTm.push(gtVram[bg2TmByte + i] | (gtVram[bg2TmByte + i + 1] << 8));
+        }
+        // Log palette distribution for verification
+        const palHist = {};
+        for (const w of cmFgRuntimeTm) {
+          if ((w & 0x3FF) === 0) continue;
+          const p = (w >> 10) & 7;
+          palHist[p] = (palHist[p] || 0) + 1;
+        }
+        console.log(`[cmFg] Runtime BG2 tilemap: ${cmFgRuntimeTm.length} entries at $${ppuCfg.bg2TilemapBase.toString(16)}, palettes:`, palHist);
+      }
+    }
 
     // Load composed cmFg image
     const cmFgBitmap = await createImageBitmap(set.cmFgBlob);
@@ -8954,7 +8982,19 @@ async function exportAsTexturePack(containerName) {
         if (entry === undefined) continue;
         const tileNum = entry & 0x3FF;
         if (tileNum === 0) continue;  // skip empty tilemap entries
-        const palRow  = (entry >> 10) & 7;
+        // Use runtime BG2 palette when available (SSB chrBase swap fix).
+        // The DMA-loaded BG1 tilemap has stale palettes; the ground truth BG2
+        // tilemap at bg2TilemapBase has the correct runtime palette values.
+        let palRow = (entry >> 10) & 7;
+        if (cmFgRuntimeTm) {
+          const rtIdx = (tileY & 31) * 32 + (tileX & 31);
+          if (rtIdx < cmFgRuntimeTm.length) {
+            const rtEntry = cmFgRuntimeTm[rtIdx];
+            if ((rtEntry & 0x3FF) !== 0) {
+              palRow = (rtEntry >> 10) & 7;
+            }
+          }
+        }
         const flipH   = !!(entry & 0x4000);
         const flipV   = !!(entry & 0x8000);
 
@@ -9166,9 +9206,11 @@ async function exportAsTexturePack(containerName) {
         }
       }
 
-      // Color Math Foreground (SSB) hashes — BG1 overlay tiles at bg1ChrBase
-      // Only for SSB levels (cmFgSource='bg1'): uses bg1ChrBase, layer=0.
-      // VRAM addresses don't collide with terrain tiles (different chrBase).
+      // Color Math Foreground (SSB) hashes — overlay tiles at bg1ChrBase
+      // At runtime, DKC2 swaps chrBases ($210B), so these tiles are rendered by
+      // BG2 (layer=1).  Uses bg1ChrBase for VRAM addresses (same chrBase value
+      // at runtime after swap).  Dedup key uses _1_ to avoid collisions with
+      // BG2 terrain section (which uses bg2ChrBase — different address range).
       if (set.vramSnapshot && set.bg1TilemapData && set.bg1TilemapData.length > 1
           && ppuCfg.cmFgSource === 'bg1') {
         const vram = set.vramSnapshot instanceof Uint8Array
@@ -9181,18 +9223,19 @@ async function exportAsTexturePack(containerName) {
           const tileNum = entry & 0x3FF;
           if (tileNum === 0) continue;
           const vramWordAddr = (cmFgChrBase + tileNum * wordsPerTile) & 0x7FFF;
-          const dk = `${gfxset}_0_${vramWordAddr}`;
+          const dk = `${gfxset}_1_${vramWordAddr}`;
           if (dedupKey.has(dk)) continue;
           dedupKey.add(dk);
 
           const byteOff = vramWordAddr * 2;
           if (byteOff + bytesPerTile <= vram.length) {
             const hash = fnv1a_64(vram, byteOff, bytesPerTile);
-            hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
+            hashEntries.push({ vramAddr: vramWordAddr, layer: 1, gfxset, hash });
           }
         }
-        const cmFgHashCount = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 0).length;
-        console.log(`[hashes] gfxset ${gfxset}: BG1+cmFg → ${cmFgHashCount} total layer-0 hash entries`);
+        const cmFgHashCount = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 1
+          && e.vramAddr >= (ppuCfg.bg1ChrBase || 0)).length;
+        console.log(`[hashes] gfxset ${gfxset}: cmFg → ${cmFgHashCount} layer-1 hash entries (bg1ChrBase=$${(ppuCfg.bg1ChrBase||0).toString(16)})`);
       }
     }
 
