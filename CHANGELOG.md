@@ -1,6 +1,48 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
-## [2026-07-06] — Issue O: Rambi Rumble 0% Match (Layer + Palette Fix for SSB cmFg Export)
+## [2026-07-06b] — Issue O: Revert wrong layer change, keep palette fix
+
+### Problem with previous fix (2026-07-06)
+
+The previous commit (38d19a5) changed cmFg export from layer=0 to layer=1,
+based on the assumption that DKC2's $210B chrBase swap ($25→$52) moves honey
+tiles to BG2.  **Diagnostic log analysis proved this wrong.**
+
+Runtime diagnostic (post-log, Rambi Rumble sig CE539ABFD210DBD0) shows:
+- BG1 (layer=0) renders honey tiles at VRAM $5xxx-$6xxx with pal=6
+- BG2 (layer=1) renders terrain tiles at VRAM $2xxx-$4xxx with pal=3
+- MISS entries: all layer=0, pal=6 (honey — content hash not found)
+- LAYER MISMATCH: runtime_layer=1, pack_layer=0 (terrain)
+
+The $210B register remains $25 (not $52) during these frames:
+- BG1 ChrAddress=$5000, BG2 ChrAddress=$2000 (default, no swap)
+- The palette difference (pal=6 vs pal=2) is a tilemap issue, not chrBase
+
+### Fix (this commit)
+
+**Layer** (reverted, 2 locations):
+- Hash export: `layer: 1` → `layer: 0`, dedup key `_1_` → `_0_`
+- PNG export: folder `bg/bg2/gfxset_XX` → `bg/bg1/gfxset_XX`
+
+**Palette** (unchanged from 38d19a5 — BG2 tilemap override is correct):
+- The BG2 tilemap at bg2TilemapBase has pal=6 (confirmed by VRAM ground truth)
+- This palette override remains correct and is kept as-is
+
+**chrBase** (unchanged — bg1ChrBase=$5000 is correct):
+- Runtime BG1 ChrAddress=$5000 (no swap in these frames)
+- Export uses bg1ChrBase=$5000 — matches runtime
+
+### Remaining Issue
+
+Despite correct layer + palette + chrBase, MISS entries persist for most honey
+tiles.  This suggests the ground truth VRAM snapshot has different content at
+$5xxx-$6xxx compared to runtime VRAM, producing different content hashes.
+Investigation needed: compare exported hashes vs runtime hashes for specific
+tile addresses.
+
+---
+
+## [2026-07-06] — Issue O: cmFg layer/palette mismatch (SSB chrBase swap) — REVERTED
 
 ### Problem
 
@@ -34,9 +76,9 @@ is what the runtime PPU actually uses — and it carries palette=6 for all honey
 tiles (confirmed: VRAM $6C00 = 1024 entries, all pal=6).  The BG1 tilemap had
 stale palette=2 values, producing a palette mismatch on every tile.
 
-### Fix
+### Fix (REVERTED in 2026-07-06b — layer change was wrong, palette fix kept)
 
-**Layer** (2 locations):
+**Layer** (2 locations) — **WRONG, reverted**:
 - Hash export: `layer: 0` → `layer: 1`, dedup key `_0_` → `_1_`
 - PNG export: folder `bg/bg1/gfxset_XX` → `bg/bg2/gfxset_XX`
 

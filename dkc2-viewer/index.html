@@ -8907,9 +8907,9 @@ async function exportAsTexturePack(containerName) {
 
   // ---- Color Math Foreground (SSB) tile export ----
   // SSB (Sub-Screen-Blend) levels have a foreground overlay (e.g., honey in Rambi Rumble).
-  // At runtime, DKC2 swaps chrBases ($210B), so these tiles are rendered by BG2 (layer 1)
-  // from bg1ChrBase, NOT by BG1 as the viewer's simulation models it.
-  // Exported to bg/bg2/ so Mesen assigns layer=1 for correct runtime matching.
+  // Runtime diagnostic confirms: BG1 (layer=0) renders these tiles at chrBase=$5000
+  // with palette from the BG2 tilemap (e.g. pal=6 for Rambi Rumble honey).
+  // Exported to bg/bg1/ so Mesen assigns layer=0 for correct runtime matching.
   let cmFgExportedTiles = 0;
 
   const setsWithCmFg = levelSets.filter(s => {
@@ -8929,10 +8929,10 @@ async function exportAsTexturePack(containerName) {
       : (catalogData && catalogData.bg1TilemapData ? catalogData.bg1TilemapData : null);
     if (!tilemapRaw || !ppuCfg) continue;
 
-    // Export to bg/bg2/ — runtime layer 1 (BG2 after chrBase swap)
+    // Export to bg/bg1/ — runtime layer 0 (BG1 renders honey at chrBase=$5000)
     const cmFgGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const cmFgGfxIdStr = String(cmFgGfxIdx).padStart(2, '0');
-    const cmFgFolder = root.folder(`bg/bg2/gfxset_${cmFgGfxIdStr}`);
+    const cmFgFolder = root.folder(`bg/bg1/gfxset_${cmFgGfxIdStr}`);
     const cmFgExportedKeys = new Set();
 
     const chrBase  = ppuCfg.bg1ChrBase || 0;
@@ -9207,10 +9207,9 @@ async function exportAsTexturePack(containerName) {
       }
 
       // Color Math Foreground (SSB) hashes — overlay tiles at bg1ChrBase
-      // At runtime, DKC2 swaps chrBases ($210B), so these tiles are rendered by
-      // BG2 (layer=1).  Uses bg1ChrBase for VRAM addresses (same chrBase value
-      // at runtime after swap).  Dedup key uses _1_ to avoid collisions with
-      // BG2 terrain section (which uses bg2ChrBase — different address range).
+      // Runtime diagnostic confirms: BG1 (layer=0) renders these tiles at
+      // chrBase=$5000 with pal from BG2 tilemap.  Dedup key uses _0_ for
+      // layer 0.  Uses bg1ChrBase for VRAM addresses (matches runtime BG1).
       if (set.vramSnapshot && set.bg1TilemapData && set.bg1TilemapData.length > 1
           && ppuCfg.cmFgSource === 'bg1') {
         const vram = set.vramSnapshot instanceof Uint8Array
@@ -9223,19 +9222,19 @@ async function exportAsTexturePack(containerName) {
           const tileNum = entry & 0x3FF;
           if (tileNum === 0) continue;
           const vramWordAddr = (cmFgChrBase + tileNum * wordsPerTile) & 0x7FFF;
-          const dk = `${gfxset}_1_${vramWordAddr}`;
+          const dk = `${gfxset}_0_${vramWordAddr}`;
           if (dedupKey.has(dk)) continue;
           dedupKey.add(dk);
 
           const byteOff = vramWordAddr * 2;
           if (byteOff + bytesPerTile <= vram.length) {
             const hash = fnv1a_64(vram, byteOff, bytesPerTile);
-            hashEntries.push({ vramAddr: vramWordAddr, layer: 1, gfxset, hash });
+            hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
           }
         }
-        const cmFgHashCount = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 1
+        const cmFgHashCount = hashEntries.filter(e => e.gfxset === gfxset && e.layer === 0
           && e.vramAddr >= (ppuCfg.bg1ChrBase || 0)).length;
-        console.log(`[hashes] gfxset ${gfxset}: cmFg → ${cmFgHashCount} layer-1 hash entries (bg1ChrBase=$${(ppuCfg.bg1ChrBase||0).toString(16)})`);
+        console.log(`[hashes] gfxset ${gfxset}: cmFg → ${cmFgHashCount} layer-0 hash entries (bg1ChrBase=$${(ppuCfg.bg1ChrBase||0).toString(16)})`);
       }
     }
 
