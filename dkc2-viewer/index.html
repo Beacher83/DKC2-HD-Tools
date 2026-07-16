@@ -7881,6 +7881,11 @@ async function saveCurrentHDToContainer(containerName) {
     tileChecksums,
     chrRawData,        // BG1 CHR bytes for content-hash (new)
     vramSnapshot,      // Full VRAM for BG2 content-hash (new)
+    // R3: reference BG palette (CGRAM 0-127, BGR555) this set's tiles were
+    // rendered/upscaled under. Exported as palettes.bin so Mesen can diff
+    // live CGRAM against it (underwater darkening, sunset HDMA, cycling).
+    paletteSnapshot: (currentPalette && currentPalette.length >= 128)
+      ? Array.from(currentPalette.slice(0, 128)) : null,
     // Must match the setId/tile-filter source above (activeGfxIdx), not currentStyle
     // directly — this is the tag ensureGfxSetHDLoaded()/loadContainerToHDPack() use to
     // prefix reloaded tile keys and stamp bg2GfxSet/bg3GfxSet. A mismatch here was the
@@ -9421,6 +9426,70 @@ async function exportAsTexturePack(containerName) {
   }
   }
 
+  // ---- palettes.bin generation (R3) ----
+  // Reference BG palettes per gfxset — the CGRAM state the HD tiles were
+  // rendered/upscaled under. Mesen diffs live CGRAM against these at runtime
+  // (per palette row, per channel) so HD tiles follow palette effects:
+  // underwater darkening, sunset HDMA, palette cycling.
+  //
+  // Palette source, in order of preference:
+  //   1. set.paletteSnapshot — stored at Container Save time (exact)
+  //   2. ROM derivation — loadTileParts() palette of the gfxset's first level
+  //      (same deterministic code path the viewer rendered the tiles with, so
+  //      existing containers work WITHOUT re-saving or re-upscaling anything)
+  // Format: [uint8 gfxsetCount] × [uint8 gfxsetIdx, 128 × uint16le bgr555]
+  let palSetCount = 0;
+  {
+    const palSets = [];
+    const seenGfx = new Set();
+    for (const set of setsWithArrangement) {
+      const gfxIdx = set.gfxSetIndex;
+      if (gfxIdx == null || seenGfx.has(gfxIdx)) continue;
+
+      let pal = (set.paletteSnapshot && set.paletteSnapshot.length >= 128)
+        ? set.paletteSnapshot : null;
+      let palSource = 'snapshot';
+
+      if (!pal && typeof rom !== 'undefined' && rom && graphicsSetsMap && graphicsSetsMap.has(gfxIdx)) {
+        // Derive from ROM: first level of this gfxset
+        const setInfo = graphicsSetsMap.get(gfxIdx);
+        for (const levelInfo of setInfo.levels) {
+          try {
+            const tileParts = loadTileParts(rom, levelInfo.style);
+            if (tileParts.palette && tileParts.palette.length >= 128) {
+              pal = Array.from(tileParts.palette.slice(0, 128));
+              palSource = `ROM (level "${levelInfo.name}")`;
+              break;
+            }
+          } catch (e) {
+            console.warn(`[palettes] gfxset ${gfxIdx}: palette derivation from level "${levelInfo.name}" failed:`, e.message);
+          }
+        }
+      }
+
+      if (!pal) {
+        console.warn(`[palettes] gfxset ${gfxIdx}: no palette source (no snapshot, ROM derivation failed) — skipped`);
+        continue;
+      }
+      console.log(`[palettes] gfxset ${gfxIdx}: reference palette from ${palSource}`);
+      seenGfx.add(gfxIdx);
+      palSets.push({ gfxIdx, pal });
+    }
+    if (palSets.length > 0) {
+      const palBuf = new ArrayBuffer(1 + palSets.length * (1 + 128 * 2));
+      const palView = new DataView(palBuf);
+      let palOff = 0;
+      palView.setUint8(palOff, palSets.length); palOff += 1;
+      for (const { gfxIdx, pal } of palSets) {
+        palView.setUint8(palOff, gfxIdx); palOff += 1;
+        for (let i = 0; i < 128; i++) { palView.setUint16(palOff, pal[i] & 0x7FFF, true); palOff += 2; }
+      }
+      root.file('palettes.bin', new Uint8Array(palBuf));
+      palSetCount = palSets.length;
+      console.log(`[palettes] Generated reference palettes for ${palSetCount} gfxsets`);
+    }
+  }
+
   // Write manifest
   root.file('manifest.json', JSON.stringify({
     format_version: 3,
@@ -9439,6 +9508,7 @@ async function exportAsTexturePack(containerName) {
     total_bg3_tiles: bg3ExportedTiles,
     total_cmfg_tiles: cmFgExportedTiles,
     has_fingerprints: fpEntries && fpEntries.size > 0,
+    has_palettes: palSetCount > 0,
     notes: `Exported from DKC2 Viewer container "${containerName}"`
   }, null, 2));
 

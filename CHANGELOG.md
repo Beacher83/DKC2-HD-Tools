@@ -1,5 +1,42 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-15] — R3: Referenz-Paletten-Export (`palettes.bin`)
+
+### Änderung
+
+HD-Tiles haben ihre Farben zur Export-Zeit "eingebacken" — CGRAM-Effekte des
+Spiels (Lockjaw-Unterwasser-Verdunklung, Gangplank-Sunset-HDMA, Mainbrace-
+Paletten-Zyklus) blieben auf ihnen unsichtbar. R3 behebt das über einen
+Laufzeit-Transform in Mesen; der Viewer liefert dafür die Referenz:
+
+1. **`hdSaveSet` (Level-Sets):** neues Feld `paletteSnapshot` — die 128
+   BG-CGRAM-Einträge (8 Zeilen × 16 Farben, BGR555, `currentPalette`), unter
+   denen die Tiles des Sets gerendert/hochskaliert wurden.
+2. **`exportAsTexturePack()`:** schreibt `palettes.bin` ins Pack:
+   `[uint8 gfxsetCount] × [uint8 gfxsetIdx, 128 × uint16le bgr555]`.
+   Manifest bekommt `has_palettes`. Sets ohne Snapshot (vor diesem Feature
+   gespeichert) werden mit Console-Warnung übersprungen.
+
+### Workflow
+
+**Bestehende Container funktionieren OHNE Neu-Speichern/Neu-Upscalen:**
+Der Export leitet fehlende Referenz-Paletten automatisch aus dem ROM ab
+(`loadTileParts()`-Palette des ersten Levels des Gfxsets — derselbe
+deterministische Codepfad, mit dem die Tiles ursprünglich gerendert wurden).
+Es reicht also: Viewer öffnen (ROM geladen) → Container laden → Texture-Pack
+exportieren → in den Mesen-`HdPacks`-Ordner kopieren. Console zeigt pro
+Gfxset die Paletten-Quelle (`snapshot` oder `ROM (level ...)`).
+Ein `paletteSnapshot` aus einem späteren Container-Save hat Vorrang
+(exakter, falls ein Set mal von einem anderen Level als dem ersten stammt).
+Mesen-Seite (Build R3.0+) liest `palettes.bin` automatisch; ohne Datei
+ändert sich nichts.
+
+### Betroffene Datei
+- `dkc2-viewer/index.html`: `hdSaveSet`-Payload (~Z. 7883),
+  `exportAsTexturePack()` palettes.bin-Block + Manifest-Flag (~Z. 9424)
+
+---
+
 ## [2026-07-06c] — Issue O: cmFg Export-Ordner Separation
 
 ### Änderung
