@@ -7896,6 +7896,15 @@ async function saveCurrentHDToContainer(containerName) {
     savedAt: Date.now()
   });
 
+  // R3 feedback: make it obvious whether this save captured a palette
+  // reference — a missing snapshot silently degrades the export to the
+  // ROM first-level derivation (wrong-sister-level color-cast trap).
+  if (currentPalette && currentPalette.length >= 128) {
+    console.log(`[save] paletteSnapshot captured for "${setId}" (palette of currently loaded level, id=${currentLevelId})`);
+  } else {
+    console.warn(`[save] paletteSnapshot NICHT gesetzt für "${setId}" — kein Level geladen. Export fällt für dieses Set auf ROM-Ableitung (erstes Level des Sets) zurück.`);
+  }
+
   // Free this gfxset's tiles/images from the in-session hdPack now that they're
   // durably persisted in IndexedDB. Without this, hdPack accumulates every imported
   // gfxset's decoded bitmaps for the whole session (uncompressed — a single 4x-scaled
@@ -8461,6 +8470,11 @@ async function exportAsTexturePack(containerName) {
   const subtileSize = 8 * scale;  // 32px per HD sub-tile
   let exportedTiles = 0;
   let bg1PaletteVariants = 0;  // count of extra tiles added by ROM palette scan
+  // R3 palette auto-detect: per gfxset, samples of (palRow, native CHR indices,
+  // downscaled HD pixels). The palettes.bin section scores every candidate level
+  // palette against these — the reference no longer depends on which level the
+  // user happens to have loaded (Issue S: wrong-sister-level color cast).
+  const paletteSamplesByGfx = new Map();
 
   for (const set of setsWithArrangement) {
     const tileArr = new Uint8Array(set.tileArrangementData);
@@ -8529,6 +8543,63 @@ async function exportAsTexturePack(containerName) {
     }
     if (skippedForeign > 0) {
       console.warn(`[export] gfxset ${gfxIdStr}: skipped ${skippedForeign} foreign tiles (contaminated container)`);
+    }
+
+    // --- R3 palette auto-detect sampling ---
+    // For a subset of sub-tiles: decode the native 8x8 palette indices from
+    // chrRawData (4bpp SNES planes) and average the matching HD region down to
+    // 8x8 RGBA. Candidate palettes are scored against these pairs later.
+    if (set.chrRawData && tileBitmaps.size > 0 && !paletteSamplesByGfx.has(gfxIdx)) {
+      const chrData = set.chrRawData instanceof Uint8Array
+        ? set.chrRawData : new Uint8Array(set.chrRawData);
+      const sampCanvas = document.createElement('canvas');
+      sampCanvas.width = 8; sampCanvas.height = 8;
+      const sctx = sampCanvas.getContext('2d', { willReadFrequently: true });
+      const palSamples = [];
+      sampling:
+      for (const [tileKey, hdBitmap] of tileBitmaps) {
+        const keyStr = String(tileKey);
+        const underIdx = keyStr.lastIndexOf('_');
+        const tileId = underIdx >= 0 ? parseInt(keyStr.slice(underIdx + 1)) : parseInt(keyStr);
+        if (isNaN(tileId)) continue;
+        const srcPixelSize = hdBitmap.width / 4;
+        for (let j = 0; j < 16; j += 3) {  // subsample sub-tiles per Map32 tile
+          const byteOff = tileId * 32 + j * 2;
+          if (byteOff + 1 >= tileArr.length) continue;
+          const tileInfo = tileArr[byteOff] | (tileArr[byteOff + 1] << 8);
+          const gfxIndex = tileInfo & 0x03FF;
+          const palRow = (tileInfo >> 10) & 7;
+          const flipH = !!(tileInfo & 0x4000);
+          const flipV = !!(tileInfo & 0x8000);
+          if ((gfxIndex + 1) * 32 > chrData.length) continue;
+          // Native 4bpp indices, flipped to match the stored HD bitmap orientation
+          const idxArr = new Uint8Array(64);
+          let nonZero = 0;
+          const base = gfxIndex * 32;
+          for (let y = 0; y < 8; y++) {
+            const p0 = chrData[base + y * 2],      p1 = chrData[base + y * 2 + 1];
+            const p2 = chrData[base + 16 + y * 2], p3 = chrData[base + 16 + y * 2 + 1];
+            for (let x = 0; x < 8; x++) {
+              const bit = 7 - x;
+              const idx = ((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1)
+                        | (((p2 >> bit) & 1) << 2) | (((p3 >> bit) & 1) << 3);
+              const dx = flipH ? 7 - x : x, dy = flipV ? 7 - y : y;
+              idxArr[dy * 8 + dx] = idx;
+              if (idx) nonZero++;
+            }
+          }
+          if (nonZero < 24) continue;  // need enough opaque native pixels
+          sctx.clearRect(0, 0, 8, 8);
+          sctx.imageSmoothingEnabled = true;
+          sctx.drawImage(hdBitmap, (j % 4) * srcPixelSize, Math.floor(j / 4) * srcPixelSize,
+                         srcPixelSize, srcPixelSize, 0, 0, 8, 8);
+          palSamples.push({ palRow, idxArr, rgba: sctx.getImageData(0, 0, 8, 8).data });
+          if (palSamples.length >= 192) break sampling;
+        }
+      }
+      // Only store non-empty results so a later container entry of the same
+      // gfxset can still contribute samples if this one had none.
+      if (palSamples.length > 0) paletteSamplesByGfx.set(gfxIdx, palSamples);
     }
 
     // For each HD tile: keys are "{gfxIdx}_{tileId}" (e.g. "7_4"), tileArrangementData indexed by tileId
@@ -9442,35 +9513,89 @@ async function exportAsTexturePack(containerName) {
   {
     const palSets = [];
     const seenGfx = new Set();
+    // A snapshot may live on ANY level entry of the gfxset (Container Save
+    // writes it onto the entry it saves — e.g. a level_N entry while the
+    // export iterates gfxset_XX first). Collect across ALL level sets so
+    // iteration order can never shadow an existing snapshot.
+    const snapshotByGfx = new Map();
+    for (const s of levelSets) {
+      if (s.gfxSetIndex != null && s.paletteSnapshot && s.paletteSnapshot.length >= 128
+          && !snapshotByGfx.has(s.gfxSetIndex)) {
+        snapshotByGfx.set(s.gfxSetIndex, s.paletteSnapshot);
+      }
+    }
+    // Score a candidate palette against the sampled (native index ↔ HD pixel)
+    // pairs: for every opaque sampled pixel, the expected color is the
+    // candidate's entry at [palRow*16 + nativeIdx]; error = squared RGB
+    // distance to the actual HD pixel. The palette the art was rendered
+    // under explains the pixels best (lowest mean error).
+    const scorePalette = (samples, pal) => {
+      let err = 0, n = 0;
+      for (const s of samples) {
+        const rowBase = s.palRow * 16;
+        for (let p = 0; p < 64; p++) {
+          const idx = s.idxArr[p];
+          if (!idx) continue;
+          if (s.rgba[p * 4 + 3] < 200) continue;  // skip transparent HD edges
+          const c = pal[rowBase + idx] & 0x7FFF;
+          const er = ((c & 31) << 3)         - s.rgba[p * 4];
+          const eg = (((c >> 5) & 31) << 3)  - s.rgba[p * 4 + 1];
+          const eb = (((c >> 10) & 31) << 3) - s.rgba[p * 4 + 2];
+          err += er * er + eg * eg + eb * eb;
+          n++;
+        }
+      }
+      return n >= 256 ? err / n : Infinity;  // require enough evidence
+    };
+
     for (const set of setsWithArrangement) {
       const gfxIdx = set.gfxSetIndex;
       if (gfxIdx == null || seenGfx.has(gfxIdx)) continue;
 
-      let pal = (set.paletteSnapshot && set.paletteSnapshot.length >= 128)
-        ? set.paletteSnapshot : null;
-      let palSource = 'snapshot';
-
-      if (!pal && typeof rom !== 'undefined' && rom && graphicsSetsMap && graphicsSetsMap.has(gfxIdx)) {
-        // Derive from ROM: first level of this gfxset
-        const setInfo = graphicsSetsMap.get(gfxIdx);
-        for (const levelInfo of setInfo.levels) {
+      // Candidates: stored snapshot (if any) + every level palette of the set
+      const candidates = [];
+      const snap = snapshotByGfx.get(gfxIdx);
+      if (snap) candidates.push({ name: 'Container-Snapshot', pal: snap });
+      if (typeof rom !== 'undefined' && rom && graphicsSetsMap && graphicsSetsMap.has(gfxIdx)) {
+        for (const levelInfo of graphicsSetsMap.get(gfxIdx).levels) {
           try {
             const tileParts = loadTileParts(rom, levelInfo.style);
             if (tileParts.palette && tileParts.palette.length >= 128) {
-              pal = Array.from(tileParts.palette.slice(0, 128));
-              palSource = `ROM (level "${levelInfo.name}")`;
-              break;
+              candidates.push({ name: `ROM "${levelInfo.name}"`, pal: Array.from(tileParts.palette.slice(0, 128)) });
             }
           } catch (e) {
             console.warn(`[palettes] gfxset ${gfxIdx}: palette derivation from level "${levelInfo.name}" failed:`, e.message);
           }
         }
       }
-
-      if (!pal) {
+      if (candidates.length === 0) {
         console.warn(`[palettes] gfxset ${gfxIdx}: no palette source (no snapshot, ROM derivation failed) — skipped`);
         continue;
       }
+
+      // Auto-detect: pick the candidate that best explains the HD art
+      const samples = paletteSamplesByGfx.get(gfxIdx) || [];
+      let pal = null, palSource = '';
+      if (samples.length > 0) {
+        let best = null, bestScore = Infinity;
+        const scoreLog = [];
+        for (const cand of candidates) {
+          const sc = scorePalette(samples, cand.pal);
+          scoreLog.push(`${cand.name}=${sc === Infinity ? 'n/a' : Math.round(sc)}`);
+          if (sc < bestScore) { bestScore = sc; best = cand; }
+        }
+        if (best) {
+          pal = best.pal;
+          palSource = `AUTO-DETECT ${best.name} (avgErr ${Math.round(bestScore)}; ${samples.length} samples; scores: ${scoreLog.join(', ')})`;
+        }
+      }
+      // Fallback (no samples / not enough evidence): old priority — snapshot, else first ROM level
+      if (!pal) {
+        pal = candidates[0].pal;
+        palSource = `${candidates[0].name} (FALLBACK ohne Auto-Detect — keine Samples;`
+          + ` Referenz kann vom falschen Schwesterlevel stammen → Farbstich-Gefahr)`;
+      }
+
       console.log(`[palettes] gfxset ${gfxIdx}: reference palette from ${palSource}`);
       seenGfx.add(gfxIdx);
       palSets.push({ gfxIdx, pal });

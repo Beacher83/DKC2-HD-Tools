@@ -1,5 +1,51 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-17] — Issue S: paletteSnapshot-Handling robuster (Schwesterlevel-Farbstich)
+
+### Problem
+
+Issue S (gelber Rahmen/Schleier auf Lockjaws P07-Tiles) entpuppte sich als
+falsche R3-Referenzpalette: Für Gfxset 3 griff beim Export die ROM-Ableitung
+über das ERSTE Level des Sets (**Lava Lagoon**, rot-braune Zeile 7), obwohl
+die HD-Art unter **Lockjaws** grüner Palette erstellt wurde. Mesens
+live/ref-Transform schob dadurch alle P07-Tiles Richtung Gelbgrün — hart an
+Tile-Grenzen, über wie unter Wasser. Log-Beweis: PALDIFF P7=287/423/192 in
+Lockjaw; in Lava Lagoon dagegen live==ref (Transform still) — was nebenbei
+die alte "Spiel bearbeitet Paletten beim Laden nach"-Theorie widerlegt (war
+ein Artefakt der falschen Referenz).
+
+### Änderungen (`exportAsTexturePack()` + Container-Save)
+
+1. **NEU: Referenz-Palette wird beim Export AUTOMATISCH ermittelt
+   (Auto-Detect, kein User-Schritt mehr nötig).** Während des Tile-Exports
+   sammelt der Export pro Gfxset bis zu 192 Subtile-Samples: native
+   8×8-Palettenindizes aus `chrRawData` (4bpp-Decode, flip-korrigiert) +
+   das auf 8×8 heruntergerechnete HD-Pixelbild. Dann wird JEDE
+   Kandidaten-Palette (Container-Snapshot, falls vorhanden, + die
+   `loadTileParts`-Palette JEDES Levels des Gfxsets) dagegen gescored
+   (mittlerer quadratischer RGB-Fehler „erwartete Palettenfarbe vs.
+   HD-Pixel"); die Palette mit dem kleinsten Fehler ist die, unter der die
+   Art tatsächlich gerendert wurde — unabhängig davon, welches Level gerade
+   geladen ist. Console zeigt alle Scores:
+   `[palettes] gfxset 3: reference palette from AUTO-DETECT ROM "Lockjaw's Locker" (avgErr …; scores: …)`.
+   Fallback ohne Samples (kein `chrRawData`): bisheriges Verhalten
+   (Snapshot, sonst erstes Level) mit expliziter Warnung.
+2. **Snapshot-Suche über ALLE Level-Einträge des Gfxsets** (`snapshotByGfx`):
+   ein per Container-Save gespeicherter `paletteSnapshot` kann nicht mehr
+   durch Iterationsreihenfolge verschattet werden; er konkurriert jetzt als
+   Kandidat im Scoring (gewinnt nur, wenn er die Art wirklich am besten
+   erklärt — ein versehentlich unter falschem Level gespeicherter Snapshot
+   kann nichts mehr kaputt machen).
+3. **Container-Save loggt Snapshot-Status:** `paletteSnapshot captured …`
+   bzw. Warnung, wenn kein Level geladen war.
+
+### Workflow
+
+Kein zusätzlicher Schritt mehr: einfach ROM + Container laden → Export.
+Die Console-Zeile `[palettes] gfxset N: … AUTO-DETECT …` beim Export
+kontrollieren (für Set 3 muss "Lockjaw's Locker" deutlich besser scoren als
+"Lava Lagoon").
+
 ## [2026-07-15] — R3: Referenz-Paletten-Export (`palettes.bin`)
 
 ### Änderung
