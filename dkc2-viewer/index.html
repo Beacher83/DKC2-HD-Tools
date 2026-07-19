@@ -193,7 +193,10 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
 .sprite-gallery-toolbar button:hover { background: #e94560; }
 .sprite-gallery-toolbar button.active { background: #e94560; border-color: #e94560; }
 .sprite-gallery-grid { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px; align-content: flex-start; overflow-y: auto; flex: 1; }
-.sprite-card { background: #1a1a2e; border: 2px solid #333; border-radius: 4px; padding: 4px; display: flex; flex-direction: column; align-items: center; cursor: pointer; min-width: 64px; max-width: 120px; transition: border-color 0.15s; }
+.sprite-card { background: #1a1a2e; border: 2px solid #333; border-radius: 4px; padding: 4px; display: flex; flex-direction: column; align-items: center; cursor: pointer; min-width: 64px; max-width: 120px; transition: border-color 0.15s; position: relative; }
+.sprite-card .selbox { position: absolute; top: 2px; left: 2px; z-index: 2; width: 14px; height: 14px; cursor: pointer; accent-color: #4caf50; opacity: 0.55; }
+.sprite-card .selbox:checked, .sprite-card:hover .selbox { opacity: 1; }
+.sprite-card.sel-marked { border-color: #4caf50; }
 .sprite-card:hover { border-color: #e94560; }
 .sprite-card canvas { image-rendering: pixelated; max-width: 112px; max-height: 80px; }
 .sprite-card-name { font-size: 9px; color: #aaa; text-align: center; margin-top: 3px; max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -366,7 +369,11 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <label style="font-size:11px;color:#ccc;cursor:pointer;margin-left:5px;" title="Export sprite sheets (all frames in one row)"><input type="checkbox" id="expSprSheets" checked> Sheets</label>
       <label style="font-size:11px;color:#ccc;cursor:pointer;margin-left:5px;" title="Export all known palette variants"><input type="checkbox" id="expSprVariants"> Varianten</label>
       <label style="font-size:11px;color:#ccc;cursor:pointer;margin-left:5px;" title="Weltkarten-Icons (Map Icons) mit exportieren"><input type="checkbox" id="expSprMapIcons" checked> Map Icons</label>
-      <button id="spriteExportBtn" style="margin-left:6px;padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;font-weight:bold;" title="Export visible sprites as ZIP with JSON manifest">Export Sprites ZIP</button>
+      <span style="border-left:1px solid #555;margin:0 4px;height:18px;display:inline-block;"></span>
+      <button id="sprSelectVisibleBtn" class="cat-btn" title="Alle aktuell sichtbaren Sprites zur Export-Auswahl hinzufügen (Checkbox auf jeder Karte wählt einzeln)">☑ Sichtbare wählen</button>
+      <button id="sprSelectClearBtn" class="cat-btn" title="Export-Auswahl leeren">✕ Leeren</button>
+      <span id="sprSelCount" style="font-size:11px;color:#4caf50;"></span>
+      <button id="spriteExportBtn" style="margin-left:6px;padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;font-weight:bold;" title="Auswahl exportieren (oder alle sichtbaren, wenn nichts gewählt) — ZIP mit JSON-Manifest">Export Sprites ZIP</button>
       <span id="spriteCount" style="font-size:11px;color:#888;margin-left:8px;"></span>
       <span id="pipetteStatus" style="font-size:11px;color:#ff9800;margin-left:4px;display:none;"></span>
     </div>
@@ -6795,22 +6802,29 @@ async function exportSpritesAsZip() {
       stats: { totalSprites: 0, totalFrames: 0, totalVariants: 0 },
     };
 
-    // Use currently filtered/visible sprites
-    const filterRaw = document.getElementById('spriteFilter').value.trim().toLowerCase();
-    const showGrey = document.getElementById('spriteShowGrey').checked;
-    const entries = spriteGalleryData.filter(e => {
-      if (!showGrey && e.isGrey && !spriteOverrides.has(e.animId)) return false;
-      // Map Icons: controlled by dedicated checkbox, independent of category filter
-      const isMapIcon = getCategoryForAnimName(e.name) === 'mapicons';
-      if (isMapIcon && !expMapIcons) return false;
-      if (!isMapIcon && activeCatFilter !== 'all' && getCategoryForAnimName(e.name) !== activeCatFilter) return false;
-      if (filterRaw) {
-        const f = filterRaw.replace(/^\$|^0x/, '');
-        if (!e.name.toLowerCase().includes(filterRaw) &&
-            !e.animId.toString(16).padStart(4,'0').includes(f)) return false;
-      }
-      return true;
-    });
+    // Export set: the explicit selection when non-empty (independent of the
+    // current filter view), else all currently filtered/visible sprites.
+    let entries;
+    if (spriteSelection.size > 0) {
+      entries = spriteGalleryData.filter(e => spriteSelection.has(e.animId));
+      console.log(`[SpriteExport] exporting explicit selection: ${entries.length} sprites`);
+    } else {
+      const filterRaw = document.getElementById('spriteFilter').value.trim().toLowerCase();
+      const showGrey = document.getElementById('spriteShowGrey').checked;
+      entries = spriteGalleryData.filter(e => {
+        if (!showGrey && e.isGrey && !spriteOverrides.has(e.animId)) return false;
+        // Map Icons: controlled by dedicated checkbox, independent of category filter
+        const isMapIcon = getCategoryForAnimName(e.name) === 'mapicons';
+        if (isMapIcon && !expMapIcons) return false;
+        if (!isMapIcon && activeCatFilter !== 'all' && getCategoryForAnimName(e.name) !== activeCatFilter) return false;
+        if (filterRaw) {
+          const f = filterRaw.replace(/^\$|^0x/, '');
+          if (!e.name.toLowerCase().includes(filterRaw) &&
+              !e.animId.toString(16).padStart(4,'0').includes(f)) return false;
+        }
+        return true;
+      });
+    }
 
     const total = entries.length;
     let processed = 0;
@@ -12194,6 +12208,22 @@ function showSpriteCardInfo(e) {
   }
 }
 
+// --- Sprite export selection ---
+// Persistent across filter/category changes; the export takes the selection
+// when non-empty (else: all visible, as before). Typical flow for targeted
+// upscale batches: filter "DD_" → "Sichtbare wählen" → filter "DX_" →
+// "Sichtbare wählen" → Export Auswahl (N).
+const spriteSelection = new Set();  // animIds
+
+function updateSpriteSelectionUI() {
+  const cnt = document.getElementById('sprSelCount');
+  const btn = document.getElementById('spriteExportBtn');
+  if (cnt) cnt.textContent = spriteSelection.size > 0 ? `${spriteSelection.size} gewählt` : '';
+  if (btn && !btn.disabled) {
+    btn.textContent = spriteSelection.size > 0 ? `Export Auswahl (${spriteSelection.size})` : 'Export Sprites ZIP';
+  }
+}
+
 function renderSpriteGallery() {
   const grid = document.getElementById('spriteGalleryGrid');
   const countEl = document.getElementById('spriteCount');
@@ -12267,6 +12297,21 @@ function buildSpriteCard(e) {
   card.className = 'sprite-card' + (hasOverride ? ' override-palette' : isUnused ? ' unused-anim' : e.isGrey ? ' grey-palette' : '');
   card.title = `${e.name}  |  animId 0x${e.animId.toString(16).toUpperCase().padStart(4,'0')}  |  Klicken für Details`;
   card._spriteEntry = e;
+
+  // Export-selection checkbox (top-left overlay; card click stays details)
+  const selBox = document.createElement('input');
+  selBox.type = 'checkbox';
+  selBox.className = 'selbox';
+  selBox.title = 'Für Export auswählen';
+  selBox.checked = spriteSelection.has(e.animId);
+  if (selBox.checked) card.classList.add('sel-marked');
+  selBox.addEventListener('click', (ev) => ev.stopPropagation());
+  selBox.addEventListener('change', () => {
+    if (selBox.checked) { spriteSelection.add(e.animId); card.classList.add('sel-marked'); }
+    else { spriteSelection.delete(e.animId); card.classList.remove('sel-marked'); }
+    updateSpriteSelectionUI();
+  });
+  card.appendChild(selBox);
 
   if (e.canvas) {
     // Check for HD sprite frame 0
@@ -12486,6 +12531,19 @@ document.getElementById('viewSprites').addEventListener('click', () => { toggleC
 // Sprite gallery build button + filter
 document.getElementById('spriteBuildBtn').addEventListener('click', buildSpriteGallery);
 document.getElementById('spriteExportBtn').addEventListener('click', () => exportSpritesAsZip());
+document.getElementById('sprSelectVisibleBtn').addEventListener('click', () => {
+  const grid = document.getElementById('spriteGalleryGrid');
+  for (const card of grid.querySelectorAll('.sprite-card')) {
+    if (card._spriteEntry) spriteSelection.add(card._spriteEntry.animId);
+  }
+  renderSpriteGallery();
+  updateSpriteSelectionUI();
+});
+document.getElementById('sprSelectClearBtn').addEventListener('click', () => {
+  spriteSelection.clear();
+  renderSpriteGallery();
+  updateSpriteSelectionUI();
+});
 document.getElementById('spriteFilter').addEventListener('input', renderSpriteGallery);
 document.getElementById('spriteShowGrey').addEventListener('change', renderSpriteGallery);
 

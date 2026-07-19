@@ -1,5 +1,24 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-19c] — Sprite-Galerie: Export-Auswahl (Checkboxen)
+
+Der Sprite-Export nahm bisher immer ALLE sichtbaren Sprites (787 Stück,
+10k+ Dateien) — für gezielte Upscale-Batches (z.B. nur Diddy+Dixie) gab es
+keine Auswahl. Neu:
+
+- **Checkbox auf jeder Galerie-Karte** (oben links, grüner Rahmen bei
+  Auswahl); Kartenklick bleibt Details.
+- Toolbar: **„☑ Sichtbare wählen"** (fügt alle aktuell gefilterten Karten
+  zur Auswahl hinzu — Auswahl bleibt über Filterwechsel erhalten, dadurch
+  additiv kombinierbar: Filter „DD_" → wählen → Filter „DX_" → wählen),
+  **„✕ Leeren"**, Zähler.
+- Export-Button zeigt **„Export Auswahl (N)"**, sobald etwas gewählt ist,
+  und exportiert dann GENAU die Auswahl (unabhängig vom aktuellen Filter);
+  ohne Auswahl unverändert alle sichtbaren.
+- ZIP-/Ordnerstruktur bewusst UNVERÄNDERT (Upscale-Pipeline des Users
+  verarbeitet sie — sie braucht nur lange; kleinere Auswahl-Exporte sind
+  die Antwort darauf).
+
 ## [2026-07-19b] — S5: Sprite-Export trägt Frame→Tile-Hashes (HD-Sprite-Pipeline)
 
 Vorbereitung für hash-adressierte HD-Sprites (Mesen S3/S4 sind live):
