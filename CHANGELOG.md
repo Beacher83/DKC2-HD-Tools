@@ -1,5 +1,25 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-19b] — S5: Sprite-Export trägt Frame→Tile-Hashes (HD-Sprite-Pipeline)
+
+Vorbereitung für hash-adressierte HD-Sprites (Mesen S3/S4 sind live):
+
+- `renderSpriteFromDescriptor()` sammelt jetzt pro gerendertem Frame alle
+  platzierten 8×8-OBJ-Tiles als `{x, y, hash}` (canvas-relativ, ungeflippt);
+  `hash` = FNV-1a über die 32 ROM-Bytes des Tiles = exakt der Content-Hash,
+  den Mesen zur Laufzeit aus OBJ-VRAM berechnet (VRAM = wörtliche ROM-Kopie,
+  per Byte-Suche bewiesen). `renderCompositeFrame()` merged die Listen der
+  Composite-Teile in Composite-Koordinaten.
+- **Export Sprites ZIP (Manifest v2):** jeder Frame-Eintrag enthält
+  `tiles: [{x, y, hash}]` (frame-relativ; für die gepaddete PNG offsetX/Y
+  addieren). Damit kann der spätere Pack-Export upscaled Frames in
+  hash-adressierte 32×32-Zellen (`sprites/{hash}_P{pal}.png`) schneiden.
+- Mesen-Gegenstück (Build "S5a"): Sprite-Capture-Recording nach
+  `%USERPROFILE%\Downloads\snes_hd_spritecap.txt` — alle im Spiel gesehenen
+  (hash, palette)-Paare inkl. Tile-Bytes + OBJ-CGRAM-Farben; liefert dem
+  Pack-Export die echten Palette-Slots. Ausstehend: Pack-Export-Slicing +
+  Spritecap-Ingestion (nächster Schritt).
+
 ## [2026-07-19] — Edge-Seam-Cleanup im Pack-Export (Issue-S-Rest) + echtes Nachbarschafts-Padding im SD-Export + Export-Fortschrittsanzeige
 
 ### 0. Fortschrittsanzeige für den Mesen-Pack-Export

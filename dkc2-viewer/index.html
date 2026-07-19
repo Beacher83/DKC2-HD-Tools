@@ -3303,6 +3303,17 @@ function renderSpriteFromDescriptor(desc, palette, secondaryPalette) {
     return (tile && tile.fromBlock2 && secondaryPalette) ? secondaryPalette : palette;
   }
 
+  // S5: collect every placed 8x8 tile as {x, y, hash} (canvas-relative,
+  // unflipped — gallery frames are always rendered in canonical orientation).
+  // hash = FNV-1a over the tile's 32 raw 4bpp bytes = EXACTLY the content
+  // hash Mesen computes from OBJ VRAM at runtime (S2 proved VRAM tiles are
+  // verbatim ROM copies). This is the frame→tile mapping the HD sprite
+  // pack export uses to slice upscaled frames into hash-keyed cells.
+  const tilePlacements = [];
+  const placeTile = (tile, x, y) => {
+    tilePlacements.push({ x, y, hash: fnv1a_64(tile.data, 0, 32) });
+  };
+
   // Render 16x16 OBJ entries with correct row-wrap formula.
   // Each VRAM row is 16 slots wide. Rows 0,2,4... hold top halves;
   // rows 1,3,5... hold bottom halves. 8 OBJs fit per top-half row.
@@ -3323,10 +3334,10 @@ function renderSpriteFromDescriptor(desc, palette, secondaryPalette) {
     if (!bl) missedTiles.push(`BL@${topSlot+16}`);
     if (!br) missedTiles.push(`BR@${topSlot+17}`);
 
-    if (tl) drawTile8x8(imgData, palForTile(tl), 0, ox,     oy,     tl.data, false, false);
-    if (tr) drawTile8x8(imgData, palForTile(tr), 0, ox + 8, oy,     tr.data, false, false);
-    if (bl) drawTile8x8(imgData, palForTile(bl), 0, ox,     oy + 8, bl.data, false, false);
-    if (br) drawTile8x8(imgData, palForTile(br), 0, ox + 8, oy + 8, br.data, false, false);
+    if (tl) { drawTile8x8(imgData, palForTile(tl), 0, ox,     oy,     tl.data, false, false); placeTile(tl, ox,     oy); }
+    if (tr) { drawTile8x8(imgData, palForTile(tr), 0, ox + 8, oy,     tr.data, false, false); placeTile(tr, ox + 8, oy); }
+    if (bl) { drawTile8x8(imgData, palForTile(bl), 0, ox,     oy + 8, bl.data, false, false); placeTile(bl, ox,     oy + 8); }
+    if (br) { drawTile8x8(imgData, palForTile(br), 0, ox + 8, oy + 8, br.data, false, false); placeTile(br, ox + 8, oy + 8); }
   }
 
   // Render 8x8 group A entries (VRAM slot = tileBase + j = off8a + j).
@@ -3339,7 +3350,7 @@ function renderSpriteFromDescriptor(desc, palette, secondaryPalette) {
     const slot = desc.tileBase + j;
     const tile = getVramTile(slot);
     if (!tile) missedTiles.push(`8x8A@${slot}`);
-    if (tile) drawTile8x8(imgData, palForTile(tile), 0, ox, oy, tile.data, false, false);
+    if (tile) { drawTile8x8(imgData, palForTile(tile), 0, ox, oy, tile.data, false, false); placeTile(tile, ox, oy); }
   }
 
   // Render 8x8 group B entries (VRAM slot = desc.flags + k = off8b + k).
@@ -3353,7 +3364,7 @@ function renderSpriteFromDescriptor(desc, palette, secondaryPalette) {
     const slot = desc.flags + k;
     const tile = getVramTile(slot);
     if (!tile) missedTiles.push(`8x8B@${slot}`);
-    if (tile) drawTile8x8(imgData, palForTile(tile), 0, ox, oy, tile.data, false, false);
+    if (tile) { drawTile8x8(imgData, palForTile(tile), 0, ox, oy, tile.data, false, false); placeTile(tile, ox, oy); }
   }
 
   if (missedTiles.length > 0) {
@@ -3362,7 +3373,7 @@ function renderSpriteFromDescriptor(desc, palette, secondaryPalette) {
 
   const canvas = new OffscreenCanvas(width, height);
   canvas.getContext('2d').putImageData(imgData, 0, 0);
-  return { canvas, width, height, offsetX: minX, offsetY: minY };
+  return { canvas, width, height, offsetX: minX, offsetY: minY, tiles: tilePlacements };
 }
 
 // Load sprite palette from palette set ID via DATA_FD5FEE
@@ -6777,7 +6788,7 @@ async function exportSpritesAsZip() {
     const rootFolder = zip.folder('sprites');
     const manifest = {
       exportDate: new Date().toISOString(),
-      exportVersion: 1,
+      exportVersion: 2,  // v2: frames carry tiles[] (frame→OBJ-tile hashes for HD pack export)
       exportType: 'sprites',
       scaleFactor: 1,
       sprites: [],
@@ -6858,7 +6869,8 @@ async function exportSpritesAsZip() {
             rendered = renderCompositeFrame(frame, palEntry.palette, paletteKey, entry.secondaryPalette, secPalKey, entry.block2Palette, b2PalKey);
           }
           if (!rendered) continue;
-          renderedFrames.push({ index: fi, canvas: rendered.canvas, width: rendered.width, height: rendered.height, duration: frame.duration || frame.delay || 4 });
+          renderedFrames.push({ index: fi, canvas: rendered.canvas, width: rendered.width, height: rendered.height,
+            duration: frame.duration || frame.delay || 4, tiles: rendered.tiles || null });
           maxW = Math.max(maxW, rendered.width);
           maxH = Math.max(maxH, rendered.height);
         }
@@ -6893,6 +6905,14 @@ async function exportSpritesAsZip() {
               offsetX: ox,
               offsetY: oy,
               duration: rf.duration,
+              // S5: frame→OBJ-tile mapping for the HD sprite pack export.
+              // x/y are FRAME-relative (add offsetX/offsetY for the padded
+              // PNG); hash = FNV-1a of the tile's 32 ROM bytes == the
+              // runtime content hash Mesen matches on (LayerIndex 4).
+              tiles: rf.tiles ? rf.tiles.map(t => ({
+                x: t.x, y: t.y,
+                hash: t.hash.toString(16).padStart(16, '0').toUpperCase(),
+              })) : null,
             });
             manifest.stats.totalFrames++;
           }
@@ -11542,7 +11562,20 @@ function renderCompositeFrame(frame, palette, paletteKey, secondaryPalette, seco
   for (const { render, worldX, worldY } of extras) {
     ctx.drawImage(render.canvas, worldX + render.offsetX - left, worldY + render.offsetY - top);
   }
-  return { canvas: out, width: w, height: h, offsetX: left, offsetY: top };
+  // S5: merge tile placements into composite-canvas coordinates
+  const tiles = [];
+  if (primary.tiles) {
+    for (const t of primary.tiles) {
+      tiles.push({ x: t.x + primary.offsetX - left, y: t.y + primary.offsetY - top, hash: t.hash });
+    }
+  }
+  for (const { render, worldX, worldY } of extras) {
+    if (!render.tiles) continue;
+    for (const t of render.tiles) {
+      tiles.push({ x: t.x + worldX + render.offsetX - left, y: t.y + worldY + render.offsetY - top, hash: t.hash });
+    }
+  }
+  return { canvas: out, width: w, height: h, offsetX: left, offsetY: top, tiles };
 }
 
 function startGalleryAnim() { galleryAnimActive = true; }
