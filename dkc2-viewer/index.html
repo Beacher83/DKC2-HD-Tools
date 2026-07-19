@@ -6396,48 +6396,87 @@ async function exportCatalogAsZip() {
       }
     }
 
-    // === Step 2: Build neighbor stats for context-padding ===
-    // For each tile, find the most common neighbor in each direction (T, R, B, L)
-    btn.textContent = 'Building neighbor context...';
+    // === Step 2: Collect real 3x3 neighborhoods for context-padding ===
+    // Old approach: per-direction "most common neighbor" statistics. Each side
+    // was picked independently (and corners were even guessed two steps deep),
+    // so the padding ring could combine neighbors from four different places —
+    // a context that never occurs anywhere in the game and sometimes looked
+    // visibly wrong. New approach (2026-07-19): record every REAL occurrence
+    // of each tile across all levels of the set and pad with ONE actual
+    // in-game neighborhood — preferring occurrences that are unflipped,
+    // complete (8 real neighbors) and typical (most frequent identical ring).
+    btn.textContent = 'Collecting tile neighborhoods...';
     await new Promise(r => setTimeout(r, 0));
-    
-    const neighborStats = new Map(); // tileId -> { T: Map(neighborId->count), R:..., B:..., L:... }
+
+    const hoodStats = new Map(); // tileId -> Map(sigKey -> {cells[9], centerFlip, nonEmpty, count})
     const setInfo = catalogData.setInfo || (graphicsSetsMap ? graphicsSetsMap.get(currentStyle?.graphics) : null);
-    
+
     if (setInfo) {
       for (const levelInfo of setInfo.levels) {
         try {
           const lprop = loadLevelProperties(rom, levelInfo.id);
           if (lprop.type === 0x0004 || lprop.type === 0x0005 || isNpcShop(levelInfo.id)) continue;
           const tileMap = loadTileMap(rom, levelInfo.style, lprop);
-          
+
           for (const [key, tile] of tileMap.map) {
             const [xStr, yStr] = key.split(',');
             const x = parseInt(xStr), y = parseInt(yStr);
-            if (!neighborStats.has(tile.partId)) {
-              neighborStats.set(tile.partId, { T: new Map(), R: new Map(), B: new Map(), L: new Map() });
+            const cells = new Array(9);
+            let nonEmpty = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const i = (dy + 1) * 3 + (dx + 1);
+                const n = (dx === 0 && dy === 0) ? tile : tileMap.map.get(`${x + dx * 32},${y + dy * 32}`);
+                if (n) {
+                  cells[i] = { partId: n.partId, flip: (n.flipH ? 1 : 0) | (n.flipV ? 2 : 0) };
+                  if (i !== 4) nonEmpty++;
+                } else {
+                  cells[i] = null;
+                }
+              }
             }
-            const ns = neighborStats.get(tile.partId);
-            
-            const check = (dx, dy, dir) => {
-              const n = tileMap.map.get(`${x + dx},${y + dy}`);
-              if (n) ns[dir].set(n.partId, (ns[dir].get(n.partId) || 0) + 1);
-            };
-            check(0, -32, 'T'); check(32, 0, 'R'); check(0, 32, 'B'); check(-32, 0, 'L');
+            const sigKey = cells.map(c => c ? `${c.partId}:${c.flip}` : 'x').join(',');
+            if (!hoodStats.has(tile.partId)) hoodStats.set(tile.partId, new Map());
+            const sigs = hoodStats.get(tile.partId);
+            const rec = sigs.get(sigKey);
+            if (rec) rec.count++;
+            else sigs.set(sigKey, { cells, centerFlip: cells[4].flip, nonEmpty, count: 1 });
           }
         } catch (e) { /* skip */ }
       }
     }
 
-    // Helper: get most common neighbor for a tile in a direction
-    function bestNeighbor(tileId, dir) {
-      const ns = neighborStats.get(tileId);
-      if (!ns || !ns[dir] || ns[dir].size === 0) return -1;
-      let best = -1, bestCount = 0;
-      for (const [nId, cnt] of ns[dir]) {
-        if (cnt > bestCount) { best = nId; bestCount = cnt; }
+    // Helper: pick the best real neighborhood for a tile — unflipped center
+    // first, then most complete ring, then most frequent. If only flipped
+    // occurrences exist, the whole ring is mirrored so the center matches the
+    // catalog's canonical un-flipped orientation.
+    function bestNeighborhood(tileId) {
+      const sigs = hoodStats.get(tileId);
+      if (!sigs || sigs.size === 0) return null;
+      let best = null;
+      for (const rec of sigs.values()) {
+        if (!best) { best = rec; continue; }
+        const aUnfl = rec.centerFlip === 0 ? 1 : 0, bUnfl = best.centerFlip === 0 ? 1 : 0;
+        if (aUnfl !== bUnfl) { if (aUnfl > bUnfl) best = rec; continue; }
+        if (rec.nonEmpty !== best.nonEmpty) { if (rec.nonEmpty > best.nonEmpty) best = rec; continue; }
+        if (rec.count > best.count) best = rec;
       }
-      return best;
+      let cells = best.cells;
+      if (best.centerFlip & 1) { // un-H-flip: swap columns, toggle each cell's H bit
+        const orig = cells;
+        cells = orig.map((c, i) => {
+          const src = orig[Math.floor(i / 3) * 3 + (2 - (i % 3))];
+          return src ? { partId: src.partId, flip: src.flip ^ 1 } : null;
+        });
+      }
+      if (best.centerFlip & 2) { // un-V-flip: swap rows, toggle each cell's V bit
+        const orig = cells;
+        cells = orig.map((c, i) => {
+          const src = orig[(2 - Math.floor(i / 3)) * 3 + (i % 3)];
+          return src ? { partId: src.partId, flip: src.flip ^ 2 } : null;
+        });
+      }
+      return cells;
     }
 
     // Helper: render a tile by partId onto a context, with optional flip
@@ -6480,9 +6519,8 @@ async function exportCatalogAsZip() {
 
     // === Step 3: Export Clusters (clean, no padding ring) ===
     // Padding was tried (2026-07-03/04, "Tile Seam Elimination") to give the AI
-    // upscaler neighbor context at cluster edges via bestNeighbor() — the same
-    // statistical "most common neighbor across all occurrences" heuristic used for
-    // individual-tile padding below. For clusters this backfired more visibly and
+    // upscaler neighbor context at cluster edges via a statistical "most common
+    // neighbor per direction" heuristic. For clusters this backfired more visibly and
     // more often than for single tiles: spot-checking several clusters (not just an
     // isolated case) showed the padding ring frequently mismatching the real content
     // right at the cluster/padding boundary (e.g. a waving-flag cluster in Mainbrace
@@ -6490,8 +6528,9 @@ async function exportCatalogAsZip() {
     // wrong padding neighbor is exactly the kind of inconsistent edge context an AI
     // upscaler is sensitive to, this risked making the real seam-at-the-boundary
     // problem worse rather than better. Reverted to plain cluster export (matches
-    // the pre-2026-07-03 behavior); individual-tile padding (Step 4 below, older and
-    // not reported as problematic) is unaffected.
+    // the pre-2026-07-03 behavior); individual-tile padding (Step 4 below) now uses
+    // one real in-game neighborhood per tile instead of that heuristic, which may
+    // make a padding ring for clusters viable again if ever needed.
     btn.textContent = 'Exporting clusters...';
     await new Promise(r => setTimeout(r, 0));
 
@@ -6588,25 +6627,33 @@ async function exportCatalogAsZip() {
         tileEntry.status = 'covered_by_cluster';
         coveredCount++;
       } else {
-        // Export padded only (3x3 = center tile + 8 neighbors for AI context)
+        // Export padded only (3x3 = center tile + one REAL in-game neighborhood)
         const filename = `tile_${String(tile.id).padStart(4, '0')}_padded.png`;
 
         const padCanvas = new OffscreenCanvas(96, 96);
         const pCtx = padCanvas.getContext('2d');
-        // Center
+        const hood = bestNeighborhood(tile.id);
+        let mirrorCells = 0;
+        for (let i = 0; i < 9; i++) {
+          if (i === 4) continue;
+          const col = i % 3, row = Math.floor(i / 3);
+          const c = hood ? hood[i] : null;
+          if (c) {
+            drawTile(pCtx, c.partId, col * 32, row * 32, c.flip);
+          } else {
+            // Mirror-fallback: no real neighbor known — either the tile is
+            // unused in every tilemap of the set (usage=0 art), or the chosen
+            // occurrence sits at a map border. Reflect the center tile into
+            // the gap so the upscaler sees a plausible continuation instead
+            // of a hard transparent edge.
+            const flip = (col !== 1 ? 1 : 0) | (row !== 1 ? 2 : 0);
+            drawTile(pCtx, tile.id, col * 32, row * 32, flip);
+            mirrorCells++;
+          }
+        }
+        // Center: canonical un-flipped catalog tile
         drawTile(pCtx, tile.id, 32, 32);
-        // Neighbors
-        drawTile(pCtx, bestNeighbor(tile.id, 'T'), 32, 0);
-        drawTile(pCtx, bestNeighbor(tile.id, 'B'), 32, 64);
-        drawTile(pCtx, bestNeighbor(tile.id, 'L'), 0, 32);
-        drawTile(pCtx, bestNeighbor(tile.id, 'R'), 64, 32);
-        // Corners (diagonal context)
-        const tN = bestNeighbor(tile.id, 'T');
-        const bN = bestNeighbor(tile.id, 'B');
-        drawTile(pCtx, tN >= 0 ? bestNeighbor(tN, 'L') : -1, 0, 0);
-        drawTile(pCtx, tN >= 0 ? bestNeighbor(tN, 'R') : -1, 64, 0);
-        drawTile(pCtx, bN >= 0 ? bestNeighbor(bN, 'L') : -1, 0, 64);
-        drawTile(pCtx, bN >= 0 ? bestNeighbor(bN, 'R') : -1, 64, 64);
+        tileEntry.padSource = mirrorCells === 0 ? 'real' : (mirrorCells === 8 ? 'mirror' : 'mixed');
         tilesFolder.file(filename, await canvasToBlob(padCanvas));
         tileEntry.file = `tiles/${filename}`;
         tileEntry.padded = true;
@@ -8445,10 +8492,43 @@ function collectBG1PaletteVariantsFromROM(gfxSetIndex, chrBase, bgMode) {
 // Converts Map32 HD tiles into per-8x8-subtile PNGs keyed by VRAM address + palette
 // Output format: HdPacks/{romName}/bg/bg1/{vramAddr}_P{pal}.png (32x32px each, 4x scaled)
 
+// ---- Mesen export progress overlay ----
+// The pack export takes a while by now; without visible feedback it looks
+// like nothing happens unless the console is open. Small fixed toast with
+// status text + progress bar; the export's heavy sync loops yield to the
+// browser periodically so the overlay actually repaints.
+function showMesenExportProgress(text, frac = null) {
+  let el = document.getElementById('mesenExportProgress');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'mesenExportProgress';
+    el.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:9999;'
+      + 'background:#1e1e1e;border:2px solid #ff9800;border-radius:8px;padding:10px 18px;min-width:360px;'
+      + 'box-shadow:0 4px 20px rgba(0,0,0,0.6);font-size:12px;color:#e0e0e0;font-family:sans-serif;';
+    el.innerHTML = '<div style="font-weight:bold;color:#ff9800;margin-bottom:4px;">Mesen2 HD Pack Export</div>'
+      + '<div id="mesenExportProgressText" style="margin-bottom:6px;">…</div>'
+      + '<div style="background:#333;border-radius:4px;height:8px;overflow:hidden;">'
+      + '<div id="mesenExportProgressBar" style="background:#ff9800;height:100%;width:0%;transition:width 0.15s;"></div></div>';
+    document.body.appendChild(el);
+  }
+  el.style.display = 'block';
+  document.getElementById('mesenExportProgressText').textContent = text;
+  const bar = document.getElementById('mesenExportProgressBar');
+  if (frac == null) { bar.style.opacity = '0.35'; bar.style.width = '100%'; }
+  else { bar.style.opacity = '1'; bar.style.width = Math.round(Math.min(1, Math.max(0, frac)) * 100) + '%'; }
+}
+function hideMesenExportProgress() {
+  const el = document.getElementById('mesenExportProgress');
+  if (el) el.style.display = 'none';
+}
+const _yieldToBrowser = () => new Promise(r => setTimeout(r, 0));
+
 async function exportAsTexturePack(containerName) {
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
 
   try {
+  showMesenExportProgress('Container wird gelesen…', 0);
+  await _yieldToBrowser();
   const sets = await hdGetContainerSets(containerName);
   const levelSets = sets.filter(s => s.type === 'level');
 
@@ -8471,12 +8551,232 @@ async function exportAsTexturePack(containerName) {
   let exportedTiles = 0;
   let bg1PaletteVariants = 0;  // count of extra tiles added by ROM palette scan
   // R3 palette auto-detect: per gfxset, samples of (palRow, native CHR indices,
-  // downscaled HD pixels). The palettes.bin section scores every candidate level
-  // palette against these — the reference no longer depends on which level the
-  // user happens to have loaded (Issue S: wrong-sister-level color cast).
+  // downscaled HD pixels). Every candidate level palette is scored against
+  // these — the reference no longer depends on which level the user happens to
+  // have loaded (Issue S: wrong-sister-level color cast).
   const paletteSamplesByGfx = new Map();
 
+  // Reference palettes are resolved EARLY (inside the set loop, right after
+  // sampling) so the edge-seam cleanup below can use the same palette the art
+  // is exported/transformed under; the palettes.bin section reuses these
+  // resolved entries instead of scoring a second time.
+  const refPalByGfx = new Map();  // gfxIdx -> { pal, source, auto }
+  const snapshotByGfx = new Map();
+  // A snapshot may live on ANY level entry of the gfxset (Container Save
+  // writes it onto the entry it saves — e.g. a level_N entry while the
+  // export iterates gfxset_XX first). Collect across ALL level sets so
+  // iteration order can never shadow an existing snapshot.
+  for (const s of levelSets) {
+    if (s.gfxSetIndex != null && s.paletteSnapshot && s.paletteSnapshot.length >= 128
+        && !snapshotByGfx.has(s.gfxSetIndex)) {
+      snapshotByGfx.set(s.gfxSetIndex, s.paletteSnapshot);
+    }
+  }
+
+  // Score a candidate palette against the sampled (native index ↔ HD pixel)
+  // pairs: for every opaque sampled pixel, the expected color is the
+  // candidate's entry at [palRow*16 + nativeIdx]; error = squared RGB
+  // distance to the actual HD pixel. The palette the art was rendered
+  // under explains the pixels best (lowest mean error).
+  const scorePalette = (samples, pal) => {
+    let err = 0, n = 0;
+    for (const s of samples) {
+      const rowBase = s.palRow * 16;
+      for (let p = 0; p < 64; p++) {
+        const idx = s.idxArr[p];
+        if (!idx) continue;
+        if (s.rgba[p * 4 + 3] < 200) continue;  // skip transparent HD edges
+        const c = pal[rowBase + idx] & 0x7FFF;
+        const er = ((c & 31) << 3)         - s.rgba[p * 4];
+        const eg = (((c >> 5) & 31) << 3)  - s.rgba[p * 4 + 1];
+        const eb = (((c >> 10) & 31) << 3) - s.rgba[p * 4 + 2];
+        err += er * er + eg * eg + eb * eb;
+        n++;
+      }
+    }
+    return n >= 256 ? err / n : Infinity;  // require enough evidence
+  };
+
+  // Resolve the reference palette for a gfxset: auto-detect via samples if
+  // available, else fall back to snapshot/first ROM level. A fallback result
+  // is upgraded later if a subsequent set entry contributes samples.
+  const resolveReferencePalette = (gfxIdx) => {
+    const existing = refPalByGfx.get(gfxIdx);
+    const samples = paletteSamplesByGfx.get(gfxIdx) || [];
+    if (existing && (existing.auto || samples.length === 0)) return existing;
+
+    // Candidates: stored snapshot (if any) + every level palette of the set
+    const candidates = [];
+    const snap = snapshotByGfx.get(gfxIdx);
+    if (snap) candidates.push({ name: 'Container-Snapshot', pal: snap });
+    if (typeof rom !== 'undefined' && rom && graphicsSetsMap && graphicsSetsMap.has(gfxIdx)) {
+      for (const levelInfo of graphicsSetsMap.get(gfxIdx).levels) {
+        try {
+          const tileParts = loadTileParts(rom, levelInfo.style);
+          if (tileParts.palette && tileParts.palette.length >= 128) {
+            candidates.push({ name: `ROM "${levelInfo.name}"`, pal: Array.from(tileParts.palette.slice(0, 128)) });
+          }
+        } catch (e) {
+          console.warn(`[palettes] gfxset ${gfxIdx}: palette derivation from level "${levelInfo.name}" failed:`, e.message);
+        }
+      }
+    }
+    if (candidates.length === 0) return existing || null;
+
+    let entry = null;
+    if (samples.length > 0) {
+      let best = null, bestScore = Infinity;
+      const scoreLog = [];
+      for (const cand of candidates) {
+        const sc = scorePalette(samples, cand.pal);
+        scoreLog.push(`${cand.name}=${sc === Infinity ? 'n/a' : Math.round(sc)}`);
+        if (sc < bestScore) { bestScore = sc; best = cand; }
+      }
+      if (best) {
+        entry = { pal: best.pal, auto: true,
+          source: `AUTO-DETECT ${best.name} (avgErr ${Math.round(bestScore)}; ${samples.length} samples; scores: ${scoreLog.join(', ')})` };
+      }
+    }
+    if (!entry) {
+      entry = { pal: candidates[0].pal, auto: false,
+        source: `${candidates[0].name} (FALLBACK ohne Auto-Detect — keine Samples;`
+          + ` Referenz kann vom falschen Schwesterlevel stammen → Farbstich-Gefahr)` };
+    }
+    refPalByGfx.set(gfxIdx, entry);
+    console.log(`[palettes] gfxset ${gfxIdx}: reference palette from ${entry.source}`);
+    return entry;
+  };
+
+  // ---- Issue S edge-seam cleanup ----
+  // The AI upscaler baked opaque yellow-olive blend seams into tile edges
+  // where two hue clusters meet (green algae vs. brown wood): blend pixels
+  // whose hue falls in a band the tile's native colors never occupy. Under
+  // water the sub-operand ADD turns them into glowing outlines. Detection is
+  // per native sub-tile and palette-driven, NOT a blanket color filter: a
+  // pixel is a seam pixel only if it is far in RGB from EVERY palette color
+  // this sub-tile actually uses AND far in hue from every saturated used
+  // color. Legitimate yellow art (bananas, KONG letters) is never touched —
+  // its yellow is IN its own tile's used palette. Seam pixels are replaced by
+  // the nearest non-seam pixel (same approach as the manual 2026-07-17 fix of
+  // 29a0/29b0/3540/3590_P07, which every re-export used to overwrite).
+  const SEAM_RGB_DIST = 28;   // min euclidean RGB distance to every used color
+  const SEAM_HUE_DIST = 16;   // min degrees from every saturated used color's hue
+  const SEAM_MIN_SAT  = 40;   // saturation (max-min) below which hue is meaningless
+  // Hysteresis growth (2026-07-19, after first user test — "deutlich besser,
+  // aber Rest-Säume"): pixels ADJACENT to detected seam pixels are also
+  // scrubbed if they meet these relaxed thresholds. Catches the borderline
+  // blend ring around each seam without raising the global thresholds
+  // (which would endanger legitimate art like bananas).
+  const SEAM_GROW_RGB  = 18;
+  const SEAM_GROW_HUE  = 10;
+  const SEAM_GROW_ITER = 6;
+  const rgbToHue = (r, g, b) => {
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    if (mx === mn) return 0;
+    const d = mx - mn;
+    let h;
+    if (mx === r) h = ((g - b) / d) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    return (h * 60 + 360) % 360;
+  };
+  const cleanupSeamPixels = (ctx, size, usedColors) => {
+    const satColors = usedColors.filter(c => c.sat >= SEAM_MIN_SAT);
+    // Without any saturated used color the hue test is meaningless — a seam
+    // (foreign hue blended in from a padded neighbor) can exist even in
+    // tiles with a single hue cluster, so one saturated color is enough.
+    if (usedColors.length === 0 || satColors.length === 0) return 0;
+    const img = ctx.getImageData(0, 0, size, size);
+    const d = img.data;
+    // Classify a pixel against the used colors with given thresholds
+    const isForeign = (i, rgbDist, hueDist) => {
+      if (d[i * 4 + 3] < 200) return false;  // leave (semi-)transparent pixels alone
+      const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+      if (Math.max(r, g, b) - Math.min(r, g, b) < SEAM_MIN_SAT) return false;
+      // Near any used color in RGB → legit (shading of that color)
+      for (const c of usedColors) {
+        const dr = r - c.r, dg = g - c.g, db = b - c.b;
+        if (dr * dr + dg * dg + db * db <= rgbDist * rgbDist) return false;
+      }
+      // Near any saturated used color's hue → legit blend WITHIN a cluster
+      const hue = rgbToHue(r, g, b);
+      for (const c of satColors) {
+        let dh = Math.abs(hue - c.hue);
+        if (dh > 180) dh = 360 - dh;
+        if (dh <= hueDist) return false;
+      }
+      return true;
+    };
+    const seam = new Uint8Array(size * size);
+    let seamCount = 0;
+    for (let i = 0; i < size * size; i++) {
+      if (isForeign(i, SEAM_RGB_DIST, SEAM_HUE_DIST)) { seam[i] = 1; seamCount++; }
+    }
+    // Hysteresis: grow into adjacent borderline pixels (relaxed thresholds)
+    if (seamCount > 0) {
+      for (let iter = 0; iter < SEAM_GROW_ITER; iter++) {
+        let grown = 0;
+        for (let y = 0; y < size; y++) {
+          for (let x = 0; x < size; x++) {
+            const i = y * size + x;
+            if (seam[i]) continue;
+            let nextToSeam = false;
+            for (let dy = -1; dy <= 1 && !nextToSeam; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const nx = x + dx, ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+                if (seam[ny * size + nx] === 1) { nextToSeam = true; break; }
+              }
+            }
+            if (nextToSeam && isForeign(i, SEAM_GROW_RGB, SEAM_GROW_HUE)) {
+              seam[i] = 2;  // mark as new this iteration (not a growth seed yet)
+              grown++; seamCount++;
+            }
+          }
+        }
+        if (grown === 0) break;
+        for (let i = 0; i < size * size; i++) if (seam[i] === 2) seam[i] = 1;
+      }
+    }
+    if (seamCount === 0 || seamCount >= size * size) return 0;
+    // Replace each seam pixel with the nearest non-seam opaque pixel's RGB
+    // (non-seam pixels are never modified, so they are safe as sources)
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = y * size + x;
+        if (!seam[i]) continue;
+        let found = -1;
+        search:
+        for (let rad = 1; rad < size; rad++) {
+          for (let dy = -rad; dy <= rad; dy++) {
+            for (let dx = -rad; dx <= rad; dx++) {
+              if (Math.max(Math.abs(dx), Math.abs(dy)) !== rad) continue;  // ring only
+              const nx = x + dx, ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+              const ni = ny * size + nx;
+              if (seam[ni] || d[ni * 4 + 3] < 200) continue;
+              found = ni;
+              break search;
+            }
+          }
+        }
+        if (found >= 0) {
+          d[i * 4]     = d[found * 4];
+          d[i * 4 + 1] = d[found * 4 + 1];
+          d[i * 4 + 2] = d[found * 4 + 2];
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return seamCount;
+  };
+
+  let bg1SetIdx = 0;
   for (const set of setsWithArrangement) {
+    bg1SetIdx++;
+    showMesenExportProgress(`BG1: Level-Set ${bg1SetIdx}/${setsWithArrangement.length} — HD-Tiles laden…`,
+      (bg1SetIdx - 1) / setsWithArrangement.length * 0.6);
+    await _yieldToBrowser();
     const tileArr = new Uint8Array(set.tileArrangementData);
     const arrTileCount = set.tileArrangementTileCount || (tileArr.length / 32);
     const ppuCfg = set.ppuConfig;
@@ -8602,8 +8902,25 @@ async function exportAsTexturePack(containerName) {
       if (palSamples.length > 0) paletteSamplesByGfx.set(gfxIdx, palSamples);
     }
 
+    // Resolve the reference palette for this gfxset now (auto-detect if
+    // samples exist) — the edge-seam cleanup below needs it per sub-tile.
+    const refPalEntry = resolveReferencePalette(gfxIdx);
+    const refPal = refPalEntry ? refPalEntry.pal : null;
+    const chrDataForCleanup = (is4bpp && set.chrRawData)
+      ? (set.chrRawData instanceof Uint8Array ? set.chrRawData : new Uint8Array(set.chrRawData))
+      : null;
+    let seamCleanedPx = 0, seamCleanedTiles = 0;
+
     // For each HD tile: keys are "{gfxIdx}_{tileId}" (e.g. "7_4"), tileArrangementData indexed by tileId
+    let bg1TileNum = 0;
     for (const [tileKey, hdBitmap] of tileBitmaps) {
+      bg1TileNum++;
+      if (bg1TileNum % 16 === 0) {
+        showMesenExportProgress(
+          `BG1: Set ${bg1SetIdx}/${setsWithArrangement.length} (gfxset ${gfxIdStr}) — Tile ${bg1TileNum}/${tileBitmaps.size}, Seam-Cleanup…`,
+          (bg1SetIdx - 1 + bg1TileNum / tileBitmaps.size) / setsWithArrangement.length * 0.6);
+        await _yieldToBrowser();
+      }
       const keyStr = String(tileKey);
       const underIdx = keyStr.lastIndexOf('_');
       const tileId = underIdx >= 0 ? parseInt(keyStr.slice(underIdx + 1)) : parseInt(keyStr);
@@ -8651,6 +8968,33 @@ async function exportAsTexturePack(containerName) {
                        0, 0, subtileSize, subtileSize);
         if (flipH || flipV) ctx.restore();
 
+        // Issue S: scrub upscaler blend seams using the palette colors this
+        // native sub-tile actually uses (indices from chrRawData, colors from
+        // the reference palette). Orientation is irrelevant — only the SET of
+        // used indices matters.
+        if (refPal && chrDataForCleanup && (gfxIndex + 1) * 32 <= chrDataForCleanup.length) {
+          const usedIdx = new Set();
+          const base = gfxIndex * 32;
+          for (let y = 0; y < 8; y++) {
+            const p0 = chrDataForCleanup[base + y * 2],      p1 = chrDataForCleanup[base + y * 2 + 1];
+            const p2 = chrDataForCleanup[base + 16 + y * 2], p3 = chrDataForCleanup[base + 16 + y * 2 + 1];
+            for (let x = 0; x < 8; x++) {
+              const bit = 7 - x;
+              const idx = ((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1)
+                        | (((p2 >> bit) & 1) << 2) | (((p3 >> bit) & 1) << 3);
+              if (idx) usedIdx.add(idx);
+            }
+          }
+          const usedColors = [];
+          for (const idx of usedIdx) {
+            const c = refPal[palRow * 16 + idx] & 0x7FFF;
+            const r = (c & 31) << 3, g = ((c >> 5) & 31) << 3, b = ((c >> 10) & 31) << 3;
+            usedColors.push({ r, g, b, sat: Math.max(r, g, b) - Math.min(r, g, b), hue: rgbToHue(r, g, b) });
+          }
+          const cleaned = cleanupSeamPixels(ctx, subtileSize, usedColors);
+          if (cleaned > 0) { seamCleanedPx += cleaned; seamCleanedTiles++; }
+        }
+
         // Convert to PNG blob once (reused across all chrBases)
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
@@ -8673,6 +9017,14 @@ async function exportAsTexturePack(containerName) {
           exportedTiles++;
         }
       }
+    }
+
+    if (seamCleanedPx > 0) {
+      console.log(`[seam-cleanup] gfxset ${gfxIdStr}: scrubbed ${seamCleanedPx} seam px in ${seamCleanedTiles} sub-tiles`);
+    } else if (refPal && chrDataForCleanup) {
+      console.log(`[seam-cleanup] gfxset ${gfxIdStr}: no seam pixels found`);
+    } else {
+      console.warn(`[seam-cleanup] gfxset ${gfxIdStr}: SKIPPED (${!refPal ? 'keine Referenzpalette' : 'kein chrRawData/2bpp'}) — Blend-Säume bleiben ungefiltert`);
     }
 
     // --- Palette variant expansion from ROM ---
@@ -8724,6 +9076,8 @@ async function exportAsTexturePack(containerName) {
   // from an old ZIP that pre-dates container support), use the live catalogData from
   // the current session — so the user just needs gfxset open, not a re-save.
   let bg2ExportedTiles = 0;
+  showMesenExportProgress('BG2-Tiles exportieren…', 0.62);
+  await _yieldToBrowser();
 
   const livePpu  = catalogData && catalogData.ppuConfig    ? catalogData.ppuConfig    : null;
   const liveTmap = catalogData && catalogData.bg2TilemapData ? catalogData.bg2TilemapData : null;
@@ -8763,6 +9117,7 @@ async function exportAsTexturePack(containerName) {
     for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
 
     for (let tileY = 0; tileY < tilesH; tileY++) {
+      if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
         const entry = tilemapWords[tileY * tilesW + tileX];
         if (entry === undefined) continue;
@@ -8807,6 +9162,8 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  showMesenExportProgress('Wall-Tiles (Schiffswand) exportieren…', 0.7);
+  await _yieldToBrowser();
   // ---- Wall (Schiffswand) tile export ----
   // Wall tiles share BG2's chrBase and layer but use different tile indices
   // (578-652), so their vramAddrs never collide with ceiling tiles (1-577).
@@ -8851,6 +9208,7 @@ async function exportAsTexturePack(containerName) {
     for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
 
     for (let tileY = 0; tileY < tilesH; tileY++) {
+      if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
         const entry = tilemapWords[tileY * tilesW + tileX];
         if (entry === undefined) continue;
@@ -8895,6 +9253,8 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  showMesenExportProgress('BG3-Tiles exportieren…', 0.75);
+  await _yieldToBrowser();
   // ---- BG3 tile export ----
   // BG3 in Mode 1 is 2bpp. Extracts unique 8x8 tiles from the composed bg3.png
   // using the saved tilemap, scales them 4x to 32x32, stores un-flipped.
@@ -8939,6 +9299,7 @@ async function exportAsTexturePack(containerName) {
     for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
 
     for (let tileY = 0; tileY < tilesH; tileY++) {
+      if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
         const entry = tilemapWords[tileY * tilesW + tileX];
         if (entry === undefined) continue;
@@ -8981,6 +9342,8 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  showMesenExportProgress('Color-Math-FG-Tiles (SSB) exportieren…', 0.8);
+  await _yieldToBrowser();
   // ---- Color Math Foreground (SSB) tile export ----
   // SSB (Sub-Screen-Blend) levels have a foreground overlay (e.g., honey in Rambi Rumble).
   // Runtime diagnostic confirms: BG1 (layer=0) renders these tiles at chrBase=$5000
@@ -9056,6 +9419,7 @@ async function exportAsTexturePack(containerName) {
     for (let i = 0; i + 1 < td.length; i += 2) tilemapWords.push(td[i] | (td[i+1] << 8));
 
     for (let tileY = 0; tileY < tilesH; tileY++) {
+      if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
         const entry = tilemapWords[tileY * tilesW + tileX];
         if (entry === undefined) continue;
@@ -9141,6 +9505,8 @@ async function exportAsTexturePack(containerName) {
   // content hash.  The emulator uses the content hash as the runtime tile key — different
   // gfxsets loading different tiles to the same VRAM address get distinct hashes.
   // Falls back to legacy checksums.bin for old containers missing chrRawData/vramSnapshot.
+  showMesenExportProgress('hashes.bin berechnen (Content-Hashes)…', 0.86);
+  await _yieldToBrowser();
   let usesContentHash = false;
   let fpEntries = null;   // fingerprint entries per gfxset (declared outside { } for manifest visibility)
   {
@@ -9151,6 +9517,7 @@ async function exportAsTexturePack(containerName) {
     const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3, ...setsWithCmFg];
     console.log(`[hashes] Processing ${allHashSets.length} set(s) for hashes.bin`);
     for (const set of allHashSets) {
+      await _yieldToBrowser();
       const ppuCfg = set.ppuConfig;
       if (!ppuCfg) { console.warn(`[hashes] gfxset ${set.gfxSetIndex}: SKIPPED (no ppuConfig)`); continue; }
       const gfxset = set.gfxSetIndex ?? 0;
@@ -9398,6 +9765,8 @@ async function exportAsTexturePack(containerName) {
         root.file('checksums.bin', new Uint8Array(buf));
       }
     }
+  showMesenExportProgress('fingerprints.bin generieren…', 0.91);
+  await _yieldToBrowser();
   // ---- fingerprints.bin generation ----
   // Selects distinctive "reference tiles" per gfxset whose content hashes uniquely
   // identify that gfxset at runtime. Mesen checks these against live VRAM once per
@@ -9497,6 +9866,8 @@ async function exportAsTexturePack(containerName) {
   }
   }
 
+  showMesenExportProgress('palettes.bin generieren…', 0.93);
+  await _yieldToBrowser();
   // ---- palettes.bin generation (R3) ----
   // Reference BG palettes per gfxset — the CGRAM state the HD tiles were
   // rendered/upscaled under. Mesen diffs live CGRAM against these at runtime
@@ -9513,92 +9884,20 @@ async function exportAsTexturePack(containerName) {
   {
     const palSets = [];
     const seenGfx = new Set();
-    // A snapshot may live on ANY level entry of the gfxset (Container Save
-    // writes it onto the entry it saves — e.g. a level_N entry while the
-    // export iterates gfxset_XX first). Collect across ALL level sets so
-    // iteration order can never shadow an existing snapshot.
-    const snapshotByGfx = new Map();
-    for (const s of levelSets) {
-      if (s.gfxSetIndex != null && s.paletteSnapshot && s.paletteSnapshot.length >= 128
-          && !snapshotByGfx.has(s.gfxSetIndex)) {
-        snapshotByGfx.set(s.gfxSetIndex, s.paletteSnapshot);
-      }
-    }
-    // Score a candidate palette against the sampled (native index ↔ HD pixel)
-    // pairs: for every opaque sampled pixel, the expected color is the
-    // candidate's entry at [palRow*16 + nativeIdx]; error = squared RGB
-    // distance to the actual HD pixel. The palette the art was rendered
-    // under explains the pixels best (lowest mean error).
-    const scorePalette = (samples, pal) => {
-      let err = 0, n = 0;
-      for (const s of samples) {
-        const rowBase = s.palRow * 16;
-        for (let p = 0; p < 64; p++) {
-          const idx = s.idxArr[p];
-          if (!idx) continue;
-          if (s.rgba[p * 4 + 3] < 200) continue;  // skip transparent HD edges
-          const c = pal[rowBase + idx] & 0x7FFF;
-          const er = ((c & 31) << 3)         - s.rgba[p * 4];
-          const eg = (((c >> 5) & 31) << 3)  - s.rgba[p * 4 + 1];
-          const eb = (((c >> 10) & 31) << 3) - s.rgba[p * 4 + 2];
-          err += er * er + eg * eg + eb * eb;
-          n++;
-        }
-      }
-      return n >= 256 ? err / n : Infinity;  // require enough evidence
-    };
-
     for (const set of setsWithArrangement) {
       const gfxIdx = set.gfxSetIndex;
       if (gfxIdx == null || seenGfx.has(gfxIdx)) continue;
 
-      // Candidates: stored snapshot (if any) + every level palette of the set
-      const candidates = [];
-      const snap = snapshotByGfx.get(gfxIdx);
-      if (snap) candidates.push({ name: 'Container-Snapshot', pal: snap });
-      if (typeof rom !== 'undefined' && rom && graphicsSetsMap && graphicsSetsMap.has(gfxIdx)) {
-        for (const levelInfo of graphicsSetsMap.get(gfxIdx).levels) {
-          try {
-            const tileParts = loadTileParts(rom, levelInfo.style);
-            if (tileParts.palette && tileParts.palette.length >= 128) {
-              candidates.push({ name: `ROM "${levelInfo.name}"`, pal: Array.from(tileParts.palette.slice(0, 128)) });
-            }
-          } catch (e) {
-            console.warn(`[palettes] gfxset ${gfxIdx}: palette derivation from level "${levelInfo.name}" failed:`, e.message);
-          }
-        }
-      }
-      if (candidates.length === 0) {
+      // Already resolved in the main set loop (auto-detect via samples, with
+      // snapshot/ROM fallback); this call is a no-op lookup for those and only
+      // computes for sets that never reached the sampling path.
+      const entry = resolveReferencePalette(gfxIdx);
+      if (!entry) {
         console.warn(`[palettes] gfxset ${gfxIdx}: no palette source (no snapshot, ROM derivation failed) — skipped`);
         continue;
       }
-
-      // Auto-detect: pick the candidate that best explains the HD art
-      const samples = paletteSamplesByGfx.get(gfxIdx) || [];
-      let pal = null, palSource = '';
-      if (samples.length > 0) {
-        let best = null, bestScore = Infinity;
-        const scoreLog = [];
-        for (const cand of candidates) {
-          const sc = scorePalette(samples, cand.pal);
-          scoreLog.push(`${cand.name}=${sc === Infinity ? 'n/a' : Math.round(sc)}`);
-          if (sc < bestScore) { bestScore = sc; best = cand; }
-        }
-        if (best) {
-          pal = best.pal;
-          palSource = `AUTO-DETECT ${best.name} (avgErr ${Math.round(bestScore)}; ${samples.length} samples; scores: ${scoreLog.join(', ')})`;
-        }
-      }
-      // Fallback (no samples / not enough evidence): old priority — snapshot, else first ROM level
-      if (!pal) {
-        pal = candidates[0].pal;
-        palSource = `${candidates[0].name} (FALLBACK ohne Auto-Detect — keine Samples;`
-          + ` Referenz kann vom falschen Schwesterlevel stammen → Farbstich-Gefahr)`;
-      }
-
-      console.log(`[palettes] gfxset ${gfxIdx}: reference palette from ${palSource}`);
       seenGfx.add(gfxIdx);
-      palSets.push({ gfxIdx, pal });
+      palSets.push({ gfxIdx, pal: entry.pal });
     }
     if (palSets.length > 0) {
       const palBuf = new ArrayBuffer(1 + palSets.length * (1 + 128 * 2));
@@ -9638,7 +9937,9 @@ async function exportAsTexturePack(containerName) {
   }, null, 2));
 
   // Generate and download ZIP
-  const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  const zipBlob = await zip.generateAsync(
+    { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
+    (meta) => showMesenExportProgress(`ZIP komprimieren… ${Math.round(meta.percent)}%`, 0.95 + meta.percent / 100 * 0.05));
   const url = URL.createObjectURL(zipBlob);
   const a = document.createElement('a');
   a.href = url;
@@ -9662,6 +9963,8 @@ async function exportAsTexturePack(containerName) {
   } catch(err) {
     console.error('[Mesen2 Export] Fehler:', err);
     alert('Export fehlgeschlagen: ' + err.message);
+  } finally {
+    hideMesenExportProgress();
   }
 }
 

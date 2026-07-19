@@ -1,5 +1,81 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-19] — Edge-Seam-Cleanup im Pack-Export (Issue-S-Rest) + echtes Nachbarschafts-Padding im SD-Export + Export-Fortschrittsanzeige
+
+### 0. Fortschrittsanzeige für den Mesen-Pack-Export
+
+Der Pack-Export dauert inzwischen spürbar; ohne offene Console sah es aus,
+als passiere nichts. Neu: fixes Overlay unten-mittig („Mesen2 HD Pack
+Export") mit Statustext + Fortschrittsbalken über alle Phasen (BG1 pro
+Set/Tile, BG2/Wall/BG3/cmFg, hashes.bin, fingerprints.bin, palettes.bin,
+ZIP-Kompression mit Prozent). Die schweren synchronen Schleifen yielden
+periodisch an den Browser (`setTimeout(0)`), damit das Overlay tatsächlich
+neu zeichnet; Fehler/Abbruch blendet es über `finally` zuverlässig aus.
+
+**Status Issue-S-Rest nach Test-Runde 2:** Hysterese entfernt mehr Saum-Pixel
+(Set 37: 1283 → 2469 px), sichtbares Ergebnis in Lockjaw/Lava aber ~unverändert
+— Rest ist vermutlich art-/upscaling-getrieben. Auf User-Entscheidung
+ZURÜCKGESTELLT (Schönheitsfehler); Kandidat für eine verfeinerte
+Upscaling-Methode statt Export-Nachbearbeitung.
+
+### 1. Edge-Seam-Cleanup (`exportAsTexturePack()`) — automatisch bei jedem Export
+
+Der KI-Upscaler hat an Kanten zwischen zwei Farbclustern (grüne Algen ↔
+braunes Holz) opake gelb-olive Blend-Säume in die Tiles eingebacken —
+Pixel, deren Farbton in einem Band liegt, das die nativen Farben des Tiles
+nie belegen. Unter Wasser macht der Sub-Operand-ADD daraus Leuchtrahmen.
+Bisher wurden 4 Tiles manuell gefixt (29a0/29b0/3540/3590_P07), die jeder
+Re-Export wieder überschrieb — deshalb sitzt der Fix jetzt im Export selbst:
+
+- **Erkennung pro nativem Subtile, palettengetrieben — KEIN pauschaler
+  Farbfilter:** Ein Pixel gilt nur dann als Saum, wenn es (a) in RGB weit
+  von JEDER Palettenfarbe entfernt ist, die dieses Subtile laut `chrRawData`
+  tatsächlich benutzt (Farben aus der Auto-Detect-Referenzpalette), UND
+  (b) im Farbton weit von jeder gesättigten benutzten Farbe entfernt liegt
+  (Schwellen: RGB-Distanz > 28, Hue-Distanz > 14°, Sättigung ≥ 40).
+  Legitimes Gelb (Bananen, KONG-Buchstaben) ist sicher: es steht in der
+  benutzten Palette des eigenen Tiles.
+- **Ersetzung:** Saum-Pixel bekommen die Farbe des nächstgelegenen
+  Nicht-Saum-Pixels (gleiche Methode wie der manuelle Fix vom 2026-07-17).
+- **Nachschärfung nach erstem User-Test ("deutlich besser, aber Rest-Säume"):**
+  (a) Hysterese-Wachstum — Pixel NEBEN erkannten Saum-Pixeln werden mit
+  entspannten Schwellen (RGB > 18, Hue > 10°, max. 6 Iterationen) mitgereinigt;
+  fängt den Blend-Restring um jeden Saum, ohne die globalen Schwellen
+  anzuheben (Bananen-Risiko). (b) Guard gelockert: EINE gesättigte benutzte
+  Farbe reicht (vorher ≥ 2 — Tiles mit nur einem Farbcluster wurden komplett
+  übersprungen, obwohl fremde Säume vom gepaddeten Nachbarn auch dort
+  vorkommen). (c) Basis-Hue-Schwelle 14° → 16°.
+- **Voraussetzung dafür:** Die Referenzpaletten-Auflösung (Auto-Detect)
+  wurde aus der `palettes.bin`-Sektion nach vorn in die Set-Schleife gezogen
+  (`resolveReferencePalette()`); `palettes.bin` nutzt dieselben aufgelösten
+  Einträge (kein doppeltes Scoring, Verhalten unverändert).
+- Console: `[seam-cleanup] gfxset NN: scrubbed X seam px in Y sub-tiles`
+  bzw. Warnung, wenn Cleanup mangels Referenzpalette/chrRawData übersprungen
+  wurde. Gilt für BG1-Subtiles (dort trat Issue S auf); BG2/Wall unverändert.
+
+### 2. Padding aus echten Vorkommen (`exportCatalogAsZip()`)
+
+Die 96×96-`tile_XXXX_padded.png`s für den Upscaler umgaben das Zentrum
+bisher mit dem *pro Richtung* statistisch häufigsten Nachbarn (Ecken sogar
+zweistufig geraten) — die vier Seiten konnten aus vier verschiedenen Stellen
+im Spiel stammen, eine Nachbarschaft, die so nie vorkommt und teils sichtbar
+falsch aussah. Jetzt: Der Export sammelt alle ECHTEN Vorkommen jedes Tiles
+über alle Level des Gfxsets (inkl. Flips) und nimmt EINE reale
+3×3-Nachbarschaft — bevorzugt ungeflippt, vollständig (8 Nachbarn) und am
+häufigsten. Existieren nur geflippte Vorkommen, wird die ganze Nachbarschaft
+gespiegelt, damit das Zentrum in kanonischer Ausrichtung bleibt. Nachbarn
+werden mit ihren echten Flips gerendert; die Ecken sind jetzt echte
+Diagonalnachbarn statt zweistufiger Schätzungen.
+
+**Mirror-Fallback (nach erstem User-Test):** ~12% der Tiles (z.B. 38/304 in
+Gfxset 3) kommen in KEINER Tilemap des Sets vor (usage=0) — für sie existiert
+keine echte Nachbarschaft, sie wurden bisher ohne Padding exportiert (war auch
+beim alten Statistik-Padding so). Jetzt: fehlende Ring-Zellen (usage=0-Tiles
+oder Vorkommen am Kartenrand) werden durch das GESPIEGELTE Zentrum gefüllt
+(Seiten achsengespiegelt, Ecken doppelt gespiegelt) — plausible Fortsetzung
+statt harter Transparenzkante. Manifest: neues Feld `padSource` pro Tile
+(`real` | `mixed` | `mirror`).
+
 ## [2026-07-17] — Issue S: paletteSnapshot-Handling robuster (Schwesterlevel-Farbstich)
 
 ### Problem
