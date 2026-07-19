@@ -9567,7 +9567,21 @@ async function exportAsTexturePack(containerName) {
             const byteOff = vramWordAddr * 2;
             if (byteOff + bytesPerTile <= vram.length) {
               const hash = fnv1a_64(vram, byteOff, bytesPerTile);
-              hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash });
+              // stable = VRAM content identical to the ROM CHR data for this
+              // tile index → not runtime-modified. Tiles that differ live in
+              // DMA-animated regions (e.g. Gusty's wind foliage): their VRAM
+              // content changes every few frames, so a fingerprint placed on
+              // one would make DetectActiveGfxset fail most of the time — and
+              // with P4.2 strict scoping that would leave the whole set SD.
+              let stable = false;
+              if (chrData && (gfxIndex + 1) * bytesPerTile <= chrData.length) {
+                stable = true;
+                const chrOff = gfxIndex * bytesPerTile;
+                for (let b = 0; b < bytesPerTile; b++) {
+                  if (vram[byteOff + b] !== chrData[chrOff + b]) { stable = false; break; }
+                }
+              }
+              hashEntries.push({ vramAddr: vramWordAddr, layer: 0, gfxset, hash, stable });
             }
           }
         }
@@ -9779,7 +9793,7 @@ async function exportAsTexturePack(containerName) {
     const gfxsetMap = new Map();  // gfxsetIdx → [{vramAddr, hash}]
     for (const e of hashEntries) {
       if (!gfxsetMap.has(e.gfxset)) gfxsetMap.set(e.gfxset, []);
-      gfxsetMap.get(e.gfxset).push({ vramAddr: e.vramAddr, hash: e.hash, layer: e.layer });
+      gfxsetMap.get(e.gfxset).push({ vramAddr: e.vramAddr, hash: e.hash, layer: e.layer, stable: e.stable });
     }
 
     // Build set of all hashes per gfxset (for uniqueness check)
@@ -9817,15 +9831,24 @@ async function exportAsTexturePack(containerName) {
         }
       }
 
-      // Sort: non-trivial first, then BG1 (layer 0) first
+      // Sort: non-trivial first, then STABLE first (VRAM == ROM CHR — not in a
+      // DMA-animated region; an animated ref tile would break detection at
+      // runtime), then BG1 (layer 0) first
       candidates.sort((a, b) => {
         if (a.isTrivial !== b.isTrivial) return a.isTrivial ? 1 : -1;
+        const aStable = a.stable === true ? 0 : 1, bStable = b.stable === true ? 0 : 1;
+        if (aStable !== bStable) return aStable - bStable;
         if (a.layer !== b.layer) return a.layer - b.layer;
         return 0;
       });
 
       // Take top N candidates
       const selected = candidates.slice(0, MAX_REF_TILES);
+      const stableCount = selected.filter(c => c.stable === true).length;
+      if (selected.length > 0 && stableCount < selected.length) {
+        console.warn(`[fingerprints] gfxset ${gs}: ${selected.length - stableCount}/${selected.length} ref tiles are NOT stable ` +
+          `(VRAM != ROM CHR — runtime-modified?) — detection may be unreliable in-game`);
+      }
       if (selected.length >= MIN_REF_TILES) {
         fpEntries.set(gs, selected.map(c => ({ vramAddr: c.vramAddr, hash: c.hash })));
       } else if (selected.length > 0) {

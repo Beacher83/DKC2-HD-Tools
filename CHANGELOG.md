@@ -18,6 +18,17 @@ neu zeichnet; Fehler/Abbruch blendet es über `finally` zuverlässig aus.
 ZURÜCKGESTELLT (Schönheitsfehler); Kandidat für eine verfeinerte
 Upscaling-Methode statt Export-Nachbearbeitung.
 
+### 0.5 Fingerprint-Auswahl bevorzugt STABILE Tiles (Gusty-Vorbereitung)
+
+BG1-Hash-Einträge tragen jetzt ein `stable`-Flag: VRAM-Bytes identisch zu
+chrRawData (ROM) = Tile wird zur Laufzeit nicht per DMA überschrieben. Die
+fingerprints.bin-Auswahl sortiert stabile Tiles nach vorn und warnt, wenn
+instabile Referenz-Tiles gewählt werden müssen. Hintergrund: Gusty Glades
+Wind-DMA (vblank 15, nicht in animDefs modelliert) ändert VRAM-Regionen
+laufend — ein Fingerprint auf einem Wind-Tile würde DetectActiveGfxset
+meistens fehlschlagen lassen, und mit Mesens P4.2-Strict-Scoping bliebe das
+ganze Set dann SD.
+
 ### 1. Edge-Seam-Cleanup (`exportAsTexturePack()`) — automatisch bei jedem Export
 
 Der KI-Upscaler hat an Kanten zwischen zwei Farbclustern (grüne Algen ↔
