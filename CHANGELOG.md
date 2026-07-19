@@ -1,5 +1,32 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-19d] — S5b-2: Sprite-Slicing im Pack-Export + Spritecap-Ingestion (HD-Sprite-Pipeline KOMPLETT)
+
+Der letzte Baustein der HD-Sprite-Pipeline (Mesen S3/S4 rendern bereits):
+
+- **„Spritecap"-Button** (Katalog-Toolbar, neben Clear HD): lädt
+  `snes_hd_spritecap.txt` (Mesen-S5a-Recording). Jede Zeile wird gegen ihre
+  eigenen Tile-Bytes hash-verifiziert; Ergebnis: hash→Set(palette-Slots).
+  Button zeigt „Spritecap ✓ N" (grün).
+- **`exportAsTexturePack()`: neue Sprite-Sektion** — schneidet die per
+  „Import HD" geladenen HD-Sprite-Frames (Manifest v2, `tiles[]`) in
+  8×-Scale-Zellen und schreibt `sprites/{hash16}_P{pal}.png` für jedes im
+  Spritecap aufgezeichnete (hash,pal)-Paar. Zellposition =
+  `(tileX + frameOffsetX) × scale` im gepaddeten Frame; voll transparente
+  Zellen und scaleFactor ≠ 4 werden übersprungen. Dedup über alle Frames
+  (erster Treffer gewinnt). Console-Summary: exportiert / ohne
+  Runtime-Palette / ohne tiles[].
+- `importHDSpritePack()` speichert dafür jetzt pro Frame `meta`
+  (offsetX/offsetY + tiles[] aus dem Manifest).
+- Ohne geladenes Spritecap läuft der Export mit Hinweis ohne Sprites weiter.
+- Pack-manifest.json: neues Feld `total_sprite_tiles`; Erfolgsmeldung
+  zeigt die Sprite-Tile-Zahl.
+
+**Workflow erster HD-Sprite-Test:** Auswahl-Export (z.B. DD_Idle/Walk/Run)
+→ upscalen (4×) → ZIP mit manifest re-packen → „Import HD" → „Spritecap"
+laden → Container → „Texture Pack" → nach HdPacks entpacken → Mesen (S4.0+)
+neu starten → Diddy ist HD.
+
 ## [2026-07-19c] — Sprite-Galerie: Export-Auswahl (Checkboxen)
 
 Der Sprite-Export nahm bisher immer ALLE sichtbaren Sprites (787 Stück,
