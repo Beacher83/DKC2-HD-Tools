@@ -6400,68 +6400,92 @@ function buildAnimPaddedCanvas(entry) {
 // is its full bounding box + a one-tile ring. This keeps WHOLE leaves together
 // (no cut-off fragments) and gives every animation frame its real in-game leaf
 // context to upscale. Returns null if the overlay/tilemap isn't available.
-function buildAnimOverlayContext(animAddrSet) {
+// Returns a Map(mesenLayer -> context) — one per BG layer that carries animated
+// tiles. Each layer is rendered from the live VRAM snapshot (renderBgLayer) so
+// the object sits in its real in-game surroundings, whichever layer it lives on:
+// Gusty leaves + Mainbrace flag on BG1, lava on BG2, etc. (not just the special
+// BG1 fg-overlay case). Returns null if nothing is available.
+function buildAnimOverlayContexts(animEntries) {
   const bg = currentBgData;
-  if (!bg || !bg.vram || !bg.ppu || !bg.ppu.bg1) return null;
-  if (!currentFgData || currentFgData.mode !== 'bg1overlay' || !currentFgData.imgData) return null;
-  const vram = bg.vram, bg1 = bg.ppu.bg1;
-  const tilesWide = bg1.wide ? 64 : 32, tilesTall = bg1.tall ? 64 : 32;
-  const tmBase = bg1.tilemapBase * 2, chrBaseWord = bg1.chrBase;
-
-  const cells = new Map();      // "tx,ty" -> {addr(word), flipH, flipV}
-  const animCells = [];
-  for (let ty = 0; ty < tilesTall; ty++) {
-    for (let tx = 0; tx < tilesWide; tx++) {
-      let screenOffset = 0;
-      const localTx = tx & 31, localTy = ty & 31;
-      if (tx >= 32) screenOffset += 0x800;
-      if (ty >= 32) screenOffset += bg1.wide ? 0x1000 : 0x800;
-      const tmOffset = tmBase + screenOffset + (localTy * 32 + localTx) * 2;
-      if (tmOffset + 1 >= vram.length) continue;
-      const tileWord = vram[tmOffset] | (vram[tmOffset + 1] << 8);
-      const wordAddr = chrBaseWord + (tileWord & 0x03FF) * 16;  // 4bpp: 16 words/tile
-      cells.set(`${tx},${ty}`, { addr: wordAddr, flipH: !!(tileWord & 0x4000), flipV: !!(tileWord & 0x8000) });
-      if (animAddrSet.has(wordAddr)) animCells.push({ tx, ty });
-    }
+  if (!bg || !bg.vram || !bg.ppu || !currentPalette) return null;
+  const vram = bg.vram, ppu = bg.ppu;
+  const layerName = ['bg1', 'bg2', 'bg3'];
+  const addrByLayer = new Map();  // mesenLayer -> Set(wordAddr)
+  for (const e of animEntries) {
+    if (!addrByLayer.has(e.layer)) addrByLayer.set(e.layer, new Set());
+    addrByLayer.get(e.layer).add(e.addr);
   }
-  if (animCells.length === 0) return null;
 
-  // Connected components (8-connectivity) of animated cells = whole leaves.
-  const animKeys = new Set(animCells.map(c => `${c.tx},${c.ty}`));
-  const seen = new Set();
-  const regionByCell = new Map();
-  const addrToCell = new Map();
-  const leaves = [];
-  for (const start of animCells) {
-    const sk = `${start.tx},${start.ty}`;
-    if (seen.has(sk)) continue;
-    const comp = []; const stack = [start]; seen.add(sk);
-    let minX = start.tx, maxX = start.tx, minY = start.ty, maxY = start.ty;
-    while (stack.length) {
-      const c = stack.pop(); comp.push(c);
-      minX = Math.min(minX, c.tx); maxX = Math.max(maxX, c.tx);
-      minY = Math.min(minY, c.ty); maxY = Math.max(maxY, c.ty);
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        if (!dx && !dy) continue;
-        const nk = `${c.tx + dx},${c.ty + dy}`;
-        if (animKeys.has(nk) && !seen.has(nk)) { seen.add(nk); stack.push({ tx: c.tx + dx, ty: c.ty + dy }); }
+  const contexts = new Map();
+  for (const [mLayer, animAddrSet] of addrByLayer) {
+    const cfg = ppu[layerName[mLayer]];
+    if (!cfg || !cfg.enabled) continue;
+    const is4bpp = mLayer <= 1;                 // BG1/BG2 in mode 1 = 4bpp, BG3 = 2bpp
+    const wordsPerTile = is4bpp ? 16 : 8;
+    const tilesWide = cfg.wide ? 64 : 32, tilesTall = cfg.tall ? 64 : 32;
+    const tmBase = cfg.tilemapBase * 2, chrBaseWord = cfg.chrBase;
+
+    // Render this layer (frame-0 VRAM) as the context image.
+    const w = tilesWide * 8, h = tilesTall * 8;
+    const layerImg = new ImageData(w, h);
+    renderBgLayer(vram, cfg, currentPalette, is4bpp, layerImg, w, h);
+
+    const cells = new Map();      // "tx,ty" -> {addr(word), flipH, flipV}
+    const animCells = [];
+    for (let ty = 0; ty < tilesTall; ty++) {
+      for (let tx = 0; tx < tilesWide; tx++) {
+        let screenOffset = 0;
+        const localTx = tx & 31, localTy = ty & 31;
+        if (tx >= 32) screenOffset += 0x800;
+        if (ty >= 32) screenOffset += cfg.wide ? 0x1000 : 0x800;
+        const tmOffset = tmBase + screenOffset + (localTy * 32 + localTx) * 2;
+        if (tmOffset + 1 >= vram.length) continue;
+        const tileWord = vram[tmOffset] | (vram[tmOffset + 1] << 8);
+        const wordAddr = chrBaseWord + (tileWord & 0x03FF) * wordsPerTile;
+        cells.set(`${tx},${ty}`, { addr: wordAddr, flipH: !!(tileWord & 0x4000), flipV: !!(tileWord & 0x8000) });
+        if (animAddrSet.has(wordAddr)) animCells.push({ tx, ty });
       }
     }
-    const x0 = Math.max(0, minX - 1), y0 = Math.max(0, minY - 1);
-    const x1 = Math.min(tilesWide - 1, maxX + 1), y1 = Math.min(tilesTall - 1, maxY + 1);
-    const region = { x0, y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
-    leaves.push({ tiles: comp.length, w: maxX - minX + 1, h: maxY - minY + 1 });
-    for (const c of comp) {
-      const k = `${c.tx},${c.ty}`;
-      regionByCell.set(k, region);
-      const info = cells.get(k);
-      if (info && !addrToCell.has(info.addr)) addrToCell.set(info.addr, k);
-    }
-  }
+    if (animCells.length === 0) continue;
 
-  const baseCanvas = new OffscreenCanvas(currentFgData.widthPx, currentFgData.heightPx);
-  baseCanvas.getContext('2d').putImageData(currentFgData.imgData, 0, 0);
-  return { cells, regionByCell, addrToCell, baseCanvas, leaves };
+    // Connected components (8-connectivity) = whole objects (leaf / flag / bubble).
+    const animKeys = new Set(animCells.map(c => `${c.tx},${c.ty}`));
+    const seen = new Set();
+    const regionByCell = new Map();
+    const addrToCell = new Map();
+    const objects = [];
+    for (const start of animCells) {
+      const sk = `${start.tx},${start.ty}`;
+      if (seen.has(sk)) continue;
+      const comp = []; const stack = [start]; seen.add(sk);
+      let minX = start.tx, maxX = start.tx, minY = start.ty, maxY = start.ty;
+      while (stack.length) {
+        const c = stack.pop(); comp.push(c);
+        minX = Math.min(minX, c.tx); maxX = Math.max(maxX, c.tx);
+        minY = Math.min(minY, c.ty); maxY = Math.max(maxY, c.ty);
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          const nk = `${c.tx + dx},${c.ty + dy}`;
+          if (animKeys.has(nk) && !seen.has(nk)) { seen.add(nk); stack.push({ tx: c.tx + dx, ty: c.ty + dy }); }
+        }
+      }
+      const x0 = Math.max(0, minX - 1), y0 = Math.max(0, minY - 1);
+      const x1 = Math.min(tilesWide - 1, maxX + 1), y1 = Math.min(tilesTall - 1, maxY + 1);
+      const region = { x0, y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+      objects.push({ tiles: comp.length, w: maxX - minX + 1, h: maxY - minY + 1 });
+      for (const c of comp) {
+        const k = `${c.tx},${c.ty}`;
+        regionByCell.set(k, region);
+        const info = cells.get(k);
+        if (info && !addrToCell.has(info.addr)) addrToCell.set(info.addr, k);
+      }
+    }
+
+    const baseCanvas = new OffscreenCanvas(w, h);
+    baseCanvas.getContext('2d').putImageData(layerImg, 0, 0);
+    contexts.set(mLayer, { cells, regionByCell, addrToCell, baseCanvas, objects, layer: mLayer });
+  }
+  return contexts.size ? contexts : null;
 }
 
 // Render one animation frame inside its whole-leaf crop: the leaf region taken
@@ -6851,20 +6875,22 @@ async function exportCatalogAsZip() {
       if (animForGfx.length > 0) {
         btn.textContent = 'Exporting anim frames...';
         await new Promise(r => setTimeout(r, 0));
-        const animAddrSet = new Set(animForGfx.map(e => e.addr));
-        const octx = buildAnimOverlayContext(animAddrSet);
-        if (octx) {
-          const sizes = octx.leaves.map(l => `${l.w}x${l.h}(${l.tiles})`).join(' ');
-          console.log(`[animtiles] Overlay-Kontext: ${octx.leaves.length} Blätter erkannt — Größen ${sizes}`);
+        const contexts = buildAnimOverlayContexts(animForGfx);
+        if (contexts) {
+          for (const [mL, c] of contexts) {
+            const sizes = c.objects.map(o => `${o.w}x${o.h}(${o.tiles})`).join(' ');
+            console.log(`[animtiles] BG${mL + 1}: ${c.objects.length} Objekte erkannt — Größen ${sizes}`);
+          }
         } else {
-          console.warn('[animtiles] kein Overlay-Kontext (Level mit Blätter-Overlay geladen?) — Fallback: transparentes Padding pro Kachel');
+          console.warn('[animtiles] kein Layer-Kontext (Level mit den Anim-Elementen geladen?) — Fallback: transparentes Padding pro Kachel');
         }
         const animFolder = rootFolder.folder('animtiles');
         manifest.animTiles = [];
         let animExported = 0, clustered = 0;
         for (const e of animForGfx) {
           let canvas, slice = null;
-          const cl = octx ? buildAnimClusterCanvas(e, octx) : null;
+          const ectx = contexts ? contexts.get(e.layer) : null;
+          const cl = ectx ? buildAnimClusterCanvas(e, ectx) : null;
           if (cl) {
             canvas = cl.canvas;
             slice = { centerCol: cl.centerCol, centerRow: cl.centerRow, cropW: cl.cropW, cropH: cl.cropH, flipH: cl.flipH, flipV: cl.flipV };
@@ -6879,11 +6905,11 @@ async function exportCatalogAsZip() {
           manifest.animTiles.push({
             file: `animtiles/${filename}`, hash: e.hash, layer: e.layer,
             pal: e.pal, addr: e.addr.toString(16), frameCount: e.frameCount,
-            padSource: cl ? 'leaf-cluster' : 'transparent', slice
+            padSource: cl ? 'object-cluster' : 'transparent', slice
           });
           animExported++;
         }
-        console.log(`[animtiles] ${animExported} Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} exportiert (${clustered} als Blatt-Cluster, ${animExported - clustered} transparent-Fallback)`);
+        console.log(`[animtiles] ${animExported} Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} exportiert (${clustered} als Objekt-Cluster, ${animExported - clustered} transparent-Fallback)`);
       } else {
         console.log(`[animtiles] keine Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} (BG-Anim geladen? richtiges Gfxset?)`);
       }

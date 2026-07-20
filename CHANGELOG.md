@@ -1,5 +1,21 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-20d] — S6b Schritt 3+: Objekt-Cluster für ALLE Layer (nicht nur Gusty-Overlay)
+
+- **`buildAnimOverlayContext` → `buildAnimOverlayContexts`** (pro Layer): der
+  Kontext war fest auf Gustys BG1-**fg-overlay** verdrahtet, deshalb fielen
+  Mainbrace-Flagge (BG1) und Hot-Head-Lava (BG2) in den transparenten Fallback
+  und kamen zerstückelt raus. Jetzt wird die TATSÄCHLICHE Ebene der Anim-Tiles
+  (aus dem bgcap-Layer: L0→BG1, L1→BG2, L2→BG3) via `renderBgLayer` +
+  `currentPalette` frisch gerendert und darin geclustert. Ein Kontext pro Layer;
+  jeder Anim-Frame wird über `contexts.get(entry.layer)` geroutet.
+- Connected-Component erkennt so das ganze Objekt (Blatt/Flagge/Blase) auf
+  seiner echten Ebene. Diagnose-Log jetzt pro Layer: `BG1: N Objekte — Größen …`.
+- `padSource` → `object-cluster`.
+- **Hinweis dynamisches Terrain (Hot Head BG2):** die BG2-Tilemap ist teils nicht
+  statisch geladen — dort kann der Kontext dünn ausfallen (dann greift der
+  transparente Fallback; opake Lava-Tiles skalieren einzeln trotzdem ok).
+
 ## [2026-07-20c] — S6b Schritt 3: SD-Export der Anim-Frames (Blatt-Cluster)
 
 - **`exportCatalogAsZip()` exportiert die Anim-Frames des aktuellen Gfxsets** als
