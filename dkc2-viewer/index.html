@@ -7052,6 +7052,12 @@ function parseBgCap(text) {
   const byHash = new Map();      // hash16 -> entry (dedup, first wins)
   let lines = 0, bad = 0;
   const perGfxLayer = new Map(); // "G29/L1" -> count
+  // Classification tracks the RAW per-address distinct hashes (from ALL valid
+  // lines, BEFORE the global hash-dedup below). A hash shared across two
+  // addresses must count as a frame at BOTH — deduping globally first would
+  // let an earlier address "claim" it and mis-classify the other as static.
+  const addrHashSets = new Map(); // "gfx/layer/addr" -> Set(hash)
+  const hashAddrKeys = new Map(); // hash -> Set(addrKey it was seen at)
   for (const raw of text.split('\n')) {
     const line = raw.trim().toUpperCase();
     if (!line) continue;
@@ -7069,7 +7075,13 @@ function parseBgCap(text) {
     const h = fnv1a_64(bytes, 0, expBytes).toString(16).padStart(16, '0').toUpperCase();
     if (h !== m[5]) { bad++; continue; }
     lines++;
-    if (byHash.has(m[5])) continue;  // distinct tiles only
+    // Per-address tracking (raw, before dedup) for animation classification.
+    const addrKey = `${parseInt(m[1])}/${layer}/${parseInt(m[4], 16)}`;
+    if (!addrHashSets.has(addrKey)) addrHashSets.set(addrKey, new Set());
+    addrHashSets.get(addrKey).add(m[5]);
+    if (!hashAddrKeys.has(m[5])) hashAddrKeys.set(m[5], new Set());
+    hashAddrKeys.get(m[5]).add(addrKey);
+    if (byHash.has(m[5])) continue;  // distinct tiles only (export unit)
     const cgram = new Uint16Array(expColors);
     for (let i = 0; i < expColors; i++) cgram[i] = parseInt(cHex.substr(i * 4, 4), 16);
     const entry = { gfx: parseInt(m[1]), layer, pal: parseInt(m[3]),
@@ -7079,9 +7091,32 @@ function parseBgCap(text) {
     const glKey = `G${entry.gfx}/L${layer}`;
     perGfxLayer.set(glKey, (perGfxLayer.get(glKey) || 0) + 1);
   }
+
+  // Classification (S6b step 2): a CHR-DMA animation streams several distinct
+  // tiles over time through ONE VRAM address — so an (gfx,layer,addr) slot that
+  // saw >= 2 distinct hashes is an animation and each of those hashes is a
+  // frame. A slot with a single hash is a static coverage gap (a tile with no
+  // HD art yet — normal rollout, not animation-specific). No catalog lookup
+  // needed: the multiplicity is in the recorded data itself.
+  const animAddrKeys = new Set();
+  let animFrames = 0, gapAddrs = 0;
+  for (const [k, s] of addrHashSets) {
+    if (s.size >= 2) { animAddrKeys.add(k); animFrames += s.size; }
+    else gapAddrs++;
+  }
+  const animAddrs = animAddrKeys.size;
+  // Annotate each (deduped) export entry: a tile is an anim frame if ANY address
+  // it was seen at animates; frameCount = the longest such animation it is in.
+  for (const e of entries) {
+    const keys = [...hashAddrKeys.get(e.hash)];
+    e.isAnim = keys.some(k => animAddrKeys.has(k));
+    e.frameCount = Math.max(...keys.map(k => addrHashSets.get(k).size));
+  }
+
   console.log(`[bgcap] ${lines} Zeilen gelesen, ${entries.length} distinkte Tiles, ${bad} verworfen`);
+  console.log(`  → ${animFrames} ANIM-Frames auf ${animAddrs} Adressen | ${gapAddrs} statische Coverage-Lücken-Adressen`);
   for (const [k, v] of [...perGfxLayer.entries()].sort()) console.log(`  ${k}: ${v}`);
-  return { entries, byHash, lines, bad, perGfxLayer };
+  return { entries, byHash, lines, bad, perGfxLayer, animFrames, animAddrs, gapAddrs };
 }
 
 function updateHDToggleUI() {
@@ -12857,10 +12892,10 @@ document.getElementById('bgCapInput').addEventListener('change', async (e) => {
   }
   bgCapEntries = res.entries;
   const btn = document.getElementById('bgCapBtn');
-  btn.textContent = `BG-Anim ✓ ${res.entries.length}`;
+  btn.textContent = `BG-Anim ✓ ${res.animFrames}/${res.animAddrs}`;
   btn.style.background = '#2e7d32';
   const gfxCount = new Set(res.entries.map(e => e.gfx)).size;
-  btn.title = `${res.entries.length} distinkte BG-Miss-Tiles aus ${gfxCount} Gfxsets geladen (${res.bad} verworfen). Werden beim Export als Anim-Kacheln aufgelöst.`;
+  btn.title = `${res.animFrames} Anim-Frames auf ${res.animAddrs} Adressen (${gfxCount} Gfxsets) + ${res.gapAddrs} statische Coverage-Lücken-Adressen. ${res.bad} verworfen. Die Anim-Frames werden beim Export als hash-adressierte Kacheln aufgelöst.`;
 });
 document.getElementById('hdZipInput').addEventListener('change', (e) => {
   if (e.target.files.length > 0) {

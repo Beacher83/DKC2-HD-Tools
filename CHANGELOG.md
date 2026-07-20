@@ -1,5 +1,19 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-20b] — S6b Schritt 2: Anim-Frame-Klassifikation
+
+- **`parseBgCap()` klassifiziert jetzt** jede Kachel: ein CHR-DMA-Anim streamt
+  mehrere distinkte Tiles über EINE VRAM-Adresse, also ist ein
+  `(gfx,layer,addr)`-Slot mit ≥2 distinkten Hashes eine Animation (jeder Hash =
+  ein Frame), ein Slot mit einem Hash eine statische Coverage-Lücke. Jeder
+  Entry trägt `isAnim` + `frameCount`. **Kein Katalog-Lookup nötig** — die
+  Multiplizität steckt in den aufgezeichneten Daten selbst.
+- Button zeigt „BG-Anim ✓ `<frames>`/`<addrs>`", Tooltip + Console listen
+  Anim-Frames/-Adressen und statische Lücken.
+- Validiert am echten Dump: 1081 Anim-Frames auf 142 Adressen + 2544 statische
+  Lücken. G29 (Gusty) 106 Frames/17 Adressen — deckt sich mit der
+  S6a-Prognose (~90 Frames / 16 Adressen $7010-$7110).
+
 ## [2026-07-20] — S6b Schritt 1: bgcap-Ingestion (BG-Anim-Tiles, Grundlage)
 
 Erster Baustein für hash-adressierte animierte BG-Kacheln (CHR-DMA-Frames wie
