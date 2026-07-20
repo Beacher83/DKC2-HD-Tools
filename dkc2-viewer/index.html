@@ -343,6 +343,8 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <button id="catClearHDBtn" style="padding:3px 8px;background:#555;color:#ccc;border:1px solid #777;" title="Clear all loaded HD textures">Clear HD</button>
       <button id="spriteCapBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_spritecap.txt laden (Mesen-Recording der Runtime-Palette-Slots — nötig für den Sprite-Anteil des Texture-Pack-Exports)">Spritecap</button>
       <input type="file" id="spriteCapInput" accept=".txt" style="display:none">
+      <button id="bgCapBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_bgcap.txt laden (Mesen-Recording der BG-Miss-Tiles — Quelle für animierte BG-Kacheln, CHR-DMA-Frames wie Gusty-Blätter)">BG-Anim</button>
+      <input type="file" id="bgCapInput" accept=".txt" style="display:none">
       <button id="containerMgrBtn" style="padding:3px 10px;background:#9c27b0;color:#fff;border:1px solid #9c27b0;font-weight:bold;" title="HD Container verwalten — Speichern, Laden, Exportieren">Container</button>
       <input type="file" id="hdZipInput" accept=".zip" style="display:none;">
     </div>
@@ -7034,6 +7036,54 @@ function parseSpriteCap(text) {
   return { map, lines, pairs, bad };
 }
 
+// S6b: runtime BG-miss capture (snes_hd_bgcap.txt from Mesen build S6a+).
+// Each line is a DISTINCT BG tile lookup that MISSED the pack, recorded with
+// its VRAM bytes + CGRAM colors:
+//   BGA G<gfx> L<layer> P<pal> A<vramWordAddr> H<hash16> T<bytes> C<cgram>
+// 4bpp layers (L0/L1 = BG1/BG2): 32 T-bytes + 16 CGRAM colors.
+// 2bpp (L2 = BG3 in mode 1):      16 T-bytes +  4 CGRAM colors.
+// These are the source for hash-keyed BG animation tiles (CHR-DMA frames:
+// Gusty wind foliage, water/lava cycles) AND a coverage-gap map. Parsed
+// entries carry the decoded bytes so the export can rebuild + upscale the art.
+let bgCapEntries = null;   // Array<{gfx, layer, pal, addr, hash, bytes:Uint8Array, cgram:Uint16Array}>
+
+function parseBgCap(text) {
+  const entries = [];
+  const byHash = new Map();      // hash16 -> entry (dedup, first wins)
+  let lines = 0, bad = 0;
+  const perGfxLayer = new Map(); // "G29/L1" -> count
+  for (const raw of text.split('\n')) {
+    const line = raw.trim().toUpperCase();
+    if (!line) continue;
+    const m = line.match(/^BGA G(-?\d+) L(\d+) P(\d+) A([0-9A-F]+) H([0-9A-F]{16}) T([0-9A-F]+) C([0-9A-F]+)$/);
+    if (!m) { bad++; continue; }
+    const layer = parseInt(m[2]);
+    const tHex = m[6], cHex = m[7];
+    // 4bpp BG1/BG2 = 32 bytes / 16 colors; 2bpp BG3 = 16 bytes / 4 colors
+    const expBytes = layer <= 1 ? 32 : 16;
+    const expColors = layer <= 1 ? 16 : 4;
+    if (tHex.length !== expBytes * 2 || cHex.length !== expColors * 4) { bad++; continue; }
+    const bytes = new Uint8Array(expBytes);
+    for (let i = 0; i < expBytes; i++) bytes[i] = parseInt(tHex.substr(i * 2, 2), 16);
+    // Verify the recorded hash against the bytes (same FNV-1a as spritecap/Mesen)
+    const h = fnv1a_64(bytes, 0, expBytes).toString(16).padStart(16, '0').toUpperCase();
+    if (h !== m[5]) { bad++; continue; }
+    lines++;
+    if (byHash.has(m[5])) continue;  // distinct tiles only
+    const cgram = new Uint16Array(expColors);
+    for (let i = 0; i < expColors; i++) cgram[i] = parseInt(cHex.substr(i * 4, 4), 16);
+    const entry = { gfx: parseInt(m[1]), layer, pal: parseInt(m[3]),
+                    addr: parseInt(m[4], 16), hash: m[5], bytes, cgram };
+    entries.push(entry);
+    byHash.set(m[5], entry);
+    const glKey = `G${entry.gfx}/L${layer}`;
+    perGfxLayer.set(glKey, (perGfxLayer.get(glKey) || 0) + 1);
+  }
+  console.log(`[bgcap] ${lines} Zeilen gelesen, ${entries.length} distinkte Tiles, ${bad} verworfen`);
+  for (const [k, v] of [...perGfxLayer.entries()].sort()) console.log(`  ${k}: ${v}`);
+  return { entries, byHash, lines, bad, perGfxLayer };
+}
+
 function updateHDToggleUI() {
   const btn = document.getElementById('hdToggleBtn');
   const status = document.getElementById('hdStatus');
@@ -12791,6 +12841,26 @@ document.getElementById('spriteCapInput').addEventListener('change', async (e) =
   btn.textContent = `Spritecap ✓ ${res.map.size}`;
   btn.style.background = '#2e7d32';
   btn.title = `${res.map.size} Hashes / ${res.pairs} (hash,pal)-Paare geladen (${res.bad} verworfen)`;
+});
+document.getElementById('bgCapBtn').addEventListener('click', () => {
+  document.getElementById('bgCapInput').click();
+});
+document.getElementById('bgCapInput').addEventListener('change', async (e) => {
+  if (!e.target.files.length) return;
+  const file = e.target.files[0];
+  e.target.value = '';
+  const text = await file.text();
+  const res = parseBgCap(text);
+  if (res.entries.length === 0) {
+    alert('Keine gültigen BGA-Zeilen gefunden — ist das eine snes_hd_bgcap.txt aus Mesen (Build S6a+)?');
+    return;
+  }
+  bgCapEntries = res.entries;
+  const btn = document.getElementById('bgCapBtn');
+  btn.textContent = `BG-Anim ✓ ${res.entries.length}`;
+  btn.style.background = '#2e7d32';
+  const gfxCount = new Set(res.entries.map(e => e.gfx)).size;
+  btn.title = `${res.entries.length} distinkte BG-Miss-Tiles aus ${gfxCount} Gfxsets geladen (${res.bad} verworfen). Werden beim Export als Anim-Kacheln aufgelöst.`;
 });
 document.getElementById('hdZipInput').addEventListener('change', (e) => {
   if (e.target.files.length > 0) {

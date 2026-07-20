@@ -1,5 +1,31 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-20] — S6b Schritt 1: bgcap-Ingestion (BG-Anim-Tiles, Grundlage)
+
+Erster Baustein für hash-adressierte animierte BG-Kacheln (CHR-DMA-Frames wie
+Gusty-Wind-Blätter, Wasser/Lava-Zyklen). Quelle ist der Mesen-S6a-Recorder
+`snes_hd_bgcap.txt`.
+
+- **„BG-Anim"-Button** (Katalog-Toolbar, neben Spritecap): lädt
+  `snes_hd_bgcap.txt`. `parseBgCap()` parst die `BGA`-Zeilen
+  (`G<gfx> L<layer> P<pal> A<addr> H<hash16> T<bytes> C<cgram>`), verifiziert
+  jede gegen ihre eigenen Tile-Bytes per FNV-1a (4bpp L0/L1 = 32 Byte/16
+  Farben, 2bpp L2 = 16 Byte/4 Farben), dedupt auf distinkte Hashes und legt
+  pro Tile `{gfx, layer, pal, addr, hash, bytes, cgram}` in `bgCapEntries` ab.
+  Button zeigt „BG-Anim ✓ N" (grün) + Console-Breakdown pro Gfxset/Layer.
+- Verifiziert gegen echten Recorder-Dump: 7715/7715 Zeilen, 0 Hash-Fehler.
+
+**Ausstehend (nächste Schritte S6b):** (2) Klassifikation Anim-Frame vs.
+Coverage-Lücke — Basis-Tile an `addr` via `tileNum=(addr−chrBase)/16` im
+Katalog suchen, dabei BG1↔BG2-Retry nachbilden (Recorder probt exakten Key
+ohne Retry → L1-„Lücken" teils falsch-positiv). (3) SD-Export in
+`exportCatalogAsZip`: Tile aus `bytes`+`cgram` decodieren, Kontext-Padding vom
+Basis-Tile (`bestNeighborhood(basePartId)`), Dateiname
+`animtile_{hash16}_L{layer}_P{pal}.png` + Manifest-Sektion. (4) Upscale-Rückweg
+→ `exportAsTexturePack` schreibt `h{hash16}_P{pal}.png` nach
+`bg/bg{layer+1}/gfxset_XX/`. (5) Mesen-Loader `ParseTileFilename`: `h`-Präfix
++ 16 Hex → `Key.ContentHash` direkt.
+
 ## [2026-07-19d] — S5b-2: Sprite-Slicing im Pack-Export + Spritecap-Ingestion (HD-Sprite-Pipeline KOMPLETT)
 
 Der letzte Baustein der HD-Sprite-Pipeline (Mesen S3/S4 rendern bereits):
