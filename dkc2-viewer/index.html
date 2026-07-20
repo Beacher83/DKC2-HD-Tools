@@ -6356,6 +6356,143 @@ async function canvasToBlob(canvas) {
   return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
 }
 
+// S6b step 3: decode a bgcap animation frame (8x8 SNES tile from its recorded
+// VRAM bytes + CGRAM) into a 32x32 canvas (4x nearest-neighbour), same tile
+// size as the catalog's SD export.
+function decodeBgCapTileCanvas(entry) {
+  if (entry.layer > 1) return null;  // 2bpp BG3 not handled yet (none in current data)
+  const img = new ImageData(8, 8);
+  // drawTile8x8 indexes palette[c + palIndex]; the recorded cgram IS the tile's
+  // 16-colour row, so palIndex 0. Colour 0 stays transparent (context padding
+  // and the game's real backdrop fill it), matching the catalog tile convention.
+  drawTile8x8(img, entry.cgram, 0, 0, 0, entry.bytes, false, false);
+  const c8 = new OffscreenCanvas(8, 8);
+  c8.getContext('2d').putImageData(img, 0, 0);
+  const c32 = new OffscreenCanvas(32, 32);
+  const ctx = c32.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(c8, 0, 0, 32, 32);
+  return c32;
+}
+
+// Build the 96x96 (3x3) padded export tile for an animation frame — SPRITE-STYLE
+// TRANSPARENT padding: the decoded frame is placed in the centre cell, the ring
+// stays transparent. The animated leaf tiles are proven to be sparse shapes on
+// transparency (60-90% transparent, only 5% with an opaque border) and the BG1
+// overlay around them is largely empty, so mirror/real neighbours add no real
+// context — the tile is exported alone like a sprite tile. Multi-tile leaf
+// boundaries are handled exactly as sprites handle them (minor, barely visible
+// on fast-moving foliage). Same 96x96 layout as the static tiles so the pack
+// step (exportAsTexturePack) slices the centre back identically.
+function buildAnimPaddedCanvas(entry) {
+  const tile32 = decodeBgCapTileCanvas(entry);
+  if (!tile32) return null;
+  const pad = new OffscreenCanvas(96, 96);
+  const ctx = pad.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tile32, 32, 32);  // centre cell only; ring transparent
+  return pad;
+}
+
+// S6b step 3 (leaf clustering): read the live BG1 overlay tilemap to find where
+// each animated VRAM address sits, group spatially-adjacent animated cells into
+// connected components (= one whole leaf), and give each leaf a crop region that
+// is its full bounding box + a one-tile ring. This keeps WHOLE leaves together
+// (no cut-off fragments) and gives every animation frame its real in-game leaf
+// context to upscale. Returns null if the overlay/tilemap isn't available.
+function buildAnimOverlayContext(animAddrSet) {
+  const bg = currentBgData;
+  if (!bg || !bg.vram || !bg.ppu || !bg.ppu.bg1) return null;
+  if (!currentFgData || currentFgData.mode !== 'bg1overlay' || !currentFgData.imgData) return null;
+  const vram = bg.vram, bg1 = bg.ppu.bg1;
+  const tilesWide = bg1.wide ? 64 : 32, tilesTall = bg1.tall ? 64 : 32;
+  const tmBase = bg1.tilemapBase * 2, chrBaseWord = bg1.chrBase;
+
+  const cells = new Map();      // "tx,ty" -> {addr(word), flipH, flipV}
+  const animCells = [];
+  for (let ty = 0; ty < tilesTall; ty++) {
+    for (let tx = 0; tx < tilesWide; tx++) {
+      let screenOffset = 0;
+      const localTx = tx & 31, localTy = ty & 31;
+      if (tx >= 32) screenOffset += 0x800;
+      if (ty >= 32) screenOffset += bg1.wide ? 0x1000 : 0x800;
+      const tmOffset = tmBase + screenOffset + (localTy * 32 + localTx) * 2;
+      if (tmOffset + 1 >= vram.length) continue;
+      const tileWord = vram[tmOffset] | (vram[tmOffset + 1] << 8);
+      const wordAddr = chrBaseWord + (tileWord & 0x03FF) * 16;  // 4bpp: 16 words/tile
+      cells.set(`${tx},${ty}`, { addr: wordAddr, flipH: !!(tileWord & 0x4000), flipV: !!(tileWord & 0x8000) });
+      if (animAddrSet.has(wordAddr)) animCells.push({ tx, ty });
+    }
+  }
+  if (animCells.length === 0) return null;
+
+  // Connected components (8-connectivity) of animated cells = whole leaves.
+  const animKeys = new Set(animCells.map(c => `${c.tx},${c.ty}`));
+  const seen = new Set();
+  const regionByCell = new Map();
+  const addrToCell = new Map();
+  const leaves = [];
+  for (const start of animCells) {
+    const sk = `${start.tx},${start.ty}`;
+    if (seen.has(sk)) continue;
+    const comp = []; const stack = [start]; seen.add(sk);
+    let minX = start.tx, maxX = start.tx, minY = start.ty, maxY = start.ty;
+    while (stack.length) {
+      const c = stack.pop(); comp.push(c);
+      minX = Math.min(minX, c.tx); maxX = Math.max(maxX, c.tx);
+      minY = Math.min(minY, c.ty); maxY = Math.max(maxY, c.ty);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nk = `${c.tx + dx},${c.ty + dy}`;
+        if (animKeys.has(nk) && !seen.has(nk)) { seen.add(nk); stack.push({ tx: c.tx + dx, ty: c.ty + dy }); }
+      }
+    }
+    const x0 = Math.max(0, minX - 1), y0 = Math.max(0, minY - 1);
+    const x1 = Math.min(tilesWide - 1, maxX + 1), y1 = Math.min(tilesTall - 1, maxY + 1);
+    const region = { x0, y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+    leaves.push({ tiles: comp.length, w: maxX - minX + 1, h: maxY - minY + 1 });
+    for (const c of comp) {
+      const k = `${c.tx},${c.ty}`;
+      regionByCell.set(k, region);
+      const info = cells.get(k);
+      if (info && !addrToCell.has(info.addr)) addrToCell.set(info.addr, k);
+    }
+  }
+
+  const baseCanvas = new OffscreenCanvas(currentFgData.widthPx, currentFgData.heightPx);
+  baseCanvas.getContext('2d').putImageData(currentFgData.imgData, 0, 0);
+  return { cells, regionByCell, addrToCell, baseCanvas, leaves };
+}
+
+// Render one animation frame inside its whole-leaf crop: the leaf region taken
+// from the base overlay (real neighbouring leaf parts, frame 0) with the
+// animated centre cell overdrawn with THIS frame (kept in its in-game flip so
+// the leaf reads coherently). Returns { canvas, centerCol, centerRow, cropW,
+// cropH, flipH, flipV } or null. The pack step slices the centre back and
+// un-flips per the recorded flip to the canonical hash orientation.
+function buildAnimClusterCanvas(entry, ctx) {
+  const cellKey = ctx.addrToCell.get(entry.addr);
+  if (!cellKey) return null;
+  const region = ctx.regionByCell.get(cellKey);
+  const [tx, ty] = cellKey.split(',').map(Number);
+  const info = ctx.cells.get(cellKey);
+  const S = 4;
+  const cw = region.w * 8 * S, ch = region.h * 8 * S;
+  const out = new OffscreenCanvas(cw, ch);
+  const octx = out.getContext('2d');
+  octx.imageSmoothingEnabled = false;
+  octx.drawImage(ctx.baseCanvas, region.x0 * 8, region.y0 * 8, region.w * 8, region.h * 8, 0, 0, cw, ch);
+  const frameImg = new ImageData(8, 8);
+  drawTile8x8(frameImg, entry.cgram, 0, 0, 0, entry.bytes, info.flipH, info.flipV);
+  const f8 = new OffscreenCanvas(8, 8);
+  f8.getContext('2d').putImageData(frameImg, 0, 0);
+  const cx = (tx - region.x0) * 8 * S, cy = (ty - region.y0) * 8 * S;
+  octx.clearRect(cx, cy, 8 * S, 8 * S);
+  octx.drawImage(f8, 0, 0, 8, 8, cx, cy, 8 * S, 8 * S);
+  return { canvas: out, centerCol: tx - region.x0, centerRow: ty - region.y0,
+           cropW: region.w, cropH: region.h, flipH: info.flipH, flipV: info.flipV };
+}
+
 async function exportCatalogAsZip() {
   if (!catalogData) { alert('No catalog data. Load a level and switch to catalog view first.'); return; }
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded. Check internet connection.'); return; }
@@ -6699,6 +6836,56 @@ async function exportCatalogAsZip() {
       if (exported % 50 === 0) {
         btn.textContent = `Exporting... ${Math.round(exported / totalItems * 100)}%`;
         await new Promise(r => setTimeout(r, 0));
+      }
+    }
+
+    // === Step 4b (S6b): Export BG animation frames for THIS gfxset ===
+    // The animated CHR-DMA frames (Gusty wind foliage etc.) are tiny per-tile
+    // fragments — useless upscaled in isolation. So each frame is rendered inside
+    // its WHOLE-LEAF crop (connected animated cells + real neighbouring leaf
+    // parts from the live overlay), exported for a coherent upscale, and the
+    // manifest records where to slice the centre tile back to h<hash>_P<pal>.png.
+    // Falls back to transparent per-tile padding if the overlay isn't available.
+    if (bgCapEntries && catalogData.gfxSetIndex !== undefined) {
+      const animForGfx = bgCapEntries.filter(e => e.isAnim && e.gfx === catalogData.gfxSetIndex && e.layer <= 1);
+      if (animForGfx.length > 0) {
+        btn.textContent = 'Exporting anim frames...';
+        await new Promise(r => setTimeout(r, 0));
+        const animAddrSet = new Set(animForGfx.map(e => e.addr));
+        const octx = buildAnimOverlayContext(animAddrSet);
+        if (octx) {
+          const sizes = octx.leaves.map(l => `${l.w}x${l.h}(${l.tiles})`).join(' ');
+          console.log(`[animtiles] Overlay-Kontext: ${octx.leaves.length} Blätter erkannt — Größen ${sizes}`);
+        } else {
+          console.warn('[animtiles] kein Overlay-Kontext (Level mit Blätter-Overlay geladen?) — Fallback: transparentes Padding pro Kachel');
+        }
+        const animFolder = rootFolder.folder('animtiles');
+        manifest.animTiles = [];
+        let animExported = 0, clustered = 0;
+        for (const e of animForGfx) {
+          let canvas, slice = null;
+          const cl = octx ? buildAnimClusterCanvas(e, octx) : null;
+          if (cl) {
+            canvas = cl.canvas;
+            slice = { centerCol: cl.centerCol, centerRow: cl.centerRow, cropW: cl.cropW, cropH: cl.cropH, flipH: cl.flipH, flipV: cl.flipV };
+            clustered++;
+          } else {
+            canvas = buildAnimPaddedCanvas(e);
+            if (canvas) slice = { centerCol: 1, centerRow: 1, cropW: 3, cropH: 3, flipH: false, flipV: false };
+          }
+          if (!canvas) continue;
+          const filename = `animtile_${e.hash}_L${e.layer}_P${e.pal}.png`;
+          animFolder.file(filename, await canvasToBlob(canvas));
+          manifest.animTiles.push({
+            file: `animtiles/${filename}`, hash: e.hash, layer: e.layer,
+            pal: e.pal, addr: e.addr.toString(16), frameCount: e.frameCount,
+            padSource: cl ? 'leaf-cluster' : 'transparent', slice
+          });
+          animExported++;
+        }
+        console.log(`[animtiles] ${animExported} Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} exportiert (${clustered} als Blatt-Cluster, ${animExported - clustered} transparent-Fallback)`);
+      } else {
+        console.log(`[animtiles] keine Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} (BG-Anim geladen? richtiges Gfxset?)`);
       }
     }
 

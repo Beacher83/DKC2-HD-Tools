@@ -1,5 +1,33 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-20c] — S6b Schritt 3: SD-Export der Anim-Frames (Blatt-Cluster)
+
+- **`exportCatalogAsZip()` exportiert die Anim-Frames des aktuellen Gfxsets** als
+  ganze Blätter. Jeder Frame wird aus Bytes+CGRAM dekodiert (`drawTile8x8`),
+  aber NICHT einzeln: einzelne 8×8-Kacheln sind winzige Fragmente (Gusty-Anims
+  Ø 12 opake Pixel/64, teils ≤3) und für den Upscaler unbrauchbar. Stattdessen:
+  - **`buildAnimOverlayContext()`** liest das LIVE BG1-Overlay-Tilemap
+    (`currentBgData.vram` + `ppu.bg1`), findet die animierten Zellen und
+    gruppiert räumlich zusammenhängende per Connected-Component (8er-Nachbar-
+    schaft) zu **ganzen Blättern** (keine Schnittabfälle). Diagnose-Log:
+    Blätter-Anzahl + Größen.
+  - **`buildAnimClusterCanvas()`** rendert jeden Frame IN seinem Blatt-Crop
+    (Bounding-Box + 1 Ring) aus dem echten Overlay-Bild (`currentFgData`) —
+    die Nachbar-Blattteile geben dem Upscaler Kontext; die Mitte trägt die
+    aktuelle Frame-Variante (in In-Game-Flip).
+  - Manifest `animTiles[]` trägt `slice{centerCol,centerRow,cropW,cropH,
+    flipH,flipV}` → Schritt 4 schneidet die Mitte hash-keyed zurück und
+    un-flippt zur kanonischen Hash-Orientierung.
+  - Fallback: transparentes Padding pro Kachel (`buildAnimPaddedCanvas`), falls
+    kein Overlay-Kontext (Level ohne Blätter-Overlay geladen).
+- Dateiname `animtile_{hash16}_L{layer}_P{pal}.png`, Ordner `animtiles/`.
+- **Kontext:** Erster Versuch Self-Mirror, dann Sprite-Stil (transparent) —
+  beide verworfen: einzelne Fragmente reichen nicht (User-Test). Blätter müssen
+  als zusammenhängende Einheit hochskaliert werden.
+- **Ausstehend:** Schritt 4 (`exportAsTexturePack` → `h{hash16}_P{pal}.png`,
+  Mitte aus Cluster schneiden+un-flippen), Schritt 5 (Mesen `h`-Präfix). 2bpp
+  BG3 später.
+
 ## [2026-07-20b] — S6b Schritt 2: Anim-Frame-Klassifikation
 
 - **`parseBgCap()` klassifiziert jetzt** jede Kachel: ein CHR-DMA-Anim streamt
