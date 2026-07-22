@@ -1,5 +1,44 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-22d] — S6b Schritt 4: Anim-Sheets importieren, persistieren und ins Pack exportieren
+
+Bis hierher gab es `animTiles` **nur auf der Export-Seite** — `importHDPack` las den
+Schlüssel nirgends, hochskalierte `animtiles/`-PNGs wurden also kommentarlos ignoriert.
+
+- **4a Import (`importHDPack`):** liest `manifest.animTiles[].slices[]`, schneidet
+  **jede** Zelle aus dem hochskalierten Objekt-Sheet und legt sie unter
+  `hash_P{pal}` in `hdPack.animTiles` ab.
+  - **Skalierung wird pro Sheet GEMESSEN, nicht angenommen** (`src = img.width /
+    cropW`). Grund: der SD-Export rendert Sheets bereits mit `S = 4`
+    (`buildAnimObjectSheet`), ein 4×-Upscale landet also bei **16× nativ**, während
+    der statische Tile-Pfad bei 4× landet. Messen statt Annehmen hält beide
+    Konventionen — und einen späteren nativen Export — ohne Format-Flag lauffähig.
+  - **Un-Flip:** Sheets zeichnen Zellen in ihrer In-Game-Orientierung, damit das
+    Objekt kohärent liest. Spiegeln ist eine Involution, also stellt dasselbe Flip
+    erneut angewandt die kanonische Form her, die Mesen hasht.
+  - Zielgröße `8 * scaleFactor` = 32 px, identisch zum Sprite-Pfad.
+- **Container-Persistenz:** `animTiles` werden im Set-Record gespeichert, nach dem
+  Speichern aus `hdPack` freigegeben (sie sind hash-keyed und tragen KEIN
+  Gfxset-Präfix, könnten also nicht wie `tiles` gefiltert werden — ohne Freigabe
+  würde der nächste Set-Save sie mitkopieren) und von `ensureGfxSetHDLoaded()`
+  wieder geladen.
+- **4b Pack-Export (`exportAsTexturePack`):** schreibt `h{hash16}_P{pal}.png` nach
+  `bg/bg{layer+1}/gfxset_XX/`. Bewusst **nicht** über die `vramAddr`-Benennung: eine
+  Animation schickt mehrere verschiedene Kacheln durch DIESELBE Adresse, die Adresse
+  kann die Art also nicht identifizieren. Das `h`-Präfix sagt dem Mesen-Loader, die
+  16 Hex-Ziffern direkt als Content-Hash zu lesen (Prinzip wie
+  `sprites/{hash}_P{pal}.png`). Zähler `total_anim_tiles` im Manifest.
+- **Verifikation gegen echte Daten** (Users 4×-Upscale von gfxset 0x20, 71 Sheets):
+  136 zufällige Slices geschnitten, auf 8×8 heruntergerechnet und gegen die aus
+  `snes_hd_bgcap.txt` decodierten nativen Bytes+CGRAM verglichen — **mittlere
+  Kanalabweichung 1,8/255, alle 136 unter 25.** `col`/`row`/`src`-Ableitung stimmen.
+  Einschränkung: in diesem Datensatz sind **alle** Slices ungeflippt, der Un-Flip-Pfad
+  ist also nur logisch begründet, nicht durch Daten belegt.
+- **NOCH OFFEN — Schritt 5 (Mesen):** `ParseTileFilename` in `SnesHdPackLoader.cpp`
+  braucht den `h`-Präfix-Zweig (16 Hex → `Key.ContentHash` direkt, analog
+  `ParseSpriteFilename`, Layer aus dem Ordner). **Bis dahin liegen die Anim-PNGs zwar
+  im Pack, werden von Mesen aber nicht geladen.**
+
 ## [2026-07-22c] — S6b: Objekt-Set-Cover über alle Layer statt pro Layer
 
 - **Problem (User-Test, Hot Head 0x20):** 113 PNGs, davon sichtbar unsaubere/doppelte.

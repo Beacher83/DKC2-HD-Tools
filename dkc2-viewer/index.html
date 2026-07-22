@@ -7585,7 +7585,7 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
     await new Promise(r => setTimeout(r, 0));
 
     if (!hdPack) {
-      hdPack = { scaleFactor: 1, gfxSetIndex: null, tiles: new Map(), clusters: [], bg2: null, bg3: null, sprites: new Map() };
+      hdPack = { scaleFactor: 1, gfxSetIndex: null, tiles: new Map(), clusters: [], bg2: null, bg3: null, sprites: new Map(), animTiles: new Map() };
     }
     if (!hdPack.sprites) hdPack.sprites = new Map();
 
@@ -7924,6 +7924,7 @@ async function importHDPack(file) {
         bg2: null,
         bg3: null,
         sprites: new Map(),
+        animTiles: new Map(),
       };
     }
     // Track which gfxset this import belongs to — updated on EVERY import, not just
@@ -7954,6 +7955,55 @@ async function importHDPack(file) {
       }
     }
 
+    // === S6b step 4a: anim object sheets -> one HD cell per content hash ===
+    // Each sheet is one animation phase of a whole object; manifest.animTiles[].slices[]
+    // says which 8x8 cell inside it carries which content hash. Cut every slice out and
+    // un-flip it back to the canonical hash orientation (the sheet draws cells in their
+    // in-game flip so the object reads coherently; flipping is an involution, so
+    // re-applying the same flip restores the canonical form Mesen hashes).
+    let animNew = 0, animDup = 0, animSheets = 0;
+    if (Array.isArray(manifest.animTiles) && manifest.animTiles.length) {
+      btn.textContent = 'Loading anim tiles...';
+      await new Promise(r => setTimeout(r, 0));
+      if (!hdPack.animTiles) hdPack.animTiles = new Map();
+      const dst = 8 * scaleFactor;   // pack cell size: 32px at 4x, same as sprites
+      for (const sheet of manifest.animTiles) {
+        if (!sheet.file || !Array.isArray(sheet.slices) || !sheet.cropW) continue;
+        const img = await loadImage(sheet.file);
+        if (!img) continue;
+        animSheets++;
+        // Derive the sheet's scale from the image instead of assuming it. The SD
+        // export already renders sheets at 4x (S=4 in buildAnimObjectSheet), so a 4x
+        // upscale lands at 16x native, whereas the static tile path lands at 4x.
+        // Measuring per sheet keeps both conventions — and any future native-res
+        // export — working without a format flag.
+        const src = img.width / sheet.cropW;   // one 8x8 cell in the HD sheet
+        for (const s of sheet.slices) {
+          const key = `${String(s.hash).toUpperCase()}_P${s.pal}`;
+          if (hdPack.animTiles.has(key)) { animDup++; continue; }
+          const sx = s.col * src, sy = s.row * src;
+          if (sx < 0 || sy < 0 || sx + src > img.width + 0.5 || sy + src > img.height + 0.5) continue;
+          const c = new OffscreenCanvas(dst, dst);
+          const cx = c.getContext('2d');
+          cx.imageSmoothingEnabled = true;   // src is usually larger than dst
+          if (s.flipH || s.flipV) {
+            cx.translate(s.flipH ? dst : 0, s.flipV ? dst : 0);
+            cx.scale(s.flipH ? -1 : 1, s.flipV ? -1 : 1);
+          }
+          cx.drawImage(img, sx, sy, src, src, 0, 0, dst, dst);
+          hdPack.animTiles.set(key, {
+            bitmap: await createImageBitmap(c),
+            hash: String(s.hash).toUpperCase(), pal: s.pal,
+            layer: s.layer != null ? s.layer : sheet.layer,
+          });
+          animNew++;
+        }
+        img.close();
+      }
+      console.log(`[animtiles] Import: ${animSheets} Sheets → ${animNew} HD-Kacheln (${animDup} Duplikate übersprungen), ` +
+                  `Zellgröße ${dst}px`);
+    }
+
     // BG2/BG3: overwrite if present in this pack
     if (hdBg2) { hdPack.bg2 = hdBg2; hdPack.bg2GfxSet = manifest.gfxSetIndex; }
     if (hdBg3) { hdPack.bg3 = hdBg3; hdPack.bg3GfxSet = manifest.gfxSetIndex; }
@@ -7972,9 +8022,10 @@ async function importHDPack(file) {
     if (catalogView) renderCatalog();
 
     const sizeMB = (file.size / 1024 / 1024).toFixed(1);
-    const mergeInfo = isFirstImport
+    const animInfo = animNew > 0 ? `, ${animNew} anim tiles` : '';
+    const mergeInfo = (isFirstImport
       ? `${hdPack.tiles.size} tiles, ${hdPack.clusters.length} clusters`
-      : `+${newTiles} tiles (${updatedTiles} updated), +${newClusters} clusters${hdBg2 ? ', BG2' : ''}${hdBg3 ? ', BG3' : ''}`;
+      : `+${newTiles} tiles (${updatedTiles} updated), +${newClusters} clusters${hdBg2 ? ', BG2' : ''}${hdBg3 ? ', BG3' : ''}`) + animInfo;
     btn.textContent = `Merged! (${mergeInfo})`;
     console.log(`HD Pack merged: ${scaleFactor}x | ${mergeInfo} | ${sizeMB} MB`);
     setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
@@ -8207,6 +8258,16 @@ async function saveCurrentHDToContainer(containerName) {
   if (skippedForeignTiles > 0) {
     console.log(`[save] Filtered out ${skippedForeignTiles} tiles from other gfxsets (keeping only gfxset ${currentGfxIdx})`);
   }
+
+  // S6b anim tiles. Unlike hdPack.tiles these are keyed by CONTENT HASH, which is
+  // gfxset-independent by design — the whole point of the hash-addressed format. They
+  // are still stored per gfxset set-record (that is the container's unit of storage),
+  // so all of them go with whichever set is being saved.
+  const animTiles = [];
+  for (const [key, a] of (hdPack.animTiles || new Map())) {
+    animTiles.push({ key, hash: a.hash, pal: a.pal, layer: a.layer, blob: await bitmapToBlob(a.bitmap) });
+  }
+
   let bg2Blob = null, bg3Blob = null, wallBlob = null;
   if (hdPack.bg2) bg2Blob = await bitmapToBlob(hdPack.bg2);
   if (hdPack.bg3) bg3Blob = await bitmapToBlob(hdPack.bg3);
@@ -8505,6 +8566,7 @@ async function saveCurrentHDToContainer(containerName) {
     scaleFactor: hdPack.scaleFactor,
     tileCount: tiles.length,
     tiles, clusters, bg2Blob, bg3Blob, wallBlob, cmFgBlob,
+    animTiles,
     tileArrangementData: tileArrangementData ? Array.from(tileArrangementData) : null,
     tileArrangementTileCount: currentTileRawData ? currentTileRawData.tileCount : 0,
     gfxCount,
@@ -8559,6 +8621,14 @@ async function saveCurrentHDToContainer(containerName) {
     if (hdPack.bg3GfxSet === activeGfxIdx) { hdPack.bg3?.close(); hdPack.bg3 = null; hdPack.bg3GfxSet = null; }
     if (hdPack.wallGfxSet === activeGfxIdx) { hdPack.wall?.close(); hdPack.wall = null; hdPack.wallGfxSet = null; }
     if (hdPack.cmFgGfxSet === activeGfxIdx) { hdPack.cmFg?.close(); hdPack.cmFg = null; hdPack.cmFgGfxSet = null; }
+    // Anim tiles were just written into this set's record; drop them so the NEXT
+    // gfxset's save doesn't copy this set's tiles into its record too (they are
+    // hash-keyed and carry no gfxset prefix, so they cannot be filtered like tiles).
+    // ensureGfxSetHDLoaded() restores them per set on demand.
+    if (hdPack.animTiles) {
+      for (const a of hdPack.animTiles.values()) a.bitmap?.close?.();
+      hdPack.animTiles.clear();
+    }
     // Must also clear hdPack.gfxSetIndex — ensureGfxSetHDLoaded() uses it as its
     // "already active, nothing to do" check. Leaving it pointed at the just-freed
     // gfxset would make that check pass while tiles/bg2/bg3 are actually empty,
@@ -8645,7 +8715,7 @@ async function loadContainerToHDPack(containerName) {
     return;
   }
 
-  hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, cmFg: null, gfxSetIndex: null, sprites: new Map() };
+  hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, cmFg: null, gfxSetIndex: null, sprites: new Map(), animTiles: new Map() };
 
   let totalTiles = 0;
   for (const set of levelSets) {
@@ -8750,7 +8820,7 @@ async function ensureGfxSetHDLoaded(gfxIdx) {
   const set = sets.find(s => s.type === 'level' && s.setId === setId);
   if (!set) return; // nothing saved for this gfxset yet
 
-  if (!hdPack) hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, cmFg: null, gfxSetIndex: null, sprites: new Map() };
+  if (!hdPack) hdPack = { scaleFactor: 1, tiles: new Map(), clusters: [], bg2: null, bg3: null, cmFg: null, gfxSetIndex: null, sprites: new Map(), animTiles: new Map() };
   if (set.scaleFactor) hdPack.scaleFactor = set.scaleFactor;
   hdPack.gfxSetIndex = set.gfxSetIndex;
 
@@ -8782,12 +8852,22 @@ async function ensureGfxSetHDLoaded(gfxIdx) {
   for (const c of (set.clusters || [])) {
     hdPack.clusters.push({ ids: c.ids, flips: c.flips || [], w: c.w, h: c.h, image: await createImageBitmap(c.blob) });
   }
+  // Anim tiles are swapped wholesale like bg2/bg3, not merged: they were freed on the
+  // last save, and each set record holds exactly the ones imported for that gfxset.
+  if (hdPack.animTiles) {
+    for (const a of hdPack.animTiles.values()) a.bitmap?.close?.();
+    hdPack.animTiles.clear();
+  } else hdPack.animTiles = new Map();
+  for (const a of (set.animTiles || [])) {
+    hdPack.animTiles.set(a.key, { bitmap: await createImageBitmap(a.blob), hash: a.hash, pal: a.pal, layer: a.layer });
+  }
 
   hdEnabled = true;
   updateHDToggleUI();
   redraw();
   if (catalogView) renderCatalog();
-  console.log(`[HD auto-load] gfxset 0x${gfxIdx.toString(16)}: ${loadedTiles} tiles loaded on demand from "${activeContainerName}"`);
+  console.log(`[HD auto-load] gfxset 0x${gfxIdx.toString(16)}: ${loadedTiles} tiles` +
+              `${hdPack.animTiles.size ? `, ${hdPack.animTiles.size} anim tiles` : ''} loaded on demand from "${activeContainerName}"`);
 }
 
 // --- Export container as ZIP ---
@@ -9138,6 +9218,8 @@ async function exportAsTexturePack(containerName) {
   const subtileSize = 8 * scale;  // 32px per HD sub-tile
   let exportedTiles = 0;
   let bg1PaletteVariants = 0;  // count of extra tiles added by ROM palette scan
+  let animExportedTiles = 0;
+  const animExportedKeys = new Set();  // "h{hash}_P{pal}" — global, hashes are gfxset-independent
   // R3 palette auto-detect: per gfxset, samples of (palRow, native CHR indices,
   // downscaled HD pixels). Every candidate level palette is scored against
   // these — the reference no longer depends on which level the user happens to
@@ -9647,6 +9729,22 @@ async function exportAsTexturePack(containerName) {
           }
         }
       }
+    }
+
+    // --- S6b step 4b: CHR-animation frames, keyed by content hash ---
+    // These deliberately do NOT go through the vramAddr naming above: an animation
+    // streams several different tiles through the SAME address, so the address cannot
+    // identify the art. The "h" prefix tells Mesen's loader to read the 16 hex digits
+    // as a content hash directly (same idea as sprites/{hash}_P{pal}.png). The gfxset
+    // folder still scopes them, and the layer picks bg1 vs bg2.
+    for (const a of (set.animTiles || [])) {
+      const layer = a.layer != null ? a.layer : 0;
+      const folder = root.folder(`bg/bg${layer + 1}/gfxset_${gfxIdStr}`);
+      const fileKey = `h${String(a.hash).toUpperCase()}_P${String(a.pal).padStart(2, '0')}`;
+      if (animExportedKeys.has(fileKey)) continue;
+      animExportedKeys.add(fileKey);
+      folder.file(`${fileKey}.png`, a.blob);
+      animExportedTiles++;
     }
   }
 
@@ -10630,6 +10728,7 @@ async function exportAsTexturePack(containerName) {
     total_bg3_tiles: bg3ExportedTiles,
     total_cmfg_tiles: cmFgExportedTiles,
     total_sprite_tiles: spriteExportedTiles,
+    total_anim_tiles: animExportedTiles,
     has_fingerprints: fpEntries && fpEntries.size > 0,
     has_palettes: palSetCount > 0,
     notes: `Exported from DKC2 Viewer container "${containerName}"`
@@ -10657,8 +10756,10 @@ async function exportAsTexturePack(containerName) {
   const palMsg = bg1PaletteVariants > 0
     ? `\n(davon ${bg1PaletteVariants} Palette-Varianten via ROM-Scan)` : '';
   const sprMsg = spriteExportedTiles > 0 ? `\n${spriteExportedTiles} HD-Sprite-Tiles (hash-keyed)` : '';
-  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${bg2Msg}${wallMsg}${bg3Msg}${cmFgMsg}${sprMsg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
-  return { exportedTiles, bg2ExportedTiles, wallExportedTiles, bg3ExportedTiles, cmFgExportedTiles, sets: setsWithArrangement.length };
+  const animMsg = animExportedTiles > 0 ? `\n${animExportedTiles} HD-Anim-Tiles (hash-keyed, h-Präfix)` : '';
+  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${bg2Msg}${wallMsg}${bg3Msg}${cmFgMsg}${sprMsg}${animMsg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
+  if (animExportedTiles > 0) console.log(`[animtiles] ${animExportedTiles} Anim-Tile-PNGs als h{hash}_P{pal}.png exportiert`);
+  return { exportedTiles, bg2ExportedTiles, wallExportedTiles, bg3ExportedTiles, cmFgExportedTiles, animExportedTiles, sets: setsWithArrangement.length };
 
   } catch(err) {
     console.error('[Mesen2 Export] Fehler:', err);
