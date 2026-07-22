@@ -1,5 +1,104 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-22b] — S6b: ein Sheet pro (Objekt, Phase) statt pro (Zelle, Frame) — 197 PNGs → 7
+
+- **Problem (User-Test):** Der Terrain-Fix lieferte zwar korrekte Objekte (Mainbrace-
+  Flagge komplett, Hot-Head-Blasen komplett), aber absurd viele PNGs: 197 für
+  Mainbrace (6 erkannte Objekte!), 510 für Hot Head. Viele davon optisch identisch.
+- **Root Cause:** `buildAnimClusterCanvas` erzeugte **ein PNG pro (Adresse, Hash)**:
+  es rendert das *ganze* Objekt und tauscht darin **genau eine einzige 8×8-Zelle**
+  gegen den Frame. Mainbrace = 30 Anim-Zellen × ~7 Phasen = 197 fast identische
+  Flaggenbilder, die sich in je einer Kachel unterscheiden. Gemessen an den bgcap-
+  Daten: G37/L0 hat 30 lückenlose Adressen `$2010`–`$21E0` (= die 6×5-Flagge) mit
+  max. **7 distinkten Hashes je Adresse** — die Animation hat also **7 Phasen**.
+- **Fix 1 — Phasen-Bündelung (`buildAnimObjectSheet`):** ein Sheet pro
+  (Objekt, Phase), in dem **alle** Anim-Zellen gleichzeitig auf dieser Phase stehen.
+  Zellen mit kürzerem Zyklus wiederholen sich (`phase % len`). Das Manifest trägt
+  jetzt `slices[]` (ein Eintrag je Zelle mit `hash/pal/layer/addr/col/row/flip`)
+  statt eines einzelnen `slice`. Nebeneffekt: der Upscaler sieht eine **echte**
+  Animationsphase statt Phase 0 mit einer ausgetauschten Kachel.
+- **Fix 2 — Objekt-Set-Cover (`selectAnimObjects`):** dasselbe Objekt kommt im Level
+  mehrfach vor (Flagge 6×, Lava-Pools 125×/152×) und liefert byte-identische Sheets.
+  Greedy: ein Objekt wird nur behalten, solange es eine noch nicht abgedeckte
+  Adresse beiträgt. Log meldet die übersprungenen Wiederholungen.
+- **Fix 3 — Frames pro ADRESSE, nicht pro (Layer, Adresse):** BG1 und BG2 teilen sich
+  in manchen Leveln dasselbe CHR-Fenster (Hot Head: `$2010`–`$2190` auf L0 **und**
+  L1, mit weitgehend identischen Hashes), und `parseBgCap` ordnet einen Hash dem
+  zuerst gesehenen Layer zu. Eine Gruppierung pro Layer hätte eine Animation
+  zerrissen; jetzt entscheidet allein die Adresse.
+- **Nicht abgedeckte Hashes** (kein Kontext / Adresse außerhalb jedes Objekts) bekommen
+  weiter ihre Einzelkachel mit transparentem Rand, damit kein Hash verloren geht.
+- **Aufgeräumt:** `regionByCell`/`addrToCell` entfallen — die Objekte tragen ihre
+  Region und Zellen jetzt selbst. `buildAnimClusterCanvas` ist ersetzt.
+- **Befund, NICHT gefixt (Datenlage, kein Bug):** einzelne Frames zeigen fremde,
+  schriftartige Kacheln im Lava-Kontext. Decodierung ist korrekt (valides 4bpp,
+  Recorder-Re-Hash bestätigt): 26 Kacheln mit identischen oberen 3 Zeilen auf den
+  zusammenhängenden Adressen `$20D0`–`$2260`, in einem engen Aufzeichnungsfenster —
+  eine **andere Szene**, die dasselbe VRAM-Animationsfenster nachnutzt. Die Kacheln
+  sind real und brauchen HD-Art, nur ihr Kontext im Sheet stimmt nicht. Automatische
+  Aussortierung verworfen: der getestete Medoid-Ähnlichkeitsfilter markierte auch
+  57 von 198 **legitimen** Mainbrace-Flaggen-Frames (die Flagge weht stark).
+- **Test-Ergebnis (User, 2026-07-22):** Mainbrace 197 → **7 PNGs**, Flagge sauber
+  und als Animation erkennbar. Gusty Glade **39 PNGs**, weiter über den
+  `vram-tilemap`-Pfad, keine Regression. Rambi sauber. Hot Head 510 → **113 PNGs**.
+- **OFFEN / bewusst akzeptiert — Hot Head (gfxset 0x20) ist noch nicht sauber:**
+  113 PNGs sind zwar 4,5× weniger, aber immer noch viel für eine Lava-Animation,
+  und ein Teil der Sheets sieht laut User weiterhin unsauber aus. Wir gehen erst mal
+  damit weiter (Upscale-Test hat Vorrang). Zwei bekannte Treiber, noch nicht getrennt:
+  (a) die oben beschriebenen **szenenfremden Kacheln** in `$20D0`–`$2260`, die im
+  Lava-Kontext gerendert werden; (b) Hot Heads Objekte sind **klein und zahlreich**
+  (3×2 und 5×3 Zellen, 125 auf BG1 / 152 auf BG2 vor dem Set-Cover), d.h. die
+  55 Anim-Adressen verteilen sich auf viele kleine Komponenten statt auf ein großes
+  Objekt wie Mainbraces Flagge — das Set-Cover braucht dann entsprechend viele
+  Objekte, und jedes bringt seine eigene Phasenzahl (bis 15) mit. Nächster
+  Diagnoseschritt, falls wir es nachschärfen: die `[animtiles] BG*:`-Zeile
+  auswerten (Objektzahl × Phasen), um (a) gegen (b) zu trennen.
+
+## [2026-07-22] — S6b Fix: BG1 wurde beim Objekt-Clustering IMMER übersprungen
+
+- **Problem (User-Test S3+):** Mainbrace (gfxset 0x25) und Hot Head (0x20)
+  exportierten 0 Objekt-Cluster, alle Anim-Frames landeten im transparenten
+  Fallback (einzelne Kacheln mit transparentem Rand) — Console:
+  `kein Layer-Kontext … 197 transparent-Fallback` bzw. `510 transparent-Fallback`.
+- **Root Cause:** `buildAnimOverlayContexts` gated pro Layer auf `cfg.enabled` —
+  aber **nur `ppu.bg2` und `ppu.bg3` tragen dieses Feld**, `ppu.bg1` hat es nie
+  (Config-Konstruktion ~Z. 1326). `undefined` → `continue` → **jedes BG1-Objekt
+  (Mainbrace-Flagge, Gusty-Blätter) wurde stumm übersprungen**, und da bei den
+  getesteten Sets kein anderer Layer trug, war das Ergebnis `contexts == null`.
+- **Fix:** kein Gate mehr auf `cfg.enabled`. Der Enable-Zustand wird aus TM/TS
+  (`mainScreen | subScreen`, Bit 1<<layer) abgeleitet und nur noch **geloggt** —
+  ein Layer ohne animierte Zellen fällt ohnehin unten raus, ein Versuch kostet
+  also nichts und diese Fehlerklasse ist damit strukturell weg.
+- **Neue Diagnose** wenn ein Layer 0 Anim-Adressen in seiner Tilemap findet:
+  gesuchte vs. tatsächlich belegte CHR-Adressen (Sample + Range), `enabled`,
+  `chrBase`, `tilemapBase`, Tilemap-Größe. Trennt die drei Fehlerfälle
+  falscher Layer / falsche chrBase / Objekt nicht im Snapshot sichtbar.
+- **Zweiter, EIGENTLICHER Root Cause (Test 2, Mainbrace):** auch mit gefixtem Gate
+  0 Objekte — Diagnose: `chrBase=$2000, tilemapBase=$7800`, aber
+  `Tilemap belegt: $2000 (1 distinkt)`, also **komplett leer**. Grund: BG1 ist in
+  Mainbrace die **dynamische TERRAIN-Ebene**. Deren Tilemap steht nie im VRAM (die
+  Scroll-Engine füllt sie zur Laufzeit aus den Level-Daten) — der VRAM-Snapshot ist
+  dort null. Der Ansatz „lies die Tilemap aus dem VRAM" kann Terrain-Anim-Tiles
+  also prinzipiell nie finden. Gusty funktionierte, weil die Blätter dort auf dem
+  BG1-**Overlay** liegen (Tilemap statisch geladen) und das Terrain BG2 ist.
+  bgcap ist unschuldig: 687 G37/L0-Einträge, Adressen `$2010`–`$21E0`, vollständig.
+- **`buildAnimTerrainContext()` (neu):** Kontext für die Terrain-Ebene aus der
+  Level-Map32-Karte statt aus dem VRAM. `tileArrangement` liefert pro 32×32-Part
+  seine 16 8×8-Chars; `gfxData` wurde bei `terrainChrBase` aus dem VRAM extrahiert,
+  also ist `terrainChrBase + gfxIndex*16` exakt die bgcap-Wortadresse. Über
+  `currentTileMap` werden die Vorkommen im Level gefunden, Connected-Component
+  darauf = ganzes Objekt (Flagge). Crops werden **on demand** aus
+  `currentTileParts` komponiert — kein Riesen-Canvas für große Level.
+  Part-Flip und Char-Flip werden korrekt verXORt (Zell-Position *und* Orientierung).
+- **Refactor:** Connected-Component in `clusterAnimCells()` extrahiert (von beiden
+  Buildern genutzt); Kontexte tragen jetzt `drawRegion(octx, region, cw, ch)` statt
+  eines `baseCanvas`, damit VRAM- und Terrain-Quelle austauschbar sind. Log zeigt
+  die Quelle: `BG1 (terrain): N Objekte …` bzw. `(vram-tilemap)`.
+- **Latenter Nebenbefund (NICHT geändert):** `index.html:4894`
+  (`fg.source === 'bg1' && ppu.bg1 && ppu.bg1.enabled`) ist aus demselben Grund
+  toter Code — das BG1-Tilemap-Caching für SSB-Level läuft nie. Bewusst nicht
+  mitgefixt, weil es den Mesen-Pack-Export verändern würde; separat prüfen.
+
 ## [2026-07-20d] — S6b Schritt 3+: Objekt-Cluster für ALLE Layer (nicht nur Gusty-Overlay)
 
 - **`buildAnimOverlayContext` → `buildAnimOverlayContexts`** (pro Layer): der

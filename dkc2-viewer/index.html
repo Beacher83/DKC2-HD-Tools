@@ -6419,7 +6419,13 @@ function buildAnimOverlayContexts(animEntries) {
   const contexts = new Map();
   for (const [mLayer, animAddrSet] of addrByLayer) {
     const cfg = ppu[layerName[mLayer]];
-    if (!cfg || !cfg.enabled) continue;
+    if (!cfg) { console.warn(`[animtiles] BG${mLayer + 1}: keine PPU-Config — übersprungen`); continue; }
+    // Do NOT gate on cfg.enabled: only bg2/bg3 carry that field (bg1 never has it),
+    // which silently skipped every BG1 object (Mainbrace flag, Gusty leaves).
+    // The enable state is derived here from TM/TS instead, and is only logged —
+    // a layer with no animated cells drops out below anyway, so trying costs nothing.
+    const screens = (ppu.mainScreen | 0) | (ppu.subScreen | 0);
+    const layerOn = screens ? !!(screens & (1 << mLayer)) : (cfg.enabled !== false);
     const is4bpp = mLayer <= 1;                 // BG1/BG2 in mode 1 = 4bpp, BG3 = 2bpp
     const wordsPerTile = is4bpp ? 16 : 8;
     const tilesWide = cfg.wide ? 64 : 32, tilesTall = cfg.tall ? 64 : 32;
@@ -6446,75 +6452,225 @@ function buildAnimOverlayContexts(animEntries) {
         if (animAddrSet.has(wordAddr)) animCells.push({ tx, ty });
       }
     }
-    if (animCells.length === 0) continue;
-
-    // Connected components (8-connectivity) = whole objects (leaf / flag / bubble).
-    const animKeys = new Set(animCells.map(c => `${c.tx},${c.ty}`));
-    const seen = new Set();
-    const regionByCell = new Map();
-    const addrToCell = new Map();
-    const objects = [];
-    for (const start of animCells) {
-      const sk = `${start.tx},${start.ty}`;
-      if (seen.has(sk)) continue;
-      const comp = []; const stack = [start]; seen.add(sk);
-      let minX = start.tx, maxX = start.tx, minY = start.ty, maxY = start.ty;
-      while (stack.length) {
-        const c = stack.pop(); comp.push(c);
-        minX = Math.min(minX, c.tx); maxX = Math.max(maxX, c.tx);
-        minY = Math.min(minY, c.ty); maxY = Math.max(maxY, c.ty);
-        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-          if (!dx && !dy) continue;
-          const nk = `${c.tx + dx},${c.ty + dy}`;
-          if (animKeys.has(nk) && !seen.has(nk)) { seen.add(nk); stack.push({ tx: c.tx + dx, ty: c.ty + dy }); }
-        }
+    if (animCells.length === 0) {
+      // The layer's VRAM tilemap doesn't reference these tiles. The usual reason is
+      // that this layer is the DYNAMIC TERRAIN layer: its tilemap is never in VRAM
+      // (the scroll engine fills it at runtime from level data), so the snapshot is
+      // all zeroes. Those objects live in the level's Map32 grid instead.
+      const tctx = buildAnimTerrainContext(animAddrSet, mLayer);
+      if (tctx) {
+        contexts.set(mLayer, tctx);
+        console.log(`[animtiles] BG${mLayer + 1}: Terrain-Ebene (Tilemap nicht im VRAM) — Kontext aus der Level-Map16-Karte`);
+        continue;
       }
-      const x0 = Math.max(0, minX - 1), y0 = Math.max(0, minY - 1);
-      const x1 = Math.min(tilesWide - 1, maxX + 1), y1 = Math.min(tilesTall - 1, maxY + 1);
-      const region = { x0, y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
-      objects.push({ tiles: comp.length, w: maxX - minX + 1, h: maxY - minY + 1 });
-      for (const c of comp) {
-        const k = `${c.tx},${c.ty}`;
-        regionByCell.set(k, region);
-        const info = cells.get(k);
-        if (info && !addrToCell.has(info.addr)) addrToCell.set(info.addr, k);
-      }
+      // Not terrain either — report enough to tell the failure modes apart: wrong
+      // layer, wrong chrBase (tilemap addresses land in a different VRAM window
+      // than bgcap recorded), or the object not present in this snapshot.
+      const tmAddrs = [...new Set([...cells.values()].map(c => c.addr))].sort((a, b) => a - b);
+      const fmt = a => '$' + a.toString(16);
+      const want = [...animAddrSet].sort((a, b) => a - b);
+      console.warn(
+        `[animtiles] BG${mLayer + 1}: 0 von ${animAddrSet.size} Anim-Adressen in der Tilemap gefunden ` +
+        `(enabled=${layerOn}, chrBase=${fmt(chrBaseWord)}, tilemapBase=${fmt(cfg.tilemapBase)}, ${tilesWide}x${tilesTall}, ` +
+        `terrainChrBase=${currentTileRawData ? fmt(currentTileRawData.terrainChrBase) : 'n/a'})\n` +
+        `   gesucht: ${want.slice(0, 8).map(fmt).join(' ')}${want.length > 8 ? ' …' : ''}\n` +
+        `   Tilemap belegt: ${tmAddrs.slice(0, 8).map(fmt).join(' ')}${tmAddrs.length > 8 ? ' …' : ''} ` +
+        `(${tmAddrs.length} distinkt, ${fmt(tmAddrs[0])}–${fmt(tmAddrs[tmAddrs.length - 1])})`);
+      continue;
     }
 
     const baseCanvas = new OffscreenCanvas(w, h);
     baseCanvas.getContext('2d').putImageData(layerImg, 0, 0);
-    contexts.set(mLayer, { cells, regionByCell, addrToCell, baseCanvas, objects, layer: mLayer });
+    const { objects } = clusterAnimCells(animCells, cells, tilesWide, tilesTall);
+    contexts.set(mLayer, {
+      cells, objects, layer: mLayer,
+      drawRegion: (octx, region, cw, ch) =>
+        octx.drawImage(baseCanvas, region.x0 * 8, region.y0 * 8, region.w * 8, region.h * 8, 0, 0, cw, ch),
+    });
   }
   return contexts.size ? contexts : null;
 }
 
-// Render one animation frame inside its whole-leaf crop: the leaf region taken
-// from the base overlay (real neighbouring leaf parts, frame 0) with the
-// animated centre cell overdrawn with THIS frame (kept in its in-game flip so
-// the leaf reads coherently). Returns { canvas, centerCol, centerRow, cropW,
-// cropH, flipH, flipV } or null. The pack step slices the centre back and
-// un-flips per the recorded flip to the canonical hash orientation.
-function buildAnimClusterCanvas(entry, ctx) {
-  const cellKey = ctx.addrToCell.get(entry.addr);
-  if (!cellKey) return null;
-  const region = ctx.regionByCell.get(cellKey);
-  const [tx, ty] = cellKey.split(',').map(Number);
-  const info = ctx.cells.get(cellKey);
+// Group animated 8x8 cells into whole objects: connected components (8-connectivity)
+// over the animated cells, each getting a crop region of its bounding box plus a
+// one-cell ring. `cells` maps "cx,cy" -> {addr, flipH, flipV}; limitW/limitH clamp
+// the ring to the grid. Shared by the VRAM-tilemap and terrain context builders.
+function clusterAnimCells(animCells, cells, limitW, limitH) {
+  const animKeys = new Set(animCells.map(c => `${c.tx},${c.ty}`));
+  const seen = new Set();
+  const objects = [];
+  for (const start of animCells) {
+    const sk = `${start.tx},${start.ty}`;
+    if (seen.has(sk)) continue;
+    const comp = []; const stack = [start]; seen.add(sk);
+    let minX = start.tx, maxX = start.tx, minY = start.ty, maxY = start.ty;
+    while (stack.length) {
+      const c = stack.pop(); comp.push(c);
+      minX = Math.min(minX, c.tx); maxX = Math.max(maxX, c.tx);
+      minY = Math.min(minY, c.ty); maxY = Math.max(maxY, c.ty);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nk = `${c.tx + dx},${c.ty + dy}`;
+        if (animKeys.has(nk) && !seen.has(nk)) { seen.add(nk); stack.push({ tx: c.tx + dx, ty: c.ty + dy }); }
+      }
+    }
+    const x0 = Math.max(0, minX - 1), y0 = Math.max(0, minY - 1);
+    const x1 = Math.min(limitW - 1, maxX + 1), y1 = Math.min(limitH - 1, maxY + 1);
+    const region = { x0, y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+    objects.push({ tiles: comp.length, w: maxX - minX + 1, h: maxY - minY + 1,
+                   region, cells: comp.map(c => `${c.tx},${c.ty}`) });
+  }
+  return { objects };
+}
+
+// Context builder for the DYNAMIC TERRAIN layer, whose tilemap never appears in
+// VRAM (the scroll engine fills it at runtime), so buildAnimOverlayContexts finds
+// nothing there — this is where Mainbrace's flag lives. The terrain is assembled
+// from the level's Map32 grid instead: `tileArrangement` gives each 32x32 part its
+// 16 8x8 chars (gfxIndex is an index into gfxData, which was extracted from VRAM at
+// terrainChrBase — so gfxIndex*16 + terrainChrBase is exactly the bgcap word
+// address), and `currentTileMap` says where each part sits in the level. Crops are
+// composed on demand from currentTileParts, so a huge level costs no big canvas.
+// Coordinates are 8x8 cells relative to the map's top-left corner.
+function buildAnimTerrainContext(animAddrSet, mLayer) {
+  const raw = currentTileRawData, tm = currentTileMap;
+  if (!raw || !tm || !tm.map || !currentTileParts) return null;
+  const { tileArrangement, tileCount, terrainChrBase } = raw;
+  if (!tileArrangement || !tileArrangement.data || terrainChrBase == null) return null;
+
+  // Animated VRAM word address -> gfx (char) index in the terrain character set.
+  const wantIdx = new Map();
+  for (const addr of animAddrSet) {
+    const delta = addr - terrainChrBase;
+    if (delta >= 0 && delta % 16 === 0) wantIdx.set(delta / 16, addr);
+  }
+  if (wantIdx.size === 0) return null;
+
+  // Which Map32 parts contain an animated char, and where inside the part.
+  const partSubs = new Map();   // partId -> [{sx, sy, addr, flipH, flipV}]
+  for (let p = 0; p < tileCount; p++) {
+    for (let j = 0; j < 16; j++) {
+      const off = p * 32 + j * 2;
+      if (off + 1 >= tileArrangement.data.length) break;
+      const word = tileArrangement.data[off] | (tileArrangement.data[off + 1] << 8);
+      const addr = wantIdx.get(word & 0x03FF);
+      if (addr === undefined) continue;
+      if (!partSubs.has(p)) partSubs.set(p, []);
+      partSubs.get(p).push({ sx: j % 4, sy: (j / 4) | 0, addr,
+                             flipH: !!(word & 0x4000), flipV: !!(word & 0x8000) });
+    }
+  }
+  if (partSubs.size === 0) return null;
+
+  // Where those parts actually occur in the level.
+  const cells = new Map();      // "cx,cy" -> {addr, flipH, flipV}
+  const animCells = [];
+  let limitW = 0, limitH = 0;
+  for (const [key, t] of tm.map) {
+    const comma = key.indexOf(',');
+    const bx = ((parseInt(key.slice(0, comma), 10) - tm.mapLeft) / 32) * 4;
+    const by = ((parseInt(key.slice(comma + 1), 10) - tm.mapTop) / 32) * 4;
+    limitW = Math.max(limitW, bx + 4); limitH = Math.max(limitH, by + 4);
+    const subs = partSubs.get(t.partId);
+    if (!subs) continue;
+    for (const s of subs) {
+      const cx = bx + (t.flipH ? 3 - s.sx : s.sx);
+      const cy = by + (t.flipV ? 3 - s.sy : s.sy);
+      const k = `${cx},${cy}`;
+      if (cells.has(k)) continue;
+      // Effective orientation = char flip XOR whole-part flip.
+      cells.set(k, { addr: s.addr, flipH: s.flipH !== t.flipH, flipV: s.flipV !== t.flipV });
+      animCells.push({ tx: cx, ty: cy });
+    }
+  }
+  if (animCells.length === 0) return null;
+
+  const tpCanvas = new OffscreenCanvas(currentTileParts.width, currentTileParts.height);
+  tpCanvas.getContext('2d').putImageData(currentTileParts, 0, 0);
+  const drawRegion = (octx, region, cw) => {
+    const S = cw / (region.w * 8);
+    for (let dy = 0; dy < region.h; dy++) {
+      for (let dx = 0; dx < region.w; dx++) {
+        const cx = region.x0 + dx, cy = region.y0 + dy;
+        const t = tm.map.get(`${tm.mapLeft + ((cx / 4) | 0) * 32},${tm.mapTop + ((cy / 4) | 0) * 32}`);
+        if (!t) continue;
+        let sx = cx % 4, sy = cy % 4;
+        if (t.flipH) sx = 3 - sx;
+        if (t.flipV) sy = 3 - sy;
+        octx.save();
+        octx.translate(dx * 8 * S, dy * 8 * S);
+        if (t.flipH) { octx.translate(8 * S, 0); octx.scale(-1, 1); }
+        if (t.flipV) { octx.translate(0, 8 * S); octx.scale(1, -1); }
+        octx.drawImage(tpCanvas, t.partId * 32 + sx * 8, sy * 8, 8, 8, 0, 0, 8 * S, 8 * S);
+        octx.restore();
+      }
+    }
+  };
+
+  const { objects } = clusterAnimCells(animCells, cells, limitW, limitH);
+  return { cells, objects, layer: mLayer, drawRegion, source: 'terrain' };
+}
+
+// Pick the minimum set of object occurrences that still covers every animated
+// address. The same art is repeated all over a level — Mainbrace's flag occurs 6x,
+// Hot Head's lava pools 125x — and every occurrence yields byte-identical sheets,
+// so exporting them all just multiplies the upscaling work. Greedy: keep an object
+// only while it contributes an address nothing kept so far covers. Returns
+// [{ o, addrs:[{key, addr, info}] }].
+function selectAnimObjects(ctx, framesByAddr) {
+  const covered = new Set();
+  const keep = [];
+  for (const o of ctx.objects) {
+    const addrs = [];
+    for (const key of o.cells) {
+      const info = ctx.cells.get(key);
+      if (info && framesByAddr.has(info.addr)) addrs.push({ key, addr: info.addr, info });
+    }
+    if (!addrs.some(a => !covered.has(a.addr))) continue;
+    for (const a of addrs) covered.add(a.addr);
+    keep.push({ o, addrs });
+  }
+  return keep;
+}
+
+// Render ONE animation phase of a WHOLE object: the object's crop region taken from
+// the live layer, with EVERY animated cell overdrawn with that cell's frame for this
+// phase (kept in its in-game flip so the object reads coherently).
+//
+// This used to emit one sheet per (cell, frame) — each showing the whole object but
+// varying a single 8x8 cell — so a 30-cell/7-phase flag cost 197 near-identical PNGs
+// instead of 7. Bundling by phase also means the upscaler sees a REAL animation
+// phase rather than frame 0 with one cell swapped. Cells whose cycle is shorter than
+// the object's longest one repeat (phase % len).
+//
+// Returns { canvas, cropW, cropH, slices } — one slice per animated cell, which the
+// pack step cuts back out and un-flips to the canonical hash orientation.
+function buildAnimObjectSheet(obj, phase, ctx, framesByAddr) {
+  const region = obj.o.region;
   const S = 4;
   const cw = region.w * 8 * S, ch = region.h * 8 * S;
   const out = new OffscreenCanvas(cw, ch);
   const octx = out.getContext('2d');
   octx.imageSmoothingEnabled = false;
-  octx.drawImage(ctx.baseCanvas, region.x0 * 8, region.y0 * 8, region.w * 8, region.h * 8, 0, 0, cw, ch);
-  const frameImg = new ImageData(8, 8);
-  drawTile8x8(frameImg, entry.cgram, 0, 0, 0, entry.bytes, info.flipH, info.flipV);
+  ctx.drawRegion(octx, region, cw, ch);
   const f8 = new OffscreenCanvas(8, 8);
-  f8.getContext('2d').putImageData(frameImg, 0, 0);
-  const cx = (tx - region.x0) * 8 * S, cy = (ty - region.y0) * 8 * S;
-  octx.clearRect(cx, cy, 8 * S, 8 * S);
-  octx.drawImage(f8, 0, 0, 8, 8, cx, cy, 8 * S, 8 * S);
-  return { canvas: out, centerCol: tx - region.x0, centerRow: ty - region.y0,
-           cropW: region.w, cropH: region.h, flipH: info.flipH, flipV: info.flipV };
+  const f8ctx = f8.getContext('2d');
+  const slices = [];
+  for (const a of obj.addrs) {
+    const frames = framesByAddr.get(a.addr);
+    const e = frames[phase % frames.length];
+    const [tx, ty] = a.key.split(',').map(Number);
+    const img = new ImageData(8, 8);
+    drawTile8x8(img, e.cgram, 0, 0, 0, e.bytes, a.info.flipH, a.info.flipV);
+    f8ctx.putImageData(img, 0, 0);
+    const cx = (tx - region.x0) * 8 * S, cy = (ty - region.y0) * 8 * S;
+    octx.clearRect(cx, cy, 8 * S, 8 * S);
+    octx.drawImage(f8, 0, 0, 8, 8, cx, cy, 8 * S, 8 * S);
+    slices.push({ hash: e.hash, pal: e.pal, layer: e.layer, addr: e.addr.toString(16),
+                  col: tx - region.x0, row: ty - region.y0,
+                  flipH: a.info.flipH, flipV: a.info.flipV });
+  }
+  return { canvas: out, cropW: region.w, cropH: region.h, slices };
 }
 
 async function exportCatalogAsZip() {
@@ -6879,37 +7035,73 @@ async function exportCatalogAsZip() {
         if (contexts) {
           for (const [mL, c] of contexts) {
             const sizes = c.objects.map(o => `${o.w}x${o.h}(${o.tiles})`).join(' ');
-            console.log(`[animtiles] BG${mL + 1}: ${c.objects.length} Objekte erkannt — Größen ${sizes}`);
+            console.log(`[animtiles] BG${mL + 1} (${c.source || 'vram-tilemap'}): ${c.objects.length} Objekte erkannt — Größen ${sizes}`);
           }
         } else {
           console.warn('[animtiles] kein Layer-Kontext (Level mit den Anim-Elementen geladen?) — Fallback: transparentes Padding pro Kachel');
         }
         const animFolder = rootFolder.folder('animtiles');
         manifest.animTiles = [];
-        let animExported = 0, clustered = 0;
+
+        // Frames per VRAM address, in recording order (= animation phase order).
+        // Keyed by ADDRESS ONLY, not (layer,address): BG1 and BG2 share the same CHR
+        // window in some levels and parseBgCap attributes a hash to whichever layer it
+        // saw first, so grouping per layer would tear one animation in half.
+        const framesByAddr = new Map();
         for (const e of animForGfx) {
-          let canvas, slice = null;
-          const ectx = contexts ? contexts.get(e.layer) : null;
-          const cl = ectx ? buildAnimClusterCanvas(e, ectx) : null;
-          if (cl) {
-            canvas = cl.canvas;
-            slice = { centerCol: cl.centerCol, centerRow: cl.centerRow, cropW: cl.cropW, cropH: cl.cropH, flipH: cl.flipH, flipV: cl.flipV };
-            clustered++;
-          } else {
-            canvas = buildAnimPaddedCanvas(e);
-            if (canvas) slice = { centerCol: 1, centerRow: 1, cropW: 3, cropH: 3, flipH: false, flipV: false };
+          if (!framesByAddr.has(e.addr)) framesByAddr.set(e.addr, []);
+          framesByAddr.get(e.addr).push(e);
+        }
+
+        let sheets = 0, coveredHashes = new Set();
+        if (contexts) {
+          for (const [mL, c] of contexts) {
+            const objs = selectAnimObjects(c, framesByAddr);
+            const skipped = c.objects.length - objs.length;
+            for (let oi = 0; oi < objs.length; oi++) {
+              const obj = objs[oi];
+              // One sheet per phase; the object's cycle is its longest cell cycle.
+              const phases = Math.max(...obj.addrs.map(a => framesByAddr.get(a.addr).length));
+              for (let ph = 0; ph < phases; ph++) {
+                const sh = buildAnimObjectSheet(obj, ph, c, framesByAddr);
+                const filename = `animobj_L${mL}_${String(oi).padStart(2, '0')}_F${String(ph).padStart(2, '0')}.png`;
+                animFolder.file(filename, await canvasToBlob(sh.canvas));
+                manifest.animTiles.push({
+                  file: `animtiles/${filename}`, kind: 'object', layer: mL,
+                  object: oi, phase: ph, phases, cropW: sh.cropW, cropH: sh.cropH,
+                  padSource: 'object-sheet', slices: sh.slices
+                });
+                for (const s of sh.slices) coveredHashes.add(s.hash);
+                sheets++;
+              }
+            }
+            console.log(`[animtiles] BG${mL + 1}: ${objs.length} Objekt${objs.length === 1 ? '' : 'e'} exportiert` +
+                        `${skipped > 0 ? ` (${skipped} identische Wiederholungen im Level übersprungen)` : ''}` +
+                        ` — Phasen ${objs.map(o => Math.max(...o.addrs.map(a => framesByAddr.get(a.addr).length))).join('/')}`);
           }
+        }
+
+        // Anything the object sheets didn't reach (no context, or an address that
+        // sits outside every detected object) still needs its own tile so the hash
+        // is not lost — transparent ring padding as before.
+        let singles = 0;
+        for (const e of animForGfx) {
+          if (coveredHashes.has(e.hash)) continue;
+          const canvas = buildAnimPaddedCanvas(e);
           if (!canvas) continue;
           const filename = `animtile_${e.hash}_L${e.layer}_P${e.pal}.png`;
           animFolder.file(filename, await canvasToBlob(canvas));
           manifest.animTiles.push({
-            file: `animtiles/${filename}`, hash: e.hash, layer: e.layer,
-            pal: e.pal, addr: e.addr.toString(16), frameCount: e.frameCount,
-            padSource: cl ? 'object-cluster' : 'transparent', slice
+            file: `animtiles/${filename}`, kind: 'single', layer: e.layer,
+            cropW: 3, cropH: 3, padSource: 'transparent',
+            slices: [{ hash: e.hash, pal: e.pal, layer: e.layer, addr: e.addr.toString(16),
+                       col: 1, row: 1, flipH: false, flipV: false }]
           });
-          animExported++;
+          singles++;
         }
-        console.log(`[animtiles] ${animExported} Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} exportiert (${clustered} als Objekt-Cluster, ${animExported - clustered} transparent-Fallback)`);
+        console.log(`[animtiles] gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()}: ` +
+                    `${sheets} Objekt-Sheets + ${singles} Einzelkacheln = ${sheets + singles} PNGs ` +
+                    `für ${animForGfx.length} Anim-Frames (${coveredHashes.size} über Sheets abgedeckt)`);
       } else {
         console.log(`[animtiles] keine Anim-Frames für gfxset 0x${catalogData.gfxSetIndex.toString(16).toUpperCase()} (BG-Anim geladen? richtiges Gfxset?)`);
       }
