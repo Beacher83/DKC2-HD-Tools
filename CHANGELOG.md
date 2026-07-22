@@ -1,5 +1,30 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-22c] — S6b: Objekt-Set-Cover über alle Layer statt pro Layer
+
+- **Problem (User-Test, Hot Head 0x20):** 113 PNGs, davon sichtbar unsaubere/doppelte.
+  Console: `BG1: 3 Objekte — Phasen 14/13/15` (42 Sheets) und
+  `BG2: 5 Objekte — Phasen 14/13/15/15/14` (71 Sheets).
+- **Root Cause:** `selectAnimObjects` legte sein `covered`-Set **pro Layer-Kontext**
+  neu an. BG1 und BG2 teilen sich in Hot Head das CHR-Fenster `$2010`–`$2190`, also
+  deckte BG2 dieselben Adressen ein zweites Mal ab. Manifest-Auswertung zeigte
+  vollständige Enthaltung: `L0_00 ⊂ L1_00` (61/61 Hashes), `L0_01 ⊂ L1_01` (46/46),
+  `L0_02 ⊂ L1_02` (118/118) — **alle 42 BG1-Sheets überflüssig**, 14 PNG-Paare sogar
+  byte-identisch (MD5), nur 99 von 113 Dateien überhaupt verschieden. Bei Mainbrace /
+  Gusty / Rambi fiel es nicht auf, weil dort nur ein Layer animierte Tiles trägt.
+- **Fix:** `selectAnimObjects(contexts, framesByAddr)` bekommt jetzt **alle** Kontexte
+  auf einmal und führt ein einziges `covered`-Set. Kandidaten werden **größtes Objekt
+  zuerst** abgearbeitet (echtes Greedy-Set-Cover), damit ein großes Objekt mehrere
+  kleine mit denselben Adressen schlägt — sonst hinge das Ergebnis allein an der
+  Layer-Reihenfolge. Rückgabe ist `Map(layer -> keptObjects)`.
+- **Log:** ein Layer, der nichts Neues beiträgt, meldet das jetzt explizit
+  (`alle N Vorkommen sind bereits über einen anderen Layer abgedeckt`) statt einer
+  leeren Phasenliste.
+- **Irreduzibler Rest bei Hot Head:** die Lava zerfällt im Level in räumlich getrennte
+  kleine Komponenten (3×2 / 5×3 / 6×3) statt in ein großes Objekt wie Mainbraces
+  Flagge, und ihr Zyklus ist mit 13–15 Phasen echt so lang. Beides ist keine
+  Redundanz und bleibt.
+
 ## [2026-07-22b] — S6b: ein Sheet pro (Objekt, Phase) statt pro (Zelle, Frame) — 197 PNGs → 7
 
 - **Problem (User-Test):** Der Terrain-Fix lieferte zwar korrekte Objekte (Mainbrace-

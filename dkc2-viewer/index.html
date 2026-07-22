@@ -6617,20 +6617,38 @@ function buildAnimTerrainContext(animAddrSet, mLayer) {
 // so exporting them all just multiplies the upscaling work. Greedy: keep an object
 // only while it contributes an address nothing kept so far covers. Returns
 // [{ o, addrs:[{key, addr, info}] }].
-function selectAnimObjects(ctx, framesByAddr) {
-  const covered = new Set();
-  const keep = [];
-  for (const o of ctx.objects) {
-    const addrs = [];
-    for (const key of o.cells) {
-      const info = ctx.cells.get(key);
-      if (info && framesByAddr.has(info.addr)) addrs.push({ key, addr: info.addr, info });
+//
+// The cover runs across ALL layer contexts at once, not per layer, because layers
+// can share a CHR window: in Hot Head BG1 and BG2 both address $2010-$2190, and
+// with a per-layer set BG1's 3 objects came out fully contained in BG2's 5
+// (61/61, 46/46, 118/118 hashes) — 42 of 113 sheets were pure duplicates, 14 of
+// them byte-identical. Candidates are taken biggest-first so one large object wins
+// over several small ones covering the same addresses (plain greedy set cover);
+// otherwise the result would just depend on layer order.
+//
+// Returns Map(layer -> [{ o, addrs:[{key, addr, info}] }]).
+function selectAnimObjects(contexts, framesByAddr) {
+  const cands = [];
+  for (const [layer, ctx] of contexts) {
+    for (const o of ctx.objects) {
+      const addrs = [];
+      for (const key of o.cells) {
+        const info = ctx.cells.get(key);
+        if (info && framesByAddr.has(info.addr)) addrs.push({ key, addr: info.addr, info });
+      }
+      if (addrs.length) cands.push({ layer, ctx, o, addrs });
     }
-    if (!addrs.some(a => !covered.has(a.addr))) continue;
-    for (const a of addrs) covered.add(a.addr);
-    keep.push({ o, addrs });
   }
-  return keep;
+  cands.sort((a, b) => b.addrs.length - a.addrs.length);
+  const covered = new Set();
+  const byLayer = new Map();
+  for (const c of cands) {
+    if (!c.addrs.some(a => !covered.has(a.addr))) continue;
+    for (const a of c.addrs) covered.add(a.addr);
+    if (!byLayer.has(c.layer)) byLayer.set(c.layer, []);
+    byLayer.get(c.layer).push({ o: c.o, addrs: c.addrs });
+  }
+  return byLayer;
 }
 
 // Render ONE animation phase of a WHOLE object: the object's crop region taken from
@@ -7055,8 +7073,9 @@ async function exportCatalogAsZip() {
 
         let sheets = 0, coveredHashes = new Set();
         if (contexts) {
+          const kept = selectAnimObjects(contexts, framesByAddr);
           for (const [mL, c] of contexts) {
-            const objs = selectAnimObjects(c, framesByAddr);
+            const objs = kept.get(mL) || [];
             const skipped = c.objects.length - objs.length;
             for (let oi = 0; oi < objs.length; oi++) {
               const obj = objs[oi];
@@ -7075,9 +7094,14 @@ async function exportCatalogAsZip() {
                 sheets++;
               }
             }
-            console.log(`[animtiles] BG${mL + 1}: ${objs.length} Objekt${objs.length === 1 ? '' : 'e'} exportiert` +
-                        `${skipped > 0 ? ` (${skipped} identische Wiederholungen im Level übersprungen)` : ''}` +
-                        ` — Phasen ${objs.map(o => Math.max(...o.addrs.map(a => framesByAddr.get(a.addr).length))).join('/')}`);
+            if (objs.length === 0) {
+              console.log(`[animtiles] BG${mL + 1}: 0 Objekte exportiert — alle ${c.objects.length} Vorkommen ` +
+                          `sind bereits über einen anderen Layer abgedeckt (geteiltes CHR-Fenster)`);
+            } else {
+              console.log(`[animtiles] BG${mL + 1}: ${objs.length} Objekt${objs.length === 1 ? '' : 'e'} exportiert` +
+                          `${skipped > 0 ? ` (${skipped} Wiederholungen/Duplikate übersprungen)` : ''}` +
+                          ` — Phasen ${objs.map(o => Math.max(...o.addrs.map(a => framesByAddr.get(a.addr).length))).join('/')}`);
+            }
           }
         }
 
