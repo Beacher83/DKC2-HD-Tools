@@ -1,5 +1,212 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-24] — Container-Datenverlust: Save darf gespeicherte Kacheln nicht mehr löschen
+
+Gefunden bei der Analyse eines Packs, in dem **1314 Kacheln fehlten**: `gfxset_07`
+(Pirate Panic) komplett leer (0 statt 1239 PNGs) und `gfxset_03` bg2 601 statt 676 —
+obwohl `hashes.bin` für beide die vollständigen Einträge enthielt. Metadaten also
+intakt, nur die Bild-Blobs verschwunden.
+
+*(Korrektur: `gfxset_04` sah mit 806 statt 1142 bg1-Adressen ebenfalls beschädigt aus,
+ist es aber nicht — die fehlenden 336 sind das Honig-Overlay, das per Design in
+`cmFg/gfxset_04` liegt. 806 + 336 = 1142, und alle 336 haben ihren Hash-Eintrag.)*
+
+- **Problem:** `hdSaveSet()` ist ein Voll-`put()` des Datensatzes, und der Block am
+  Ende von `saveCurrentHDToContainer()` **gibt die Bitmaps des gespeicherten Gfxsets
+  absichtlich frei** (Speicherschonung über viele Importe hinweg). Zielt ein späterer
+  Save auf dasselbe Set, findet der Gfxset-Filter nichts mehr im Speicher und schreibt
+  `tiles: []` über die gespeicherte Kunst. Die einzige vorhandene Schutzprüfung
+  (`hdPack.tiles.size === 0`) sieht `hdPack.tiles` nur als **Ganzes** und bleibt
+  zufrieden, solange irgendein anderes Gfxset resident ist.
+  Auslöser im Alltag: „Import HD" mit einer Sprite-ZIP, während ein Level ausgewählt
+  ist — `hdPack.gfxSetIndex` ist dann leer, `activeGfxIdx` fällt auf `selectedGfxSet`
+  dieses Levels zurück, und dessen Container-Eintrag wird geleert. Genau der vom User
+  beobachtete Ablauf „Pirate Panic war HD → Sprites importiert → wieder SD".
+- **Fix:** neuer Lese-Helper `hdGetSet()`; `saveCurrentHDToContainer()` vergleicht vor
+  dem Schreiben mit dem gespeicherten Datensatz:
+  - **0 Kacheln im Speicher, aber >0 im Container → harter Abbruch** (`return 0`,
+    Konsole + Dialog). Dieser Fall ist nie legitim.
+  - **weniger Kacheln als gespeichert → `confirm()`** mit Zahlen; Abbruch bei Nein.
+    Ein absichtlich kleinerer Re-Import bleibt damit möglich, ein stiller Verlust nicht.
+  - Die Blob-Konvertierung läuft erst **nach** der Prüfung (vorher wurden alle Bitmaps
+    umsonst encodiert, bevor überhaupt klar war, ob gespeichert wird).
+- **Gleiche Falle mitgeschlossen:** `hdPack.animTiles` wird nach jedem Save
+  **geleert**, `bg2`/`bg3` werden geschlossen, `wallBlob`/`cmFgBlob` entstehen nur aus
+  `currentBgData`/`catalogData` des gerade angezeigten Levels. Alle fünf werden jetzt
+  aus dem gespeicherten Datensatz **übernommen**, wenn im Speicher nichts vorliegt,
+  statt ihn zu nullen. Bei den Anim-Kacheln ist das besonders wichtig: sie sind
+  hash-adressiert und lassen sich aus nichts anderem rekonstruieren.
+- **Reparatur bestehender Container:** der Fix verhindert weiteren Verlust, stellt
+  aber nichts wieder her — betroffene Sets müssen einmal neu per „Import HD"
+  eingespielt werden.
+
+### Ursache abgestellt: Import entscheidet, was gespeichert wird
+
+Die Guards oben sind das Netz; das eigentliche Loch saß im Aufrufer.
+
+- **Problem:** `importHDPackToContainer()` entschied per `hdPack.tiles.size > 0`, ob ein
+  Level-Set gespeichert wird. `hdPack` ist aber ein **Sammler über die ganze Sitzung** —
+  nach einem Sprite-Import liegen dort noch die Kacheln vorheriger Level. Der Level-Save
+  feuerte also auch bei Sprite-ZIPs, und `activeGfxIdx` fiel mangels
+  `hdPack.gfxSetIndex` auf das gerade **ausgewählte Level** zurück. Genau so wurde
+  gfxset_07 geleert.
+- **Fix:** `importHDPack()` gibt jetzt zurück, was es tatsächlich importiert hat
+  (`{ kind: 'level' | 'sprites' | 'none', gfxSetIndex, tileCount }`) — die Verzweigung
+  `manifest.exportType === 'sprites'` existierte ohnehin schon, ihr Ergebnis wurde nur
+  weggeworfen. `importHDPackToContainer()` speichert Level-Sets nur noch bei
+  `kind === 'level'`.
+
+### Honig-Overlay (cmFg) kommt in die Upscale-Pipeline
+
+Das Foreground-Overlay von Rambi Rumble (Honig, `cmFgSource === 'bg1'`) wurde zwar ins
+Pack nach `cmFg/gfxset_XX/` geschnitten, war aber **nie Teil des SD-Exports** — es kam
+also nie am Upscaler an, und die Kacheln blieben nativ. Gemessen: die 483 PNGs in
+`cmFg/gfxset_04` decken 336 Adressen ab, und das sind exakt die 336 Adressen, die in
+Rambi zur Laufzeit verfehlt werden.
+
+- **SD-Export:** schreibt jetzt `cmfg.png` (natives Overlay-Bild) plus `manifest.cmFg`
+  mit Quelle, Modus, Alpha und Subtract-Flag — genau wie `bg2.png`/`bg3.png`.
+- **Import:** liest `manifest.cmFg.file` nach `hdPack.cmFg` und übernimmt die Metadaten;
+  meldet den gemessenen Skalierungsfaktor und warnt, wenn das Overlay nicht
+  hochskaliert wurde.
+- **Container:** `saveCurrentHDToContainer()` bevorzugt jetzt `hdPack.cmFg`. Vorher
+  gewann immer der native Redraw aus `currentFgData`/`catalogData`, d.h. ein
+  importiertes HD-Overlay wurde beim Speichern sofort wieder überschrieben —
+  `bg2`/`bg3` lesen aus genau diesem Grund schon lange aus `hdPack`.
+- Der Pack-Export musste nicht angefasst werden: er leitet die Zellgröße aus der
+  Bildbreite ab (`cmFgBitmap.width / tilesW`), ein 4×-Overlay passt also von selbst.
+- **Mesen-Seite (Build S12):** der Loader scannt jetzt `cmFg/gfxset_XX/` und lädt die
+  Kacheln als Layer 0. Sie sind gewöhnliche adress-adressierte BG1-Kacheln, und der
+  Export schreibt ihre Content-Hashes ohnehin schon unter Layer 0 in `hashes.bin` —
+  es braucht also weder einen neuen Key-Typ noch eine Renderer-Änderung.
+  Vorabprüfung am vorhandenen Pack: 336/336 Adressen haben einen Hash-Eintrag,
+  0 Dateinamen-Kollisionen mit `bg/bg1/gfxset_04`.
+- **Rücknahme im Ernstfall:** der Ordner bleibt bewusst getrennt — `cmFg/` umbenennen
+  stellt exakt das alte Verhalten wieder her.
+- **Totes Gate entfernt (der Grund, warum `cmFg` beim Neuaufbau ganz ausfiel):**
+  `buildCatalogByGfxSet()` cachte das BG1-Tilemap für Overlay-Level nur unter
+  `fg.source === 'bg1' && ppu.bg1 && ppu.bg1.enabled`. `readPpuConfig()` schreibt
+  `enabled` aber **nur auf bg2 und bg3** — `ppu.bg1.enabled` ist immer `undefined`, der
+  Block lief also nie. Folge: `catalogData` trug weder `bg1TilemapData` noch die
+  SSB-Felder in `ppuConfig`, und ein aus ZIPs aufgebauter Container (ohne geladenes
+  Level) bekam für gfxset_04 einen Datensatz ohne beides. Der Pack-Export verlangt
+  genau diese zwei Felder und übersprang `cmFg` daher komplett und lautlos
+  (`total_cmfg_tiles: 0`). `fg.source === 'bg1'` identifiziert das Overlay-Level bereits
+  — das ist der eigentliche Test, das Enable-Bit war nie einer.
+  *(Der Befund war am 2026-07-22 als latent notiert und bewusst liegen gelassen, weil er
+  den Mesen-Pack-Export verändert. Genau das ist jetzt erwünscht.)*
+
+### KERNURSACHE: Anim-Sheets gingen 4× vorvergrößert in den Upscaler
+
+Der eigentliche Grund, warum Anim-Kacheln im Spiel nativ aussahen — und er liegt **vor**
+dem Viewer-Import, im SD-Export.
+
+- **Messung (Blockgröße der uniformen Pixelblöcke im SD-Export):**
+
+  | Ordner | Blockgröße |
+  |---|---|
+  | `tiles/` | **1** — echte native Pixel |
+  | `clusters/` | **1** — echte native Pixel |
+  | `animtiles/` | **4** — bereits 4× Nearest-Blowup |
+
+- **Folge:** `buildAnimObjectSheet()` rendert mit `S = 4` und `imageSmoothingEnabled =
+  false`. Das Upscale-Modell bekam also keine nativen Pixel, sondern einen fertigen
+  Blowup, und konnte nur Blockkanten abrunden. Messbar: die Modellausgabe weicht bei
+  `animtiles/` nur **4,2** von einer reinen NEAREST-Vergrößerung ab, bei `tiles/` und
+  `clusters/` dagegen **10,3**. Anschließend rechnete der Import die 16×-Zelle wieder
+  auf die 32px des Pack-Formats herunter und verwarf auch das noch.
+- **Fix:** `S = 1`. Der Anim-Pfad entspricht jetzt exakt dem statischen: nativ raus,
+  4× hochskalieren, Zelle 1:1 mit 32px übernehmen — nichts wird weggeworfen.
+  `decodeBgCapTileCanvas()` gibt entsprechend natives 8×8 statt 32×32 zurück, und der
+  Einzelkachel-Fallback `buildAnimPaddedCanvas()` baut 24×24 statt 96×96 (3×3 Zellen).
+- **Import versteht jetzt alle drei Sheet-Formen** über die gemessene Zellgröße:
+  8px (nativ, nicht upgescalt → Warnung), 32px (Sollfall, 1:1) und 128px (Altbestand
+  aus 4×-Sheets, wird heruntergerechnet).
+- **Alte ZIPs bleiben importierbar**, ihre Kacheln sind aber die schlechteren — die
+  SD-Exporte müssen für volle Qualität einmal neu erzeugt und neu hochskaliert werden.
+- **Die Colab-Routine ist unschuldig** und war es die ganze Zeit: sie erfasst
+  `animtiles/` vollständig und rechnet sauber 4× hoch. Sie bekam nur schlechtes Futter.
+
+### Anim-Kacheln: HD-Import konnte eine SD-Fassung nicht mehr ersetzen
+
+Nachweis: die Anim-Kacheln im Pack wurden Zelle für Zelle gegen beide möglichen Quellen
+gerechnet (Schnitt exakt wie im Import, mittlere RGB-Abweichung). Ergebnis gemischt —
+**gfxset_20 (Hot Head) 790/790 aus dem HD-Sheet, gfxset_1D (Gusty) 99 von 105 aus dem
+SD-Sheet.** Ein Magenta-Test (alle 1064 Kacheln eingefärbt) hatte zuvor bewiesen, dass
+Mesen sie zeichnet — der Fehler lag also allein in der Kunst, die ins Pack kam.
+
+- **Problem 1 — „wer zuerst da ist, gewinnt":** der Anim-Import übersprang jeden bereits
+  vorhandenen Schlüssel (`if (hdPack.animTiles.has(key)) { animDup++; continue; }`).
+  Lag eine Kachel schon aus einem SD-Import oder aus dem Container vor, konnte ein
+  späterer HD-Import sie **nie** reparieren — er meldete sie nur als „Duplikat".
+- **Fix:** jede Kachel merkt sich ihre Quellauflösung (`srcPx` = Quellpixel pro
+  8×8-Zelle). Bei Kollision gewinnt die höhere Auflösung, die alte Bitmap wird
+  geschlossen. Kacheln unbekannter Herkunft zählen als Minimum (Ziel-Zellgröße), damit
+  ein echter HD-Import sie hebt, ein SD-Import eine bessere aber nicht überschreibt.
+  `srcPx` wird im Container persistiert und beim Laden wiederhergestellt.
+- **Problem 2 — `loadContainerToHDPack()` stellte Anim-Kacheln gar nicht wieder her:**
+  nach „Laden" war `hdPack.animTiles` leer, ein anschließender Import hatte nichts zum
+  Vergleichen, und der folgende Save schrieb die schlechtere Fassung in den Container.
+  Sie werden jetzt über alle Sets hinweg zusammengeführt (hash-adressiert, also
+  gfxset-unabhängig), bei Kollision nach derselben Auflösungsregel.
+- **Problem 3 — nicht hochskalierte Sheets fielen nicht auf:** der SD-Export rendert
+  Sheets bereits mit 4×, ein nicht upgescaltes Sheet misst also exakt die Ziel-Zellgröße
+  und wurde 1:1 durchgereicht. Der Import warnt jetzt (Konsole + Dialog), wenn
+  `src <= dst`, mit Nennung der betroffenen Sheet-Anzahl.
+- **Entlastet:** die Colab-Upscale-Routine. Die vier HD-ZIPs enthalten `animtiles/`
+  vollständig und 4× hochgerechnet (224×160 → 896×640 usw.), Manifest mit
+  `scaleFactor: 4` und `upscaleModel`.
+
+### Pack-Export liest Sprites aus dem Container statt aus dem Speicher
+
+- **Problem:** die Sprite-Sektion von `exportAsTexturePack()` las `hdPack.sprites`,
+  während der ganze übrige Export aus dem Container kommt. Ein Export ohne vorheriges
+  „Import HD"/„Laden" in derselben Sitzung lieferte deshalb ein **leeres `sprites/`**,
+  obwohl die Kunst im Container lag.
+- **Fix:** Quelle sind jetzt die `sprite`/`mapicon`-Sets des Containers; `hdPack` ist nur
+  noch Fallback für Sprites, die in dieser Sitzung importiert und noch nicht gespeichert
+  wurden. Beide Quellen laufen über dieselbe normalisierte Struktur.
+- **Speicher:** Frames bleiben Blobs und werden **einzeln** dekodiert und wieder
+  freigegeben (`createImageBitmap` → `close()` im `finally`) — ein voller Container hat
+  über 20 000 Frames.
+- **Laufzeit:** vor dem Dekodieren wird geprüft, ob ein Frame überhaupt noch einen
+  ungeschriebenen Hash beitragen kann. Da jeder Hash paketweit nur einmal geschrieben
+  wird, sind die allermeisten späteren Frames redundant; ohne die Vorprüfung würde ihr
+  Dekodieren den Export dominieren.
+
+## [2026-07-22e] — Anim-Kacheln: ALLE beobachteten Layer exportieren, nicht nur den ersten
+
+Gefunden beim Gegenlesen der Mesen-Seite (Schritt 5), bevor getestet wurde.
+
+- **Problem:** `parseBgCap` dedupliziert global per Hash und behielt damit pro Hash
+  nur den **zuerst gesehenen Layer**. Mesens Tile-Key enthält aber den Layer
+  (`SnesHdTileKey::operator==`), und in Hot Head zeigen BG1 **und** BG2 auf dasselbe
+  CHR-Fenster: **203 von 1110 Hashes in gfxset 0x20 kommen auf beiden Layern vor**
+  (gfx37/29/4 dagegen praktisch gar nicht). Für die hätte im Spiel jeder Lookup auf
+  dem jeweils anderen Layer ins Leere gegriffen — stilles Teil-HD, schwer zu
+  diagnostizieren.
+- **Fix:** `parseBgCap` führt jetzt `e.layers` = alle beobachteten Layer (aus
+  `hashAddrKeys`, das die Layer ohnehin im Schlüssel trägt). Die Information wandert
+  durch Sheet-Slices → Import → Container → Pack-Export, der pro Layer eine PNG
+  schreibt. Der Dedup-Schlüssel des Exports enthält jetzt den Layer.
+- Gleiche Bytes, also sind die Kopien exakt; für Sets mit nur einem Layer ändert
+  sich nichts (gfxset 0x25 bleibt bei 7, 0x1D bei 39).
+- **Nachbesserung (erster Test-Export zeigte weiter 510 statt 713):** die
+  Layer-Information über den SD-Manifest-Weg zu führen reicht nicht. `layers[]`
+  entsteht beim SD-Export, reist im Manifest durch den Upscaler und kommt erst beim
+  Import an — ein Container, der VOR dem Fix gefüllt wurde, hat sie also nicht, und
+  ein reiner Pack-Export kann sie nicht mehr herstellen. Ohne Gegenmaßnahme hätte
+  der Fix ein komplettes Re-Upscale erzwungen.
+  Deshalb leitet der Pack-Export die Layer jetzt **primär aus dem live geladenen
+  `bgCapEntries` ab** (`animHashLayers`, Hash → alle beobachteten Layer); `layers[]`
+  aus dem Container und der Einzel-Layer sind nur noch Fallback. Damit repariert ein
+  einfacher Re-Export bestehende Container. Fehlt bgcap, warnt der Export explizit,
+  statt still zu wenig zu schreiben.
+- **Vorhersage am echten Pack verifiziert:** 797 Dateien → **1000** (+203), und die
+  203 liegen ausnahmslos in gfxset 32 — deckt sich exakt mit der bgcap-Analyse
+  (203 von 1110 Hashes auf beiden Layern; 0x25/0x1D/0x04 unberührt).
+- **Pack muss neu exportiert werden** (mit geladenem BG-Anim), damit der Fix wirkt.
+
 ## [2026-07-22d] — S6b Schritt 4: Anim-Sheets importieren, persistieren und ins Pack exportieren
 
 Bis hierher gab es `animTiles` **nur auf der Export-Seite** — `importHDPack` las den

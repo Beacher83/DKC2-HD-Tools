@@ -4890,8 +4890,15 @@ function buildCatalogByGfxSet(gfxSetIndex) {
         };
         console.log(`  FG overlay cached: ${fg.widthPx}x${fg.heightPx}px, mode=${fg.mode}, alpha=${fg.colorMathAlpha}, source=${fg.source}, ${fg.colorMathSubtract ? 'subtract' : 'add'}`);
 
-        // Cache BG1 tilemap for SSB levels (source='bg1') — needed for Mesen HD pack export
-        if (fg.source === 'bg1' && ppu.bg1 && ppu.bg1.enabled) {
+        // Cache BG1 tilemap for SSB levels (source='bg1') — needed for Mesen HD pack export.
+        // The gate used to also require ppu.bg1.enabled, which is DEAD: readPpuConfig()
+        // only ever writes `enabled` onto bg2 and bg3, so ppu.bg1.enabled is undefined and
+        // this whole block never ran. Consequence: catalogData never carried
+        // bg1TilemapData or the SSB ppuConfig fields, so building a container from
+        // imported ZIPs (no level loaded) produced gfxset_04 records without them — and
+        // the pack export, which requires both, silently skipped cmFg entirely.
+        // fg.source === 'bg1' already identifies an overlay level; that is the real test.
+        if (fg.source === 'bg1' && ppu.bg1) {
           const bg1TilesW = ppu.bg1.wide ? 64 : 32;
           const bg1TilesH = ppu.bg1.tall ? 64 : 32;
           const bg1TmByteOffset = ppu.bg1.tilemapBase * 2;
@@ -6368,11 +6375,7 @@ function decodeBgCapTileCanvas(entry) {
   drawTile8x8(img, entry.cgram, 0, 0, 0, entry.bytes, false, false);
   const c8 = new OffscreenCanvas(8, 8);
   c8.getContext('2d').putImageData(img, 0, 0);
-  const c32 = new OffscreenCanvas(32, 32);
-  const ctx = c32.getContext('2d');
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(c8, 0, 0, 32, 32);
-  return c32;
+  return c8;   // NATIVE 8x8 — the upscaler must see real pixels, not a blow-up
 }
 
 // Build the 96x96 (3x3) padded export tile for an animation frame — SPRITE-STYLE
@@ -6385,12 +6388,14 @@ function decodeBgCapTileCanvas(entry) {
 // on fast-moving foliage). Same 96x96 layout as the static tiles so the pack
 // step (exportAsTexturePack) slices the centre back identically.
 function buildAnimPaddedCanvas(entry) {
-  const tile32 = decodeBgCapTileCanvas(entry);
-  if (!tile32) return null;
-  const pad = new OffscreenCanvas(96, 96);
+  const tile8 = decodeBgCapTileCanvas(entry);
+  if (!tile8) return null;
+  // 3x3 cells at NATIVE resolution (24x24), matching buildAnimObjectSheet's S = 1 —
+  // cropW 3 then measures 8px/cell before the upscale and 32px/cell after it.
+  const pad = new OffscreenCanvas(24, 24);
   const ctx = pad.getContext('2d');
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(tile32, 32, 32);  // centre cell only; ring transparent
+  ctx.drawImage(tile8, 8, 8);  // centre cell only; ring transparent
   return pad;
 }
 
@@ -6665,7 +6670,18 @@ function selectAnimObjects(contexts, framesByAddr) {
 // pack step cuts back out and un-flips to the canonical hash orientation.
 function buildAnimObjectSheet(obj, phase, ctx, framesByAddr) {
   const region = obj.o.region;
-  const S = 4;
+  // NATIVE resolution — one image pixel per SNES pixel. This used to be S = 4, drawn
+  // with smoothing off, i.e. the sheet handed to the upscaler was already a 4x nearest
+  // blow-up. Measured consequence: tiles/ and clusters/ come out of this export with a
+  // uniform-block size of 1 (real pixels), animtiles/ had block size 4 — the model saw
+  // no detail to work from and could only round the block corners, so its output
+  // deviated only half as much from a plain NEAREST enlargement as the static tiles did
+  // (4.2 vs 10.3 mean channel distance). The import then scaled the 16x cell back down
+  // to the pack's 32px, discarding what little was gained. In the game the anim tiles
+  // therefore looked native while everything around them looked upscaled.
+  // At S = 1 the anim path matches the static one exactly: native in, 4x upscale, and
+  // the importer cuts 32px cells 1:1 with nothing thrown away.
+  const S = 1;
   const cw = region.w * 8 * S, ch = region.h * 8 * S;
   const out = new OffscreenCanvas(cw, ch);
   const octx = out.getContext('2d');
@@ -6684,7 +6700,9 @@ function buildAnimObjectSheet(obj, phase, ctx, framesByAddr) {
     const cx = (tx - region.x0) * 8 * S, cy = (ty - region.y0) * 8 * S;
     octx.clearRect(cx, cy, 8 * S, 8 * S);
     octx.drawImage(f8, 0, 0, 8, 8, cx, cy, 8 * S, 8 * S);
-    slices.push({ hash: e.hash, pal: e.pal, layer: e.layer, addr: e.addr.toString(16),
+    slices.push({ hash: e.hash, pal: e.pal, layer: e.layer,
+                  layers: e.layers && e.layers.length ? e.layers : [e.layer],
+                  addr: e.addr.toString(16),
                   col: tx - region.x0, row: ty - region.y0,
                   flipH: a.info.flipH, flipV: a.info.flipV });
   }
@@ -7118,7 +7136,9 @@ async function exportCatalogAsZip() {
           manifest.animTiles.push({
             file: `animtiles/${filename}`, kind: 'single', layer: e.layer,
             cropW: 3, cropH: 3, padSource: 'transparent',
-            slices: [{ hash: e.hash, pal: e.pal, layer: e.layer, addr: e.addr.toString(16),
+            slices: [{ hash: e.hash, pal: e.pal, layer: e.layer,
+                       layers: e.layers && e.layers.length ? e.layers : [e.layer],
+                       addr: e.addr.toString(16),
                        col: 1, row: 1, flipH: false, flipV: false }]
           });
           singles++;
@@ -7153,6 +7173,23 @@ async function exportCatalogAsZip() {
       manifest.bg3 = { file: 'bg3.png', widthPx: bg3Src.widthPx, heightPx: bg3Src.heightPx };
     } else if (expBg3) {
       console.warn('BG3 export skipped: kein BG3-Layer im aktuellen Level verfügbar.');
+    }
+
+    // Foreground overlay (Rambi Rumble honey, SSB drips): source='bg1' means the
+    // overlay lives on its own chrBase and is compositing-blended over the level.
+    // The pack export slices it into cmFg/gfxset_XX/ tiles, but until now it was never
+    // part of THIS export — so it never reached the upscaler and those tiles stayed at
+    // native resolution. Shipped whole, exactly like bg2/bg3: the pack-export slicer
+    // derives its scale from the image width, so a 4x upscale needs no other change.
+    const fgSrc = catalogData.ssbFgImage;
+    if (fgSrc && fgSrc.canvas && (fgSrc.source || 'bg3') === 'bg1') {
+      rootFolder.file('cmfg.png', await canvasToBlob(fgSrc.canvas));
+      manifest.cmFg = {
+        file: 'cmfg.png', widthPx: fgSrc.widthPx, heightPx: fgSrc.heightPx,
+        source: fgSrc.source, mode: fgSrc.mode,
+        colorMathAlpha: fgSrc.colorMathAlpha, colorMathSubtract: !!fgSrc.colorMathSubtract,
+      };
+      console.log(`[cmFg] Overlay exportiert: cmfg.png ${fgSrc.widthPx}x${fgSrc.heightPx} (nativ) — mit hochskalieren!`);
     }
 
     // === Stats ===
@@ -7540,6 +7577,11 @@ function parseBgCap(text) {
     const keys = [...hashAddrKeys.get(e.hash)];
     e.isAnim = keys.some(k => animAddrKeys.has(k));
     e.frameCount = Math.max(...keys.map(k => addrHashSets.get(k).size));
+    // ALL layers this content was seen on, not just the first. Some levels point
+    // BG1 and BG2 at the same CHR window (Hot Head: 203 of 1110 hashes appear on
+    // both), and the pack's tile key includes the layer — shipping only the
+    // first-seen layer would silently miss every lookup on the other one.
+    e.layers = [...new Set(keys.map(k => parseInt(k.split('/')[1], 10)))].sort();
   }
 
   console.log(`[bgcap] ${lines} Zeilen gelesen, ${entries.length} distinkte Tiles, ${bad} verworfen`);
@@ -7680,9 +7722,14 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
   }
 }
 
+// Returns what was actually imported: { kind: 'level'|'sprites'|'none', gfxSetIndex, tileCount }.
+// importHDPackToContainer() MUST branch on this rather than inspecting hdPack afterwards:
+// hdPack is a session-wide accumulator, so after a sprite import it still holds whatever
+// level tiles were resident, and the container save would then aim at a gfxset this ZIP
+// never touched — the mechanism that emptied gfxset_07's container entry.
 async function importHDPack(file) {
-  if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
-  
+  if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return { kind: 'none' }; }
+
   const btn = document.getElementById('catImportHDBtn');
   const origText = btn.textContent;
   btn.disabled = true;
@@ -7701,25 +7748,25 @@ async function importHDPack(file) {
       }
     });
     
-    if (!manifestFile) { alert('No manifest.json found in ZIP. This ZIP must be from an Export ZIP that was re-packed with upscaled images.'); return; }
-    
+    if (!manifestFile) { alert('No manifest.json found in ZIP. This ZIP must be from an Export ZIP that was re-packed with upscaled images.'); return { kind: 'none' }; }
+
     const manifestText = await manifestFile.async('text');
     const manifest = JSON.parse(manifestText);
-    
+
     if (!manifest.exportVersion || manifest.exportVersion < 1) {
       alert('This manifest is from an older export version. Please re-export with the current version first.');
-      return;
+      return { kind: 'none' };
     }
 
     // Branch: sprite ZIP vs level ZIP
     if (manifest.exportType === 'sprites') {
       await importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file);
-      return;
+      return { kind: 'sprites' };
     }
 
     if (manifest.exportVersion < 2) {
       alert('This level manifest is from an older export version (v' + manifest.exportVersion + '). Please re-export with the current version first.');
-      return;
+      return { kind: 'none' };
     }
     
     // Detect scale factor from first available image
@@ -7903,13 +7950,16 @@ async function importHDPack(file) {
       console.log(`HD scoring: resolved ${scoringChoices} tiles with multiple candidates`);
     }
     
-    // Load BG2/BG3 HD
-    let hdBg2 = null, hdBg3 = null;
+    // Load BG2/BG3/overlay HD
+    let hdBg2 = null, hdBg3 = null, hdCmFg = null;
     if (manifest.bg2 && manifest.bg2.file) {
       hdBg2 = await loadImage(manifest.bg2.file);
     }
     if (manifest.bg3 && manifest.bg3.file) {
       hdBg3 = await loadImage(manifest.bg3.file);
+    }
+    if (manifest.cmFg && manifest.cmFg.file) {
+      hdCmFg = await loadImage(manifest.cmFg.file);
     }
 
     // Merge into existing hdPack rather than replacing — allows importing multiple
@@ -7961,7 +8011,7 @@ async function importHDPack(file) {
     // un-flip it back to the canonical hash orientation (the sheet draws cells in their
     // in-game flip so the object reads coherently; flipping is an involution, so
     // re-applying the same flip restores the canonical form Mesen hashes).
-    let animNew = 0, animDup = 0, animSheets = 0;
+    let animNew = 0, animDup = 0, animSheets = 0, animUpgraded = 0, animFlatSheets = 0;
     if (Array.isArray(manifest.animTiles) && manifest.animTiles.length) {
       btn.textContent = 'Loading anim tiles...';
       await new Promise(r => setTimeout(r, 0));
@@ -7972,15 +8022,32 @@ async function importHDPack(file) {
         const img = await loadImage(sheet.file);
         if (!img) continue;
         animSheets++;
-        // Derive the sheet's scale from the image instead of assuming it. The SD
-        // export already renders sheets at 4x (S=4 in buildAnimObjectSheet), so a 4x
-        // upscale lands at 16x native, whereas the static tile path lands at 4x.
-        // Measuring per sheet keeps both conventions — and any future native-res
-        // export — working without a format flag.
+        // Derive the sheet's scale from the image instead of assuming it. Sheets exist
+        // in three shapes and all of them must keep working without a format flag:
+        //   8px/cell   — native sheet, never upscaled (current export, unprocessed)
+        //   32px/cell  — native sheet after a 4x upscale (the intended case; cut 1:1)
+        //   128px/cell — legacy sheet that was already 4x before upscaling (downscaled)
         const src = img.width / sheet.cropW;   // one 8x8 cell in the HD sheet
+        // Below the pack cell size the sheet cannot carry HD detail at all — it is the
+        // raw SD export, and importing it just stretches native art. Silent until now.
+        if (src < dst) animFlatSheets++;
         for (const s of sheet.slices) {
           const key = `${String(s.hash).toUpperCase()}_P${s.pal}`;
-          if (hdPack.animTiles.has(key)) { animDup++; continue; }
+          // Not "first one wins": a tile already present may have come from a WORSE
+          // source (an SD sheet imported earlier, or a set restored from the container).
+          // Silently skipping meant an HD re-import could never repair it — that is how
+          // gfxset_1D kept 99 of its 105 anim tiles at native resolution while gfxset_20
+          // got the upscaled ones.
+          // The rule is deliberately NOT "more source pixels wins": legacy sheets measure
+          // 128px/cell yet came from a 4x blow-up, so a bigger number does not mean better
+          // art. What is reliable is the floor — below the pack cell size a sheet demonstrably
+          // carries no HD detail. So: a later import wins, except when it is that raw SD case.
+          const prev = hdPack.animTiles.get(key);
+          if (prev) {
+            if (src < dst) { animDup++; continue; }   // never downgrade to un-upscaled art
+            prev.bitmap?.close?.();
+            animUpgraded++;
+          }
           const sx = s.col * src, sy = s.row * src;
           if (sx < 0 || sy < 0 || sx + src > img.width + 0.5 || sy + src > img.height + 0.5) continue;
           const c = new OffscreenCanvas(dst, dst);
@@ -7991,22 +8058,47 @@ async function importHDPack(file) {
             cx.scale(s.flipH ? -1 : 1, s.flipV ? -1 : 1);
           }
           cx.drawImage(img, sx, sy, src, src, 0, 0, dst, dst);
+          const layers = (Array.isArray(s.layers) && s.layers.length)
+            ? s.layers
+            : [s.layer != null ? s.layer : sheet.layer];
           hdPack.animTiles.set(key, {
             bitmap: await createImageBitmap(c),
             hash: String(s.hash).toUpperCase(), pal: s.pal,
-            layer: s.layer != null ? s.layer : sheet.layer,
+            layer: layers[0], layers,
+            srcPx: src,   // source pixels per 8x8 cell — lets a later import compare quality
           });
           animNew++;
         }
         img.close();
       }
-      console.log(`[animtiles] Import: ${animSheets} Sheets → ${animNew} HD-Kacheln (${animDup} Duplikate übersprungen), ` +
-                  `Zellgröße ${dst}px`);
+      console.log(`[animtiles] Import: ${animSheets} Sheets → ${animNew} HD-Kacheln ` +
+                  `(${animUpgraded} bessere ersetzt, ${animDup} übersprungen), Zellgröße ${dst}px`);
+      if (animFlatSheets > 0) {
+        const msg = `${animFlatSheets} von ${animSheets} Anim-Sheets sind NICHT hochskaliert `
+          + `(weniger als ${dst}px pro 8x8-Zelle). Der SD-Export rendert sie nativ mit 8px; `
+          + `nach dem 4x-Upscale müssen es ${dst}px sein.\n\n`
+          + `Diese Kacheln landen in nativer Auflösung im Pack und sehen im Spiel aus wie SD.\n\n`
+          + `Vermutlich wurde die SD-ZIP statt der "_hd4x"-ZIP importiert.`;
+        console.warn('[animtiles] ' + msg);
+        alert('Achtung — Anim-Sheets ohne Upscale\n\n' + msg);
+      }
     }
 
     // BG2/BG3: overwrite if present in this pack
     if (hdBg2) { hdPack.bg2 = hdBg2; hdPack.bg2GfxSet = manifest.gfxSetIndex; }
     if (hdBg3) { hdPack.bg3 = hdBg3; hdPack.bg3GfxSet = manifest.gfxSetIndex; }
+    if (hdCmFg) {
+      hdPack.cmFg = hdCmFg;
+      hdPack.cmFgGfxSet = manifest.gfxSetIndex;
+      hdPack.cmFgSource = manifest.cmFg.source || 'bg1';
+      if (manifest.cmFg.colorMathAlpha != null) hdPack.cmFgAlpha = manifest.cmFg.colorMathAlpha;
+      hdPack.cmFgSubtract = !!manifest.cmFg.colorMathSubtract;
+      const fgScale = manifest.cmFg.widthPx ? (hdCmFg.width / manifest.cmFg.widthPx) : 1;
+      console.log(`[cmFg] Overlay importiert: ${hdCmFg.width}x${hdCmFg.height} = ${fgScale}x der SD-Vorlage.`);
+      if (fgScale <= 1) {
+        console.warn('[cmFg] Das Overlay ist NICHT hochskaliert — die Honig-Kacheln landen in nativer Auflösung im Pack.');
+      }
+    }
 
     // Update scaleFactor only when this pack had actual images to auto-detect from.
     // A BG2-only pack has scaleFactor=1 in the manifest and no tiles/clusters to detect
@@ -8029,13 +8121,16 @@ async function importHDPack(file) {
     btn.textContent = `Merged! (${mergeInfo})`;
     console.log(`HD Pack merged: ${scaleFactor}x | ${mergeInfo} | ${sizeMB} MB`);
     setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
-    
+
+    return { kind: 'level', gfxSetIndex: manifest.gfxSetIndex, tileCount: hdPack.tiles.size };
+
   } catch (err) {
     console.error('HD Import error:', err);
     btn.textContent = 'Import failed!';
     btn.disabled = false;
     setTimeout(() => { btn.textContent = origText; }, 2000);
     alert('HD Import failed: ' + err.message);
+    return { kind: 'none' };
   }
 }
 
@@ -8144,6 +8239,20 @@ function fnv1a_64(bytes, offset, length) {
   return hash;
 }
 
+// Read one stored set record (or null). Used by saveCurrentHDToContainer() to compare
+// against what is about to be written — hdSaveSet() is a full-record put(), so a save
+// that carries less than the stored record DELETES the difference.
+async function hdGetSet(containerName, type, setId) {
+  const db = await getHDDB();
+  const key = `${containerName}/${type}/${setId}`;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sets', 'readonly');
+    const req = tx.objectStore('sets').get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 async function hdSaveSet(containerName, type, setId, data) {
   const db = await getHDDB();
   const key = `${containerName}/${type}/${setId}`;
@@ -8242,9 +8351,9 @@ async function saveCurrentHDToContainer(containerName) {
   // the export to produce PNGs with wrong pixel content (Bug: Level 2 showed
   // Level 1 graphics because gfxset_7 tiles overwrote gfxset_37's exports).
   const currentGfxIdx = activeGfxIdx;
-  const tiles = [];
+  const ownTileIds = [];
   let skippedForeignTiles = 0;
-  for (const [id, bmp] of hdPack.tiles) {
+  for (const id of hdPack.tiles.keys()) {
     const keyStr = String(id);
     // Keep tiles belonging to current gfxset (prefix match) or unprefixed legacy tiles
     if (currentGfxIdx !== undefined && keyStr.includes('_')) {
@@ -8253,7 +8362,7 @@ async function saveCurrentHDToContainer(containerName) {
         continue;  // skip foreign gfxset tiles
       }
     }
-    tiles.push({ id, blob: await bitmapToBlob(bmp) });
+    ownTileIds.push(id);
   }
   if (skippedForeignTiles > 0) {
     console.log(`[save] Filtered out ${skippedForeignTiles} tiles from other gfxsets (keeping only gfxset ${currentGfxIdx})`);
@@ -8262,15 +8371,89 @@ async function saveCurrentHDToContainer(containerName) {
   // S6b anim tiles. Unlike hdPack.tiles these are keyed by CONTENT HASH, which is
   // gfxset-independent by design — the whole point of the hash-addressed format. They
   // are still stored per gfxset set-record (that is the container's unit of storage),
-  // so all of them go with whichever set is being saved.
-  const animTiles = [];
+  // so all of them go with whichever set is being saved. Built BEFORE the guard below
+  // so an aborted save can still rescue them (see there).
+  let animTiles = [];
   for (const [key, a] of (hdPack.animTiles || new Map())) {
-    animTiles.push({ key, hash: a.hash, pal: a.pal, layer: a.layer, blob: await bitmapToBlob(a.bitmap) });
+    animTiles.push({ key, hash: a.hash, pal: a.pal, layer: a.layer,
+                     layers: a.layers || [a.layer], srcPx: a.srcPx || null,
+                     blob: await bitmapToBlob(a.bitmap) });
+  }
+
+  // ---- Overwrite guard ----
+  // hdSaveSet() is a full-record put(), and the block at the end of this function
+  // deliberately FREES this gfxset's bitmaps from hdPack once they are persisted.
+  // So a second save aimed at the same set finds nothing resident and would write
+  // tiles: [] straight over the stored art. That is how gfxset_07 (Pirate Panic,
+  // 1239 tiles) and parts of gfxset_04/03 were lost: importing sprites while a level
+  // was selected made activeGfxIdx fall back to that level's gfxset, the per-gfxset
+  // filter above matched nothing, and the record was overwritten with an empty list.
+  // The size check at the top of this function only sees hdPack.tiles as a WHOLE, so
+  // it stays happy as long as some OTHER gfxset is resident.
+  const existingSet = await hdGetSet(containerName, 'level', setId);
+  const existingTileCount = existingSet?.tiles?.length || 0;
+  if (existingTileCount > 0 && ownTileIds.length === 0) {
+    const msg = `[save] ABGEBROCHEN: "${setId}" (gfxset ${currentGfxIdx}) enthält im Container `
+      + `${existingTileCount} Kacheln, im Speicher liegt aber keine einzige dieses Gfxsets. `
+      + `Speichern würde sie löschen. Der Container bleibt unverändert.`;
+    console.error(msg);
+    // Don't let the guard create a new way to lose data: anim tiles that were just
+    // imported live only in memory and are hash-keyed (nothing to re-derive them from).
+    // Write them into the existing record without touching any other field.
+    let rescued = '';
+    if (animTiles.length > 0) {
+      const { key, container, type, setId: _sid, ...rest } = existingSet;
+      await hdSaveSet(containerName, 'level', setId, { ...rest, animTiles, savedAt: Date.now() });
+      for (const a of hdPack.animTiles.values()) a.bitmap?.close?.();
+      hdPack.animTiles.clear();
+      rescued = `\n\n${animTiles.length} neue Anim-Kacheln wurden trotzdem gesichert `
+        + `(nur sie — die vorhandenen Kacheln blieben unangetastet).`;
+      console.warn(`[save] "${setId}": ${animTiles.length} Anim-Kacheln trotz Abbruch gespeichert.`);
+    }
+    alert(msg + '\n\nUrsache ist meist: Import eines anderen Sets (z.B. Sprites), während dieses '
+      + 'Level/Gfxset ausgewählt war. Der Container ist in Ordnung — einfach weiterarbeiten.' + rescued);
+    return 0;
+  }
+  if (existingTileCount > 0 && ownTileIds.length < existingTileCount) {
+    const ok = confirm(
+      `"${setId}" (gfxset ${currentGfxIdx}) hat im Container ${existingTileCount} Kacheln, `
+      + `gespeichert würden jetzt nur ${ownTileIds.length}.\n\n`
+      + `${existingTileCount - ownTileIds.length} Kacheln gingen dabei verloren.\n\n`
+      + `Trotzdem speichern?`);
+    if (!ok) {
+      console.warn(`[save] "${setId}" auf Wunsch NICHT gespeichert (hätte ${existingTileCount - ownTileIds.length} Kacheln verloren).`);
+      return 0;
+    }
+    console.warn(`[save] "${setId}": Überschreiben bestätigt — ${existingTileCount} → ${ownTileIds.length} Kacheln.`);
+  }
+
+  const tiles = [];
+  for (const id of ownTileIds) {
+    tiles.push({ id, blob: await bitmapToBlob(hdPack.tiles.get(id)) });
+  }
+
+  // Same overwrite trap as the tiles above, and hit even more easily: the freeing block
+  // at the end CLEARS hdPack.animTiles after every save, so any later save of this set
+  // would write an empty list over them. They are hash-keyed and gfxset-independent, so
+  // there is nothing to re-derive from — carry the stored ones forward instead.
+  if (animTiles.length === 0 && existingSet?.animTiles?.length) {
+    animTiles = existingSet.animTiles;
+    console.log(`[save] "${setId}": ${animTiles.length} gespeicherte Anim-Kacheln übernommen (keine im Speicher).`);
   }
 
   let bg2Blob = null, bg3Blob = null, wallBlob = null;
   if (hdPack.bg2) bg2Blob = await bitmapToBlob(hdPack.bg2);
   if (hdPack.bg3) bg3Blob = await bitmapToBlob(hdPack.bg3);
+  // bg2/bg3 are freed from hdPack after a save exactly like the tiles, so a re-save
+  // would null them out in the record. Keep whatever is already stored.
+  if (!bg2Blob && existingSet?.bg2Blob) {
+    bg2Blob = existingSet.bg2Blob;
+    console.log(`[save] "${setId}": gespeichertes BG2-Bild übernommen (keines im Speicher).`);
+  }
+  if (!bg3Blob && existingSet?.bg3Blob) {
+    bg3Blob = existingSet.bg3Blob;
+    console.log(`[save] "${setId}": gespeichertes BG3-Bild übernommen (keines im Speicher).`);
+  }
   // Wall blob: convert wallData ImageData to PNG blob (no HD version yet, always native res)
   if (currentMatchesActive && currentBgData && currentBgData.wallData) {
     const wd = currentBgData.wallData;
@@ -8311,6 +8494,28 @@ async function saveCurrentHDToContainer(containerName) {
     if (cmFgSource === 'bg1' && sfg.canvas) {
       cmFgBlob = await sfg.canvas.convertToBlob({ type: 'image/png' });
     }
+  }
+  // An imported HD overlay beats the native one rebuilt above. Without this the honey
+  // overlay went through the upscaler, landed in hdPack.cmFg — and was then overwritten
+  // in the container by the native redraw from currentFgData/catalogData, so the pack
+  // export sliced native art no matter what was imported. bg2/bg3 already read from
+  // hdPack for exactly this reason.
+  if (hdPack.cmFg && (hdPack.cmFgGfxSet == null || hdPack.cmFgGfxSet === activeGfxIdx)) {
+    cmFgBlob = await bitmapToBlob(hdPack.cmFg);
+    cmFgSource = hdPack.cmFgSource || cmFgSource || 'bg1';
+    if (hdPack.cmFgAlpha != null) cmFgAlpha = hdPack.cmFgAlpha;
+    cmFgSubtract = !!hdPack.cmFgSubtract;
+    console.log(`[save] "${setId}": HD-Overlay aus dem Speicher gespeichert (${hdPack.cmFg.width}x${hdPack.cmFg.height}).`);
+  }
+
+  // Both blobs above are rebuilt from currentBgData/catalogData, which describe the
+  // gfxset only while it is the one on screen (currentMatchesActive). Saving from any
+  // other context would otherwise null them out in the stored record.
+  if (!wallBlob && existingSet?.wallBlob) wallBlob = existingSet.wallBlob;
+  if (!cmFgBlob && existingSet?.cmFgBlob) {
+    cmFgBlob = existingSet.cmFgBlob;
+    if (cmFgSource == null) cmFgSource = existingSet.ppuConfig?.cmFgSource ?? null;
+    if (cmFgAlpha == null) cmFgAlpha = existingSet.ppuConfig?.cmFgAlpha ?? null;
   }
 
   // Collect tile arrangement and PPU data for texture pack export
@@ -8748,10 +8953,24 @@ async function loadContainerToHDPack(containerName) {
         existingClusterKeys.add(key);
       }
     }
+    // Anim tiles were NOT restored here before, so hdPack.animTiles stayed empty after
+    // "Laden" — and a subsequent import had nothing to compare against, letting a
+    // low-resolution sheet overwrite good tiles in the container. They are hash-keyed
+    // and gfxset-independent, so they merge across sets; on collision the one from the
+    // higher-resolution sheet wins (same rule as the import).
+    for (const a of (set.animTiles || [])) {
+      const prev = hdPack.animTiles.get(a.key);
+      if (prev && (a.srcPx || 0) < (prev.srcPx || 0)) continue;   // keep the better source
+      prev?.bitmap?.close?.();
+      hdPack.animTiles.set(a.key, {
+        bitmap: await createImageBitmap(a.blob), hash: a.hash, pal: a.pal,
+        layer: a.layer, layers: a.layers || [a.layer], srcPx: a.srcPx || null,
+      });
+    }
   }
 
   // Load sprite sets
-  let totalSpriteFrames = 0;
+  let totalSpriteFrames = 0, spritesWithoutMeta = 0;
   for (const set of spriteSets) {
     const hdFrames = new Map();
     for (const f of (set.frames || [])) {
@@ -8762,15 +8981,29 @@ async function loadContainerToHDPack(containerName) {
       }
     }
     if (hdFrames.size > 0) {
+      // Restore frame placement metadata — the pack export needs it to slice
+      // frames into hash-keyed cells. Absent for sprites stored before it was
+      // persisted; those export as "no tiles[]" until re-imported.
+      const hdMeta = new Map();
+      for (const m of (set.meta || [])) {
+        hdMeta.set(m.idx, { offsetX: m.offsetX || 0, offsetY: m.offsetY || 0, tiles: m.tiles || null });
+      }
+      if (hdMeta.size === 0) spritesWithoutMeta++;
       hdPack.sprites.set(set.setId, {
         animId: set.animId,
         name: set.name,
         scaleFactor: set.scaleFactor || hdPack.scaleFactor,
         frames: hdFrames,
+        meta: hdMeta,
         paddedWidth: set.paddedWidth || 0,
         paddedHeight: set.paddedHeight || 0,
       });
     }
+  }
+  if (spritesWithoutMeta > 0) {
+    console.warn(`[sprites] ${spritesWithoutMeta} von ${spriteSets.length} Sprite-Sets im Container haben KEINE ` +
+                 `Platzierungs-Metadaten (vor dem Fix gespeichert). Sie werden angezeigt, aber der Pack-Export ` +
+                 `überspringt sie — diese Sets einmal neu per "Import HD" einspielen.`);
   }
 
   activeContainerName = containerName;
@@ -8859,7 +9092,9 @@ async function ensureGfxSetHDLoaded(gfxIdx) {
     hdPack.animTiles.clear();
   } else hdPack.animTiles = new Map();
   for (const a of (set.animTiles || [])) {
-    hdPack.animTiles.set(a.key, { bitmap: await createImageBitmap(a.blob), hash: a.hash, pal: a.pal, layer: a.layer });
+    hdPack.animTiles.set(a.key, { bitmap: await createImageBitmap(a.blob), hash: a.hash,
+                                  pal: a.pal, layer: a.layer, layers: a.layers || [a.layer],
+                                  srcPx: a.srcPx || null });
   }
 
   hdEnabled = true;
@@ -9219,7 +9454,30 @@ async function exportAsTexturePack(containerName) {
   let exportedTiles = 0;
   let bg1PaletteVariants = 0;  // count of extra tiles added by ROM palette scan
   let animExportedTiles = 0;
-  const animExportedKeys = new Set();  // "h{hash}_P{pal}" — global, hashes are gfxset-independent
+  const animExportedKeys = new Set();  // "{layer}/h{hash}_P{pal}" — hashes are gfxset-independent
+  // hash -> every BG layer it was recorded on. Built from the live bgcap rather than
+  // from what the container happens to store, so a pack export fixes the layer set
+  // without a re-import (see the use site).
+  let animHashLayers = null;
+  if (bgCapEntries && bgCapEntries.length) {
+    animHashLayers = new Map();
+    const seen = new Map();
+    for (const e of bgCapEntries) {
+      if (!e.isAnim || e.layer > 1) continue;
+      const h = String(e.hash).toUpperCase();
+      if (!seen.has(h)) seen.set(h, new Set());
+      for (const l of (e.layers && e.layers.length ? e.layers : [e.layer])) {
+        if (l >= 0 && l <= 1) seen.get(h).add(l);
+      }
+    }
+    for (const [h, s] of seen) animHashLayers.set(h, [...s].sort());
+    const multi = [...animHashLayers.values()].filter(v => v.length > 1).length;
+    console.log(`[animtiles] Layer-Zuordnung aus bgcap: ${animHashLayers.size} Hashes, ${multi} auf mehreren Layern`);
+  } else {
+    console.warn('[animtiles] Kein bgcap geladen — Anim-Kacheln werden nur auf ihrem gespeicherten Layer exportiert. ' +
+                 'Teilen sich BG1/BG2 ein CHR-Fenster (z.B. Hot Head), fehlt HD auf dem anderen Layer. ' +
+                 'BG-Anim-Button laden und erneut exportieren.');
+  }
   // R3 palette auto-detect: per gfxset, samples of (palRow, native CHR indices,
   // downscaled HD pixels). Every candidate level palette is scored against
   // these — the reference no longer depends on which level the user happens to
@@ -9737,14 +9995,31 @@ async function exportAsTexturePack(containerName) {
     // identify the art. The "h" prefix tells Mesen's loader to read the 16 hex digits
     // as a content hash directly (same idea as sprites/{hash}_P{pal}.png). The gfxset
     // folder still scopes them, and the layer picks bg1 vs bg2.
+    // One PNG per layer the content was actually observed on. Mesen's tile key
+    // includes the layer, and some levels point BG1 and BG2 at the same CHR window
+    // (Hot Head: 203 of 1110 hashes show up on both) — shipping only one layer would
+    // silently miss every lookup on the other. Same bytes, so the copy is exact.
     for (const a of (set.animTiles || [])) {
-      const layer = a.layer != null ? a.layer : 0;
-      const folder = root.folder(`bg/bg${layer + 1}/gfxset_${gfxIdStr}`);
-      const fileKey = `h${String(a.hash).toUpperCase()}_P${String(a.pal).padStart(2, '0')}`;
-      if (animExportedKeys.has(fileKey)) continue;
-      animExportedKeys.add(fileKey);
-      folder.file(`${fileKey}.png`, a.blob);
-      animExportedTiles++;
+      // Layer set, best source first:
+      //  1. the live bgcap recording — authoritative and always current, and the only
+      //     source that fixes containers filled before layers[] existed (the field
+      //     otherwise rides in the SD manifest, which the user carries through the
+      //     upscaler, so it cannot be corrected without re-exporting and re-upscaling);
+      //  2. layers[] stored with the tile;
+      //  3. the single layer it was imported under.
+      const capLayers = animHashLayers ? animHashLayers.get(String(a.hash).toUpperCase()) : null;
+      const layers = (capLayers && capLayers.length) ? capLayers
+        : (Array.isArray(a.layers) && a.layers.length)
+          ? a.layers : [a.layer != null ? a.layer : 0];
+      const fileName = `h${String(a.hash).toUpperCase()}_P${String(a.pal).padStart(2, '0')}.png`;
+      for (const layer of layers) {
+        if (layer < 0 || layer > 2) continue;
+        const dedupKey = `${layer}/${fileName}`;
+        if (animExportedKeys.has(dedupKey)) continue;
+        animExportedKeys.add(dedupKey);
+        root.folder(`bg/bg${layer + 1}/gfxset_${gfxIdStr}`).file(fileName, a.blob);
+        animExportedTiles++;
+      }
     }
   }
 
@@ -10200,8 +10475,43 @@ async function exportAsTexturePack(containerName) {
   // with the S5a build grows the recording.
   let spriteExportedTiles = 0;
   {
-    const sprSrc = (typeof hdPack !== 'undefined' && hdPack && hdPack.sprites) ? hdPack.sprites : null;
-    if (sprSrc && sprSrc.size > 0) {
+    // Sprites are read from the CONTAINER, like every other part of this export.
+    // They used to be taken only from the in-memory hdPack, so an export that did not
+    // happen to follow an "Import HD"/"Laden" in the same session silently shipped an
+    // empty sprites/ folder — the container held the art the whole time.
+    // Frames stay as blobs here and are decoded one at a time in the loop below: a full
+    // container is >20k frames, and materialising them all would blow up memory.
+    const sprSources = [];
+    for (const s of sets.filter(s => s.type === 'sprite' || s.type === 'mapicon')) {
+      const metaMap = new Map();
+      for (const m of (s.meta || [])) metaMap.set(m.idx, m);
+      const frames = [];
+      for (const f of (s.frames || [])) {
+        const idx = parseInt(String(f.key).replace('frame_', ''), 10);
+        if (!isNaN(idx) && f.blob) frames.push({ idx, blob: f.blob });
+      }
+      if (frames.length) {
+        sprSources.push({ key: s.setId, scaleFactor: s.scaleFactor || 4, metaMap, frames });
+      }
+    }
+    // Fallback for sprites imported in this session but not (yet) written to the container.
+    if (sprSources.length === 0 && hdPack && hdPack.sprites && hdPack.sprites.size > 0) {
+      for (const [key, spr] of hdPack.sprites) {
+        sprSources.push({
+          key, scaleFactor: spr.scaleFactor || 4, metaMap: spr.meta || new Map(),
+          frames: [...spr.frames].map(([idx, bitmap]) => ({ idx, bitmap })),
+        });
+      }
+      console.log(`[sprites] ${sprSources.length} Sprite-Sets aus dem Speicher (im Container liegen keine).`);
+    }
+    if (sprSources.length === 0) {
+      console.warn('[sprites] Weder im Container noch im Speicher HD-Sprites gefunden — sprites/ bleibt leer. ' +
+                   'Sprite-ZIP per "Import HD" einspielen.');
+    } else {
+      const totalFrames = sprSources.reduce((n, s) => n + s.frames.length, 0);
+      console.log(`[sprites] Quelle: ${sprSources.length} Sets, ${totalFrames} Frames.`);
+    }
+    if (sprSources.length > 0) {
       showMesenExportProgress('Sprite-Tiles exportieren…', 0.83);
       await _yieldToBrowser();
       if (!spriteCapPairs) {
@@ -10213,7 +10523,8 @@ async function exportAsTexturePack(containerName) {
         const noPalHashes = new Set();       // seen but never recorded at runtime
         let noMetaFrames = 0, sprFrameCount = 0;
 
-        for (const [spriteKey, spr] of sprSrc) {
+        for (const spr of sprSources) {
+          const spriteKey = spr.key;
           const sprScale = spr.scaleFactor || 4;
           if (sprScale !== 4) {
             console.warn(`[sprites] ${spriteKey}: scaleFactor ${sprScale} != 4 — übersprungen (Pack-Format ist 4x)`);
@@ -10221,59 +10532,84 @@ async function exportAsTexturePack(containerName) {
           }
           const cellSize = 8 * sprScale;
 
-          for (const [fi, img] of spr.frames) {
-            const meta = spr.meta ? spr.meta.get(fi) : null;
+          for (const fr of spr.frames) {
+            const fi = fr.idx;
+            const meta = spr.metaMap.get(fi);
             if (!meta || !meta.tiles) { noMetaFrames++; continue; }
+
+            // Decide BEFORE decoding whether this frame can still contribute anything.
+            // Every hash is written once across the whole pack, so late frames are
+            // almost all redundant — decoding them would dominate the export time.
+            let frameNeeded = false;
+            for (const t of meta.tiles) {
+              const hashHex = String(t.hash).toUpperCase();
+              const pals = spriteCapPairs.get(hashHex);
+              if (!pals || pals.size === 0) { noPalHashes.add(hashHex); continue; }
+              for (const p of pals) { if (!writtenKeys.has(`${hashHex}_P${p}`)) { frameNeeded = true; break; } }
+            }
+            if (!frameNeeded) continue;
+
             sprFrameCount++;
             if (sprFrameCount % 8 === 0) {
               showMesenExportProgress(`Sprite-Tiles: ${spriteKey} Frame ${fi}…`, 0.83);
               await _yieldToBrowser();
             }
 
-            for (const t of meta.tiles) {
-              const hashHex = String(t.hash).toUpperCase();
-              const pals = spriteCapPairs.get(hashHex);
-              if (!pals || pals.size === 0) { noPalHashes.add(hashHex); continue; }
-              let needed = false;
-              for (const p of pals) { if (!writtenKeys.has(`${hashHex}_P${p}`)) { needed = true; break; } }
-              if (!needed) continue;
+            // Container frames arrive as blobs; hdPack frames are already decoded.
+            const img = fr.bitmap || await createImageBitmap(fr.blob);
+            try {
+              for (const t of meta.tiles) {
+                const hashHex = String(t.hash).toUpperCase();
+                const pals = spriteCapPairs.get(hashHex);
+                if (!pals || pals.size === 0) continue;
+                let needed = false;
+                for (const p of pals) { if (!writtenKeys.has(`${hashHex}_P${p}`)) { needed = true; break; } }
+                if (!needed) continue;
 
-              // Cell position inside the padded HD frame
-              const sx = (t.x + meta.offsetX) * sprScale;
-              const sy = (t.y + meta.offsetY) * sprScale;
-              if (sx < 0 || sy < 0 || sx + cellSize > img.width || sy + cellSize > img.height) continue;
+                // Cell position inside the padded HD frame
+                const sx = (t.x + meta.offsetX) * sprScale;
+                const sy = (t.y + meta.offsetY) * sprScale;
+                if (sx < 0 || sy < 0 || sx + cellSize > img.width || sy + cellSize > img.height) continue;
 
-              const outCanvas = document.createElement('canvas');
-              outCanvas.width = cellSize; outCanvas.height = cellSize;
-              const octx = outCanvas.getContext('2d');
-              octx.drawImage(img, sx, sy, cellSize, cellSize, 0, 0, cellSize, cellSize);
+                const outCanvas = document.createElement('canvas');
+                outCanvas.width = cellSize; outCanvas.height = cellSize;
+                const octx = outCanvas.getContext('2d');
+                octx.drawImage(img, sx, sy, cellSize, cellSize, 0, 0, cellSize, cellSize);
 
-              // Skip fully transparent cells (tile hidden behind overlap etc.)
-              const idata = octx.getImageData(0, 0, cellSize, cellSize).data;
-              let anyOpaque = false;
-              for (let a = 3; a < idata.length; a += 4) { if (idata[a] > 8) { anyOpaque = true; break; } }
-              if (!anyOpaque) continue;
+                // Skip fully transparent cells (tile hidden behind overlap etc.)
+                const idata = octx.getImageData(0, 0, cellSize, cellSize).data;
+                let anyOpaque = false;
+                for (let a = 3; a < idata.length; a += 4) { if (idata[a] > 8) { anyOpaque = true; break; } }
+                if (!anyOpaque) continue;
 
-              const dataUrl = outCanvas.toDataURL('image/png');
-              const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-              const rawPng = atob(b64);
-              const arr = new Uint8Array(rawPng.length);
-              for (let k = 0; k < rawPng.length; k++) arr[k] = rawPng.charCodeAt(k);
-              const blob = new Blob([arr], { type: 'image/png' });
+                const dataUrl = outCanvas.toDataURL('image/png');
+                const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+                const rawPng = atob(b64);
+                const arr = new Uint8Array(rawPng.length);
+                for (let k = 0; k < rawPng.length; k++) arr[k] = rawPng.charCodeAt(k);
+                const blob = new Blob([arr], { type: 'image/png' });
 
-              for (const p of pals) {
-                const fileKey = `${hashHex}_P${p}`;
-                if (writtenKeys.has(fileKey)) continue;
-                writtenKeys.add(fileKey);
-                spritesFolder.file(`${fileKey}.png`, blob);
-                spriteExportedTiles++;
+                for (const p of pals) {
+                  const fileKey = `${hashHex}_P${p}`;
+                  if (writtenKeys.has(fileKey)) continue;
+                  writtenKeys.add(fileKey);
+                  spritesFolder.file(`${fileKey}.png`, blob);
+                  spriteExportedTiles++;
+                }
               }
+            } finally {
+              if (!fr.bitmap) img.close();   // release container-decoded frames again
             }
           }
         }
         console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert; ` +
           `${noPalHashes.size} Hashes ohne Runtime-Palette übersprungen (mehr Level mit S5a-Build spielen); ` +
-          `${noMetaFrames} Frames ohne tiles[] (Manifest vor v2 — Sprites neu exportieren+upscalen)`);
+          `${noMetaFrames} Frames ohne Platzierungs-Metadaten`);
+        if (noMetaFrames > 0 && spriteExportedTiles === 0) {
+          console.warn('[sprites] ALLE Frames ohne Platzierungs-Metadaten. Zwei mögliche Ursachen: ' +
+            '(a) die Sprites liegen seit vor dem meta-Persistenz-Fix im Container — einmal neu per "Import HD" ' +
+            'einspielen; (b) das Manifest der importierten ZIP ist älter als v2 (dann Sprites neu exportieren).');
+        }
       }
     }
   }
@@ -11317,28 +11653,31 @@ async function refreshContainerSetMetadata(containerName) {
     }
   }
 
-  // Re-save: keep existing tile bitmaps, update all metadata
+  // Re-save: keep EVERYTHING that was stored, overwrite only the metadata this
+  // function recomputes. hdSaveSet() is a full-record put(), so anything not listed
+  // here would be deleted — this used to enumerate the fields to preserve by hand and
+  // silently dropped `animTiles` (hash-keyed, unrecoverable) and `paletteSnapshot`
+  // (export falls back to the ROM first-level palette → wrong-sister-level color cast).
+  // Spreading the stored record instead makes that class of omission impossible, also
+  // for fields added later.
+  const { key: _k, container: _c, type: _t, setId: _s, ...preserved } = existing;
   await hdSaveSet(containerName, 'level', setId, {
-    scaleFactor: existing.scaleFactor,
+    ...preserved,
     tileCount: existing.tileCount || (existing.tiles || []).length,
-    tiles: existing.tiles || [],
-    clusters: existing.clusters || [],
-    bg2Blob: existing.bg2Blob || null,
-    bg3Blob: existing.bg3Blob || null,
-    wallBlob: existing.wallBlob || null,
-    cmFgBlob: existing.cmFgBlob || null,
-    gfxSetIndex: existing.gfxSetIndex,
-    tileArrangementData,
-    tileArrangementTileCount,
-    gfxCount,
-    ppuConfig,
-    bg2TilemapData,
-    bg3TilemapData,
-    wallTilemapData,
-    bg1TilemapData,
-    tileChecksums,
-    chrRawData,
-    vramSnapshot,
+    // A refresh should only ever improve the metadata. Where derivation came up empty
+    // (e.g. refreshing a set whose level isn't the one currently loaded), keep what is
+    // stored rather than replacing a good value with null.
+    tileArrangementData: tileArrangementData ?? preserved.tileArrangementData ?? null,
+    tileArrangementTileCount: tileArrangementTileCount || preserved.tileArrangementTileCount || 0,
+    gfxCount: gfxCount || preserved.gfxCount || 0,
+    ppuConfig: ppuConfig ?? preserved.ppuConfig ?? null,
+    bg2TilemapData: bg2TilemapData ?? preserved.bg2TilemapData ?? null,
+    bg3TilemapData: bg3TilemapData ?? preserved.bg3TilemapData ?? null,
+    wallTilemapData: wallTilemapData ?? preserved.wallTilemapData ?? null,
+    bg1TilemapData: bg1TilemapData ?? preserved.bg1TilemapData ?? null,
+    tileChecksums: (tileChecksums && tileChecksums.length) ? tileChecksums : (preserved.tileChecksums || []),
+    chrRawData: chrRawData ?? preserved.chrRawData ?? null,
+    vramSnapshot: vramSnapshot ?? preserved.vramSnapshot ?? null,
     savedAt: Date.now()
   });
 
@@ -11395,7 +11734,7 @@ function closeContainerSelectDialog() {
 
 async function importHDPackToContainer(file, containerName) {
   // First, run the existing import logic
-  await importHDPack(file);
+  const imported = await importHDPack(file);
 
   // If a container was specified, save the imported data
   if (containerName && hdPack) {
@@ -11405,10 +11744,16 @@ async function importHDPackToContainer(file, containerName) {
 
     try {
       let savedInfo = '';
-      // Save level tiles
-      if (hdPack.tiles.size > 0) {
+      // Save level tiles — ONLY when this ZIP actually was a level pack. Asking
+      // hdPack.tiles.size instead (as this used to) sees the whole session's
+      // accumulated tiles, so a sprite import triggered a level save whose target
+      // gfxset came from whatever level was selected — and wrote an empty tile list
+      // over that set's stored art.
+      if (imported?.kind === 'level') {
         const tileCount = await saveCurrentHDToContainer(containerName);
         savedInfo += `${tileCount} tiles`;
+      } else if (imported?.kind === 'sprites') {
+        console.log('[import] Sprite-ZIP — Level-Sets im Container bleiben unangetastet.');
       }
       // Save sprite HD data
       if (hdPack.sprites && hdPack.sprites.size > 0) {
@@ -11421,12 +11766,24 @@ async function importHDPackToContainer(file, containerName) {
             blob: await bitmapToBlob(img),
             w: img.width, h: img.height
           })));
+          // Frame placement metadata (offset inside the padded canvas + the
+          // frame→OBJ-tile mapping). WITHOUT this the pack export cannot slice a
+          // frame into hash-keyed cells, so every frame is dropped as "no tiles[]"
+          // — which is exactly what happened to sprites saved before this was
+          // persisted: they survived the round-trip as images but became
+          // un-exportable, and the export blamed an outdated manifest version.
+          const meta = [];
+          if (sprData.meta) {
+            for (const [idx, m] of sprData.meta) {
+              meta.push({ idx, offsetX: m.offsetX || 0, offsetY: m.offsetY || 0, tiles: m.tiles || null });
+            }
+          }
           await hdSaveSet(containerName, 'sprite', key, {
             animId: sprData.animId, name: sprData.name,
             scaleFactor: sprData.scaleFactor,
             paddedWidth: sprData.paddedWidth || 0,
             paddedHeight: sprData.paddedHeight || 0,
-            frameCount: frames.length, frames,
+            frameCount: frames.length, frames, meta,
             savedAt: Date.now()
           });
           sprCount++;
