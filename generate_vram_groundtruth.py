@@ -23,6 +23,7 @@ def main():
         return
 
     ground_truth = {}
+    cgram_truth  = {}
     total_bytes  = 0
 
     for filename in sorted(os.listdir(DUMP_FOLDER)):
@@ -37,7 +38,22 @@ def main():
             continue
         ground_truth[gfxset_id] = base64.b64encode(data).decode("ascii")
         total_bytes += len(data)
-        print(f"  {gfxset_id}: {len(data):,} bytes -> {len(ground_truth[gfxset_id]):,} base64 chars")
+
+        # CGRAM alongside it. The shop/world-map catalog renders straight from the
+        # dump, and the game post-processes palettes at load time (R3), so the live
+        # CGRAM — not the ROM's raw palette — is what the screen actually looks like.
+        cgram_path = os.path.join(DUMP_FOLDER, f"{gfxset_id}_cgram.bin")
+        cg_note = ""
+        if os.path.isfile(cgram_path):
+            with open(cgram_path, "rb") as f:
+                cg = f.read()
+            if len(cg) == 512:
+                cgram_truth[gfxset_id] = base64.b64encode(cg).decode("ascii")
+                total_bytes += len(cg)
+                cg_note = " + 512 B CGRAM"
+            else:
+                print(f"  WARNING: {gfxset_id}_cgram.bin has size {len(cg)} (expected 512) — skipping CGRAM")
+        print(f"  {gfxset_id}: {len(data):,} bytes -> {len(ground_truth[gfxset_id]):,} base64 chars{cg_note}")
 
     if not ground_truth:
         print("No VRAM dumps found!")
@@ -60,6 +76,11 @@ def main():
 // The Viewer auto-applies these snapshots when a container set has no vramSnapshot stored.
 
 const VRAM_GROUND_TRUTH = {json.dumps(ground_truth, indent=2)};
+
+// Matching 512-byte CGRAM dumps, same keys. Used to render shop / world-map
+// screens from the real runtime state instead of the ROM's raw palettes.
+// May cover fewer sets than VRAM_GROUND_TRUTH — always check before use.
+const CGRAM_GROUND_TRUTH = {json.dumps(cgram_truth, indent=2)};
 """
 
     with open(OUTPUT_JS, "w", encoding="utf-8") as f:

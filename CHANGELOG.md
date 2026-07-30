@@ -1,5 +1,200 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-29] — NPC-Shops und Weltkarten: Katalog-Builder (Teil 1 von 4)
+
+Shops und Weltkarten waren bisher vom HD-Pack ausgeschlossen. Sie haben im ROM
+**keinen Gfxset** (Property-Typ `0x0004`/`0x0005` trägt keine Style-Daten) und kein
+Map32-Terrain — sie sind reine Tilemap + CHR. Damit fallen sie durch den BG1-Pfad,
+der part-getrieben ist (`set.tiles` mit Schlüsseln `"{gfxSet}_{partId}"`), passen aber
+exakt auf den tilemap-getriebenen BG2-Pfad.
+
+- **Neu: `buildOverworldCatalog(gfxSetIndex)`** — rendert den Schirm aus dem **echten
+  VRAM+CGRAM-Dump**, nicht aus ROM-rekonstruierten Daten. Das ist kein Detail: der
+  Pack-Export benennt jede Kachel nach ihrer VRAM-Adresse und schneidet sie aus genau
+  diesem Bild, also müssen Bild und Tilemap aus derselben Quelle stammen, sonst werden
+  Kacheln falsch beschriftet. Nebeneffekt: die Content-Hashes decken sich mit Mesens
+  Laufzeit-VRAM.
+- **Neu: `OVERWORLD_SETS`** — synthetische Gfxset-Indizes. Ein Scan aller 192 Level-IDs
+  zeigt, dass das ROM nur `0x02`–`0x34` benutzt, also sind `0x35`+ frei. Die 5 Shops
+  behalten ihre echten Sets `0x08`–`0x0C`.
+  **Achtung:** die Karten-*Level*-IDs sind `0x30`–`0x38`, aber `0x30`–`0x34` sind echte
+  Level-Gfxsets — die Karten dürfen also *nicht* nach ihrer Level-ID benannt werden.
+- **`chr`/`tm`/`wide`/`tall` sind an die Dumps gepinnt, nicht aus `OVERWORLD_WORLDS`
+  abgeleitet.** Die beiden decken sich für 14 von 15 Schirmen, aber der Config für
+  **Lost World** beschreibt `$2000/$7800` — das ist zur Laufzeit dessen **BG2**; sein
+  BG1 liegt bei `$6000/$7C00`. Eine falsche Basis verschiebt die Adressen des ganzen
+  Schirms. Nachprüfbar mit `scratchpad/check_owconfig.py`.
+  Ebenfalls aus den Dumps: drei Schirme sind nicht 32×32 — Hub und K. Rool's Keep sind
+  32×64, Krem Quay ist 64×32.
+- **Groundtruth trägt jetzt auch CGRAM** (`CGRAM_GROUND_TRUTH`, 39 Sets à 512 B). Das
+  Spiel bearbeitet Paletten beim Laden nach (R3), die ROM-Rohpalette ist also nicht das,
+  was auf dem Schirm steht. `VRAM_GROUND_TRUTH` blieb dabei unverändert — geprüft gegen
+  `git show HEAD:`, alle 24 vorbestehenden Sets byte-identisch.
+- **Entfernt: `gfxset_02`.** Der Dump vom 29.06. war keine Level-VRAM, sondern die
+  Lost-World-Karte: alle 10 PPU-Register identisch mit `gfxset_3D`, 92,7 % der belegten
+  Kacheln byte-gleich, und die Karte hat im ROM gar keinen Gfxset. Damals hatte
+  `readCurrentGfxset()` auf der Karte den Restwert `$0539 = 0x02` gelesen. Dateien nach
+  `dkc2_vram_dump\_mislabeled\` verschoben, nichts gelöscht. Der **echte** Gfxset 0x02
+  (Web Woods Beta, Ghostly-Grove-Bonusräume) ist weiterhin ungedumpt.
+
+**Verifiziert:** 13 der 15 Schirme rendern als reines BG1 vollständig (69–100 % Deckung,
+67–110 Farben). Crankys Laden per Auge geprüft — Schilder, Preise, Fässer, alles korrekt.
+Die zwei Ausnahmen sind bekannt und erwartet: **Hub** und **Lost World** komponieren
+zusätzlich BG2 (Lost Worlds BG1 ist nur eine dünne Overlay-Ebene, 6 % Deckung), die
+brauchen später einen Zwei-Ebenen-Pfad.
+
+### Freigabe im Katalog (Teile 2–3, user-getestet)
+
+- `scanGraphicsSets()` trägt die 15 Schirme als synthetische Sets nach (Marker
+  `kind:'overworld'`). Keine Kollision: die Shop-Sets `0x08`–`0x0C` überspringt die
+  ROM-Schleife ohnehin über `isNpcShop()`, die Karten liegen über dem ROM-Maximum
+  `0x34`. **Bestätigt: 42 Sets statt 27.**
+- `buildCatalogByGfxSet()` leitet Overworld-Sets als allererste Zeile um — vor jedem
+  `style`-Zugriff.
+- Anzeige über `renderBgImageSection(..., hdOw)`, also derselbe HD-Tausch wie bei BG2:
+  nach einem HD-Import ersetzt die HD-Fassung das SD-Bild.
+
+**Zwei Fehler, die erst der Test zeigte:**
+
+1. **Es gibt zwei Katalog-Einstiegspunkte.** Neben `buildCatalogByGfxSet()` (Per-GfxSet)
+   gibt es `buildCatalog()` (Per-Level), und der steigt bei `!currentTileParts` aus.
+   Overworld-Level haben kein Map32 → `null` → die Katalogansicht behielt stumm das
+   vorher geladene Level. Gefixt über den neuen Helfer `overworldSetForLevel(levelId)`.
+   Dort muss `isNpcShop()` **zuerst** geprüft werden, weil `getOverworldIndex()` auch
+   Shop-IDs auf ihre Welt abbildet — sonst landet Crankys Laden auf der Karte von Welt 0.
+2. **`loadLevel()` hat drei Ausgänge.** Der Katalog wird erst am Funktionsende neu
+   gebaut, der Overworld-Zweig kehrt aber vorher zurück. Folge: der Katalog aktualisierte
+   sich beim Wechsel zu oder von einem Shop/einer Karte nicht. Derselbe Refresh-Block
+   läuft jetzt auch dort, samt `selectedGfxSet`/`#catGfxSet`-Sync auf das synthetische
+   Set (spiegelt, was der Normalpfad mit `style.graphics` tut).
+
+**Ebenfalls gefixt, sonst hätte die Freigabe es ausgelöst:** die VBlank-Anim-Injektion im
+Pack-Export dereferenzierte `setInfo.levels[0].style.vblankType` ungeprüft. Overworld-Sets
+haben kein `style` → hätte den **gesamten** Pack-Export abgebrochen, sobald ein Shop im
+Container liegt.
+
+**User-bestätigt:** Katalogverhalten sauber, Wechsel in beide Richtungen aktualisiert
+korrekt. Lost World zeigt wie vorhergesagt nur Rauchsäule und den Vulkaneingang
+(Krokodilmaul), Rest transparent — die statische Karte liegt dort auf BG2.
+
+**Hinweis zur Bedienung:** Das Set-Dropdown (`catGfxSetWrap`) ist im Standardmodus
+„Per Level" ausgeblendet und erscheint erst über den Knopf **„Per Graphics Set"**. Nur
+darüber erreichbar ist `Set 0x3E` (Krazy Kremland, zweiter Bildschirm) — dieser Schirm
+hat keine eigene Level-ID, er teilt sich `0x33` mit dem ersten.
+
+### Die `ow*`-Kette (Teil 4)
+
+Der Katalog liefert **`owLayers[]`** statt eines einzelnen Bildes — heute genau ein Eintrag
+für BG1. Alles dahinter iteriert dieses Array, damit der Hub (Himmel auf BG2, Wolken auf
+BG3), Funkys BG2 und Lost Worlds BG2 später als *Daten* dazukommen und nicht als neue
+Codepfade.
+
+- **SD-Export:** `ow_bg{N}.png` + `manifest.owLayers[]` (chrBase, tilemapBase, Geometrie).
+- **HD-Import:** → `hdPack.owLayers`, warnt wenn das Bild nicht hochskaliert wurde.
+- **Container:** neues Feld `owBlobs`. Liegt nichts im Speicher, wird das Gespeicherte
+  übernommen statt überschrieben — dieselbe Regel wie bei bg2/bg3, sonst hätte ein
+  zweiter Save die importierte Kunst gelöscht (Bug 1 vom 2026-07-24 in neuer Verkleidung).
+  `refreshContainerSetMetadata` brauchte nichts: es spreadet seit dem Juli-Fix den ganzen
+  Datensatz.
+- **Pack-Export:** schneidet nach dem BG2-Vorbild in `bg/bg{N}/gfxset_{DEZIMAL}/`.
+  Die **Tilemap wird aus `vramSnapshot` neu abgeleitet**, nicht durch die ZIP geschleust —
+  Bild und Tilemap müssen aus derselben VRAM stammen, sonst tragen Kacheln fremde Adressen.
+  Die Kachelgröße kommt aus der Bild*breite*, weil die Höhe bei Shops beschnitten ist.
+- **Content-Hashes:** Overworld-Sets hängen jetzt an `allHashSets`. Ohne die tragen die
+  exportierten PNGs keinen ContentHash und sind für Mesen prinzipiell unauffindbar.
+  Die **Fingerprints entstehen daraus automatisch**, weil die Auswahl auf denselben
+  Hash-Einträgen aufbaut.
+
+**Müllstreifen:** Tilemap-Zeilen 28–31 liegen unterhalb der 224 sichtbaren Zeilen. Nur bei
+Shops abgeschnitten — Karten scrollen, dort wäre Material außerhalb des Startbildes sonst
+verloren. Der gleiche Streifen existiert auch in Pirate Panics BG2; am bestehenden
+BG2-Export wurde bewusst **nichts** geändert, um vorhandene Packs nicht zu verändern.
+
+**Drei Blocker, die den Export sonst still hätten scheitern lassen:**
+1. `exportCatalogAsZip` verlangte `currentTileParts` (Guard *und* Canvas-Anlage).
+2. Der Fallback `buildBgImageFromCurrentLevel()` lieferte die Ebenen des zuletzt geladenen
+   Levels, weil der Overworld-Zweig `currentBgData` nicht nullte — im Test landete Pirate
+   Panics BG3 (1280×512) im Gangplank-ZIP. Wurzel gefixt, plus Sperre im Export.
+3. `exportAsTexturePack` brach bei `setsWithArrangement.length === 0` komplett ab. Ein
+   Container mit nur Shops/Karten hätte nie exportiert, mit irreführender Meldung.
+
+## [2026-07-29] — Pack-Export wahlweise direkt in einen Ordner statt als ZIP
+
+Der Weg ZIP erzeugen → warten → entpacken → nach Mesen kopieren kostete bei jedem Durchlauf
+spürbar Zeit. Neue Checkbox **„Texture Pack direkt in einen Ordner schreiben (statt ZIP)"**
+im Container-Panel: beim Export wird einmal ein Zielordner abgefragt, dann werden die
+Dateien direkt hineingeschrieben.
+
+- **Bewusst rein additiv:** Der komplette Export baut weiterhin denselben JSZip-Baum auf;
+  nur der *letzte* Schritt entscheidet zwischen „ZIP herunterladen" und „Dateien schreiben".
+  Die Option kann also nicht beeinflussen, *was* exportiert wird.
+- **ZIP bleibt Standard.** Die Checkbox ist nicht vorausgewählt.
+- Die Option erscheint nur, wo `showDirectoryPicker` existiert (Chromium). In anderen
+  Browsern bleibt sie ausgeblendet, statt ein Versprechen zu geben, das nicht einlösbar ist.
+- Bricht der Ordner-Weg ab — Auswahl abgebrochen, Rechte verweigert — fällt der Export
+  automatisch auf die ZIP zurück, statt ohne Ergebnis zu enden.
+
+**Nachtrag 1 (erster Test schlug fehl):** Die Ordnerabfrage kam nie, es wurde stumm eine ZIP
+geladen. Ursache: `showDirectoryPicker()` verlangt eine *transiente Benutzeraktivierung*,
+die wenige Sekunden nach dem Klick verfällt — der Aufruf stand aber am **Ende** eines
+minutenlangen Exports und warf deshalb zuverlässig. Der Ordner wird jetzt **ganz am Anfang**
+abgefragt, solange die Aktivierung frisch ist; das Schreibrecht gleich mit. Nebeneffekt:
+man wählt den Ordner einmal vorne und der Export läuft danach ohne Rückfrage durch.
+
+**Nachtrag 2 (zweiter Test: Ordner kam, brach aber mittendrin ab):** 6574 von 34044 Dateien
+wurden geschrieben, dann fiel der Export auf die ZIP zurück. Abbruchstelle exakt bestimmt
+(Vergleich der Dateizahlen je Ordner gegen die ZIP): `bg/bg1/gfxset_54`, Datei 53 von 800 —
+alles davor deckungsgleich. Zwei Härtungen:
+
+- Der Blob kommt jetzt direkt vom Eintrag aus `zip.forEach` statt über eine erneute
+  `zip.file(path)`-Suche — ein Fehlermodus weniger, ohne Gegenwert.
+- **Ein einzelner Schreibfehler wirft nicht mehr den ganzen Lauf weg.** Fehler werden je
+  Datei gesammelt, der Pfad landet in der Konsole, und am Ende sagt eine Meldung, wie viele
+  Dateien geschrieben wurden und welche fehlten. Erst über 200 Fehlern wird abgebrochen.
+
+Die eigentliche Fehlerursache ist damit noch nicht bewiesen — der nächste Lauf nennt sie
+beim Namen. Nebenbefund: Als Ziel war ein **früher entpackter Export** gewählt, erkennbar
+an `bg2/gfxset_04` mit 64 statt 65 Dateien aus jenem älteren Lauf.
+
+## [2026-07-30] — Spritecap bleibt gespeichert, Ordner-Export schreibt parallel
+
+- **Spritecap überlebt jetzt einen Reload.** Bisher musste `snes_hd_spritecap.txt` in jeder
+  Sitzung neu hochgeladen werden, und wer es vergaß, erfuhr das erst *am Ende* eines langen
+  Exports — der dann ohne Sprite-Tiles herauskam. Die geparsten Daten liegen jetzt in
+  IndexedDB (`recordings`-Store, DB-Version 2) und werden beim Start automatisch geladen.
+  „Aktualisieren" heißt einfach: eine neue Datei wählen, sie überschreibt die alte. Der
+  Knopf zeigt Anzahl und Ladedatum.
+- **Fehlender Spritecap wird vor dem Export gemeldet**, nicht danach, und fragt, ob trotzdem
+  exportiert werden soll.
+- **Ordner-Export schreibt in Bündeln zu 24 parallel** statt streng nacheinander, und der
+  Verzeichnis-Cache hält jetzt das *Promise* statt des fertigen Handles — vorher verfehlte
+  ein paralleles Bündel den Cache geschlossen und lief die volle Elternkette fünfmal pro
+  Datei ab. Der Fortschritt zeigt zusätzlich Dateien/Sekunde und geschätzte Restzeit.
+
+**Ehrlicher Stand zum Ordner-Export:** Er ist deutlich langsamer als der ZIP-Weg, und das
+ist noch nicht vollständig erklärt. Bekannt ist: der ZIP-Weg macht **einen** Durchlauf durch
+alle Einträge, der Ordner-Weg dagegen pro Datei mehrere Dateisystem-Operationen — Chromium
+legt für jedes `createWritable()` eine Swap-Datei an und benennt sie beim `close()` um, was
+unter Windows zusätzlich den Virenscanner beschäftigt. Dazu kommt, dass jeder Eintrag über
+`entry.async('blob')` aus der JSZip-Struktur zurückgelesen wird, obwohl er dort als Blob
+hineingelegt wurde — ein vermeidbarer Umweg. **Der nächste Schritt wäre, für den Ordner-Weg
+gar nicht erst über JSZip zu gehen**, sondern die Blobs beim Bauen parallel in einer flachen
+Liste zu sammeln. Bis dahin bleibt die ZIP der verlässliche Weg; die Laufzeitausgabe in der
+Konsole (`[export] folder write took …`) liefert die Messwerte dafür.
+
+## [2026-07-30] — Nur der zuletzt importierte Shop/Karten-Schirm wurde in HD angezeigt
+
+Nach dem Import mehrerer Schirme nacheinander zeigte die Katalogansicht nur noch beim
+zuletzt importierten die HD-Fassung. Container und Pack-Export waren korrekt — es war reine
+Anzeige.
+
+- **Ursache:** `hdPack.owLayers` war nur nach *Ebene* geschlüsselt (`{1: …}`), nicht nach
+  Gfxset. Jeder Import überschrieb also das BG1 des vorherigen Schirms, und die Anzeige
+  prüfte zusätzlich gegen ein einzelnes `hdPack.owGfxSet`.
+- **Fix:** `hdPack.owLayers[gfxSet][layer]`. Import und Container-Restore mergen jetzt pro
+  Gfxset, die Anzeige schlägt über die `gfxSetIndex` des angezeigten Schirms nach.
+  `owGfxSet` entfällt.
+
 ## [2026-07-24] — Container-Datenverlust: Save darf gespeicherte Kacheln nicht mehr löschen
 
 Gefunden bei der Analyse eines Packs, in dem **1314 Kacheln fehlten**: `gfxset_07`

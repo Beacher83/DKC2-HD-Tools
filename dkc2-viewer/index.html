@@ -409,6 +409,10 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <input type="file" id="containerZipInput" accept=".zip" style="display:none;">
       <input type="file" id="vramDumpInput" accept=".bin,.dmp" style="display:none;">
     </div>
+    <label id="expToFolderWrap" style="display:none;font-size:12px;color:#ccc;cursor:pointer;margin-bottom:8px;"
+           title="Statt einer ZIP die Dateien direkt in einen Ordner schreiben — spart Packen, Entpacken und Kopieren. Beim Export wird einmal ein Zielordner abgefragt (idealerweise der Mesen-HdPacks-Ordner).">
+      <input type="checkbox" id="expToFolder"> „Texture Pack" direkt in einen Ordner schreiben (statt ZIP)
+    </label>
     <div id="containerStatusMsg" style="color:#ff9800;font-size:12px;min-height:18px;"></div>
   </div>
 </div>
@@ -4647,6 +4651,31 @@ function scanGraphicsSets(rom) {
       // skip levels that can't be parsed
     }
   }
+  // Shops and world maps carry no style, so the loop above never sees them —
+  // that is exactly why they were excluded from the catalog until now. Add them
+  // from OVERWORLD_SETS. Their catalog is built by buildOverworldCatalog() from
+  // the VRAM dump, not by the Map32 terrain path, and the `kind` marker is what
+  // buildCatalogByGfxSet() switches on.
+  //
+  // No collision with the ROM scan: the shops' sets 0x08-0x0C exist in the ROM
+  // only through the NPC override, which the loop skips via isNpcShop(), and the
+  // maps' synthetic 0x35-0x3E are above the ROM's highest set (0x34).
+  for (const gfxKey of Object.keys(OVERWORLD_SETS)) {
+    const gfx = Number(gfxKey);
+    if (map.has(gfx)) {
+      console.warn(`[overworld] gfxset 0x${gfx.toString(16).toUpperCase()} already came ` +
+        `from the ROM scan — keeping the ROM entry, skipping the overworld one`);
+      continue;
+    }
+    const def = OVERWORLD_SETS[gfx];
+    map.set(gfx, {
+      graphics: gfx,
+      kind: 'overworld',
+      levels: [{ id: def.levelId, name: def.name, styleAddr: null, mapId: null, style: null }],
+      mapIds: new Set(),
+    });
+  }
+
   console.log(`Graphics set scan: ${map.size} unique sets across ${192} levels`);
   for (const [gfx, info] of [...map.entries()].sort((a, b) => a[0] - b[0])) {
     console.log(`  GfxSet 0x${gfx.toString(16).toUpperCase().padStart(2,'0')}: ${info.levels.length} levels [${info.levels.map(l => l.name).join(', ')}]`);
@@ -4676,8 +4705,225 @@ function populateGfxSetSelect() {
   }
 }
 
+// ============================================================
+// Overworld / NPC shop catalog sets
+// ============================================================
+// Shops and world maps have no gfxset in the ROM (property type 0x0004/0x0005
+// carries no style data) and no Map32 terrain — they are plain tilemap + CHR.
+// They get synthetic gfxset indices so they can ride the normal container and
+// pack-export path. A scan of all 192 level IDs found the ROM using only
+// 0x02–0x34, so 0x35+ is free.
+//
+// CAREFUL: the maps' LEVEL IDs are 0x30–0x38, but 0x30–0x34 are real level
+// gfxsets. The indices below are deliberately NOT the level IDs.
+//
+// The shops keep their real ROM gfxsets (0x08–0x0C via NPC_SHOP_CONFIGS).
+//
+// chr/tm/wide/tall are the BG1 PPU registers as actually captured in each VRAM
+// dump — NOT derived from OVERWORLD_WORLDS. Those two agree for 14 of 15
+// screens, but Lost World's config describes $2000/$7800, which at runtime is
+// its BG2; its BG1 really sits at $6000/$7C00. Since the pack export names every
+// tile after chrBase + tileNum, a wrong base mislabels the whole screen, so
+// these numbers stay pinned to the dumps. Re-verify with
+// scratchpad/check_owconfig.py if the dumps are ever retaken.
+const OVERWORLD_SETS = {
+  0x08: { kind: 'shop', shop: 'cranky',  levelId: 0x39, name: "Cranky's Monkey Museum",  chr: 0x2000, tm: 0x7000 },
+  0x09: { kind: 'shop', shop: 'funky',   levelId: 0x50, name: "Funky's Flights II",      chr: 0x2000, tm: 0x7400 },
+  0x0A: { kind: 'shop', shop: 'wrinkly', levelId: 0x40, name: "Wrinkly's Kong Kollege",  chr: 0x2000, tm: 0x7000 },
+  0x0B: { kind: 'shop', shop: 'swanky',  levelId: 0x48, name: "Swanky's Bonus Bonanza",  chr: 0x2000, tm: 0x7000 },
+  0x0C: { kind: 'shop', shop: 'klubba',  levelId: 0x58, name: "Klubba's Kiosk",          chr: 0x2000, tm: 0x7000 },
+  0x35: { kind: 'map', world: 0, levelId: 0x38, name: 'Crocodile Isle (hub)',   chr: 0x2000, tm: 0x7800, tall: true },
+  0x36: { kind: 'map', world: 1, levelId: 0x30, name: 'Gangplank Galleon',      chr: 0x2000, tm: 0x7800 },
+  0x37: { kind: 'map', world: 2, levelId: 0x31, name: 'Crocodile Cauldron',     chr: 0x2000, tm: 0x7800 },
+  0x38: { kind: 'map', world: 3, levelId: 0x32, name: 'Krem Quay',              chr: 0x2000, tm: 0x7000, wide: true },
+  0x39: { kind: 'map', world: 4, levelId: 0x33, name: 'Krazy Kremland',         chr: 0x2000, tm: 0x7800 },
+  0x3A: { kind: 'map', world: 5, levelId: 0x34, name: 'Gloomy Gulch',           chr: 0x2000, tm: 0x7800 },
+  0x3B: { kind: 'map', world: 6, levelId: 0x35, name: "K. Rool's Keep",         chr: 0x2000, tm: 0x7000, tall: true },
+  0x3C: { kind: 'map', world: 7, levelId: 0x36, name: 'The Flying Krock',       chr: 0x2000, tm: 0x7800 },
+  0x3D: { kind: 'map', world: 8, levelId: 0x37, name: 'Lost World',             chr: 0x6000, tm: 0x7C00 },
+  // Krazy Kremland's map is two separate screens, not one scrolled screen.
+  0x3E: { kind: 'map', world: 4, levelId: 0x33, name: 'Krazy Kremland (screen 2)', chr: 0x2000, tm: 0x7800 },
+};
+
+function isOverworldSet(gfxSetIndex) {
+  return Object.prototype.hasOwnProperty.call(OVERWORLD_SETS, gfxSetIndex);
+}
+
+function overworldSetId(gfxSetIndex) {
+  return `gfxset_${gfxSetIndex.toString(16).toUpperCase().padStart(2, '0')}`;
+}
+
+// Which overworld set does a level ID belong to? null for ordinary levels.
+// Shops must be tested first: getOverworldIndex() also maps their IDs to the
+// world they sit in, which is not what we want here.
+// Note Krazy Kremland's second screen (0x3E) has no level ID of its own — it is
+// reachable only by picking the set directly.
+function overworldSetForLevel(levelId) {
+  if (levelId == null) return null;
+  if (isNpcShop(levelId)) {
+    const cfg = getNpcShopConfig(levelId);
+    return cfg ? cfg.gfxSet : null;
+  }
+  const world = getOverworldIndex(levelId);
+  if (world < 0) return null;
+  const gfx = 0x35 + world;      // world 0 (hub) → 0x35 … world 8 → 0x3D
+  return isOverworldSet(gfx) ? gfx : null;
+}
+
+// BG1 layer geometry for an overworld set, straight from its dump-verified entry.
+// Three screens are not 32x32: the hub and K. Rool's Keep are 32x64, Krem Quay
+// is 64x32.
+function getOverworldBgConfig(gfxSetIndex) {
+  const def = OVERWORLD_SETS[gfxSetIndex];
+  if (!def) return null;
+  return {
+    tilemapBase: def.tm,
+    chrBase: def.chr,
+    wide: !!def.wide,
+    tall: !!def.tall,
+  };
+}
+
+// Build the catalog for a shop or world map.
+//
+// Renders from the REAL VRAM+CGRAM dump, not from ROM-reconstructed data. That
+// matters for more than colour fidelity: the pack export names every tile after
+// its VRAM address and slices it out of this composed image, so image and
+// tilemap must come from the same source or tiles get mislabelled. Rendering
+// from the dump also makes the content hashes line up with Mesen's runtime.
+//
+// Only BG1 is rendered. That is the whole visible background for 8 of 9 maps and
+// 4 of 5 shops. Known exceptions, handled later: Funky's Flights also runs BG2
+// (chr $6000, and 252/256 of its tiles already exist in gfxset 0x25), the hub
+// composites BG2 on main plus BG3/OBJ on the sub screen, and Lost World has BG2
+// enabled too.
+function buildOverworldCatalog(gfxSetIndex) {
+  const def = OVERWORLD_SETS[gfxSetIndex];
+  if (!def) return null;
+
+  const setId = overworldSetId(gfxSetIndex);
+  if (typeof VRAM_GROUND_TRUTH === 'undefined' || !VRAM_GROUND_TRUTH[setId]) {
+    console.warn(`[overworld] no VRAM dump for ${setId} (${def.name}) — ` +
+      `run generate_vram_groundtruth.py after dumping it in Mesen`);
+    return null;
+  }
+  const vram = _b64ToUint8Array(VRAM_GROUND_TRUTH[setId]);
+
+  // Live CGRAM if we have it — the game post-processes palettes at load time
+  // (R3), so the ROM's raw palette is not what the screen looks like.
+  let palette = null;
+  if (typeof CGRAM_GROUND_TRUTH !== 'undefined' && CGRAM_GROUND_TRUTH[setId]) {
+    const cg = _b64ToUint8Array(CGRAM_GROUND_TRUTH[setId]);
+    palette = new Uint16Array(cg.length >> 1);
+    for (let i = 0; i < palette.length; i++) palette[i] = cg[i * 2] | (cg[i * 2 + 1] << 8);
+  } else {
+    console.warn(`[overworld] no CGRAM for ${setId} — falling back to ROM palette`);
+    try {
+      palette = loadOverworldLevel(rom, def.levelId).palette;
+    } catch (e) {
+      console.error(`[overworld] ROM palette fallback failed for ${setId}:`, e.message);
+      return null;
+    }
+  }
+
+  const bgConfig = getOverworldBgConfig(gfxSetIndex);
+  if (!bgConfig) {
+    console.error(`[overworld] no layer config for ${setId} (${def.name})`);
+    return null;
+  }
+
+  const tilesW = bgConfig.wide ? 64 : 32;
+  const tilesH = bgConfig.tall ? 64 : 32;
+  const widthPx = tilesW * 8, heightPx = tilesH * 8;
+
+  const imgData = new ImageData(widthPx, heightPx);
+  renderBgLayer(vram, bgConfig, palette, true /* mode 1: BG1 is 4bpp */,
+                imgData, widthPx, heightPx, null);
+
+  const canvas = new OffscreenCanvas(widthPx, heightPx);
+  canvas.getContext('2d').putImageData(imgData, 0, 0);
+
+  // Tilemap bytes for the pack export (same slicing the BG2 path uses)
+  const tmByteOffset = bgConfig.tilemapBase * 2;
+  const tmByteLength = tilesW * tilesH * 2;
+  let bg1TilemapData = null;
+  if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
+    bg1TilemapData = [];
+    for (let i = 0; i < tmByteLength; i++) bg1TilemapData.push(vram[tmByteOffset + i] || 0);
+  } else {
+    console.error(`[overworld] tilemap $${bgConfig.tilemapBase.toString(16)} ` +
+      `+${tmByteLength}B is outside the ${vram.length}B VRAM dump for ${setId}`);
+    return null;
+  }
+
+  const ppuConfig = {
+    bgMode: 1,
+    bg1ChrBase: bgConfig.chrBase,
+    bg2ChrBase: 0,
+    bg3ChrBase: 0,
+    terrainChrBase: bgConfig.chrBase,
+    bg1TilesW: tilesW, bg1TilesH: tilesH,
+    bg2TilesW: 32, bg2TilesH: 32,
+    bg3TilesW: 32, bg3TilesH: 32,
+    wallTilesW: 0, wallTilesH: 0, wallTilemapBase: 0,
+  };
+
+  const setInfo = {
+    graphics: gfxSetIndex,
+    kind: 'overworld',
+    levels: [{ id: def.levelId, name: def.name, styleAddr: null, mapId: null, style: null }],
+    mapIds: new Set(),
+  };
+
+  console.log(`[overworld] ${setId} "${def.name}": ${widthPx}x${heightPx}px, ` +
+    `chr $${bgConfig.chrBase.toString(16).toUpperCase()}, ` +
+    `tm $${bgConfig.tilemapBase.toString(16).toUpperCase()}`);
+
+  // Rows 28-31 of a 32-row tilemap sit below the 224 visible scanlines and hold
+  // leftover data — visible as a garbage strip along the bottom of the render.
+  // Excluded for shops, which are static single screens. NOT excluded for maps:
+  // those scroll, so material outside the initial view can still be reached, and
+  // exporting a few unused tiles is cheaper than losing visible art.
+  const visibleRows = (def.kind === 'shop' && tilesH === 32) ? 28 : tilesH;
+
+  const image = { canvas, widthPx, heightPx, tilesW, tilesH, tileSize: 8 };
+
+  return {
+    // No Map32 parts exist here, so there is no tile gallery — the screen is
+    // shown as one image, and after an HD import the HD version replaces it.
+    bg1Tiles: [],
+    bg2Image: null, bg3Image: null, wallImage: null, ssbFgImage: null,
+    // One entry per BG layer. Today always just BG1, but the hub (sky on BG2,
+    // clouds on BG3), Funky's Flights (BG2) and Lost World (map on BG2, animated
+    // smoke on BG1) need more — everything downstream iterates this list so
+    // those are added as data, not as new code paths.
+    owLayers: [{
+      layer: 1,
+      image,
+      chrBase: bgConfig.chrBase,
+      tilemapBase: bgConfig.tilemapBase,
+      tilesW, tilesH, visibleRows,
+      is4bpp: true,
+      tilemapData: bg1TilemapData,
+    }],
+    owImage: image,          // convenience alias for the catalog display
+    isOverworld: true,
+    gfxSetIndex, refLevelId: def.levelId, setInfo, clusters: [],
+    ppuConfig,
+    bg2TilemapData: null, bg3TilemapData: null, wallTilemapData: null,
+    bg1TilemapData,
+    vram,
+    tileArrangement: null, gfxData: null, gfxCount: 0, tileCount: 0,
+  };
+}
+
 // Build catalog for an entire graphics set (all unique tiles across all mapIds in this set)
 function buildCatalogByGfxSet(gfxSetIndex) {
+  // Shops and world maps have no Map32 terrain — everything below this point
+  // (loadTileParts, loadTileMap, cluster detection) would fail on their null
+  // style. They get their own tilemap-driven builder.
+  if (isOverworldSet(gfxSetIndex)) return buildOverworldCatalog(gfxSetIndex);
+
   if (!rom || !graphicsSetsMap || !graphicsSetsMap.has(gfxSetIndex)) return null;
   const setInfo = graphicsSetsMap.get(gfxSetIndex);
   
@@ -5455,12 +5701,36 @@ function loadLevel(levelId) {
         currentTileParts = null;
         currentStyle = null;
         currentTileRawData = null;
+        // Must be cleared too: buildBgImageFromCurrentLevel() reads currentBgData,
+        // and leaving the previous level's data behind made the catalog export
+        // ship that level's BG2/BG3 under this screen's gfxset.
+        currentBgData = null;
         applyZoom();
         
         updateInfoPanel(prop, null, null);
         updatePaletteDisplay(ow.palette);
         
         statusText.textContent = `Level 0x${levelId.toString(16).toUpperCase().padStart(2, '0')}: ${name} | Overworld ${ow.widthPx}x${ow.heightPx}px`;
+
+        // Point the gfx set selector at this screen's synthetic set, mirroring
+        // what the normal path does for style.graphics — otherwise Per-GfxSet
+        // mode keeps showing whichever level was open before.
+        const owGfx = overworldSetForLevel(levelId);
+        if (owGfx != null && graphicsSetsMap && graphicsSetsMap.has(owGfx)) {
+          selectedGfxSet = owGfx;
+          const gfxSel = document.getElementById('catGfxSet');
+          if (gfxSel) gfxSel.value = owGfx;
+        }
+
+        // This branch returns early, so it has to refresh the catalog itself —
+        // the block at the end of loadLevel() is never reached from here. Without
+        // this, switching to or away from a shop/map while the catalog is open
+        // leaves the previous level's catalog on screen.
+        if (catalogView) {
+          catalogData = (catalogMode === 'gfxset') ? buildCatalogByGfxSet(selectedGfxSet) : buildCatalog();
+          if (catalogData) renderCatalog();
+        }
+
         console.timeEnd('loadLevel ' + levelId);
         return;
       } catch (owErr) {
@@ -5868,6 +6138,13 @@ function buildBgImageFromCurrentLevel(layer) {
 }
 
 function buildCatalog() {
+  // A loaded shop or world map has no Map32 terrain, so currentTileParts /
+  // currentTileMap are null and the guard below would return null — leaving the
+  // catalog showing whatever level was open before. Route those to the
+  // tilemap-driven builder instead.
+  const owSet = overworldSetForLevel(currentLevelId);
+  if (owSet != null) return buildOverworldCatalog(owSet);
+
   if (!rom || !currentTileParts || !currentTileMap) return null;
   
   const tilePartsImg = currentTileParts;
@@ -6173,6 +6450,20 @@ function renderCatalog() {
     grid.appendChild(section);
   }
   
+  // Shop / world-map screens are shown as one composed image instead of a tile
+  // gallery — they have no Map32 parts to list. Same HD swap as the BG layers:
+  // once an HD version is imported, it replaces the SD render.
+  if (catalogData.owImage) {
+    const owName = OVERWORLD_SETS[catalogData.gfxSetIndex]
+      ? OVERWORLD_SETS[catalogData.gfxSetIndex].name : 'Overworld';
+    // Look the HD art up by this screen's gfxset, so every imported screen keeps
+    // showing HD — not just the one imported last.
+    const hdOwSet = (hdEnabled && hdPack && hdPack.owLayers)
+      ? hdPack.owLayers[catalogData.gfxSetIndex] : null;
+    const hdOw = (hdOwSet && hdOwSet[1]) ? hdOwSet[1].img : null;
+    renderBgImageSection(grid, catalogData.owImage, `BG1 — ${owName}`, '#9ccc65', scale, hdOw);
+  }
+
   // Render BG2 as composed background image with grid overlay
   if (showBg2 && catalogData.bg2Image) {
     const hdBg2 = (hdEnabled && hdPack && hdPack.bg2 && (hdPack.bg2GfxSet === undefined || hdPack.bg2GfxSet === catalogData?.gfxSetIndex)) ? hdPack.bg2 : null;
@@ -6712,7 +7003,11 @@ function buildAnimObjectSheet(obj, phase, ctx, framesByAddr) {
 async function exportCatalogAsZip() {
   if (!catalogData) { alert('No catalog data. Load a level and switch to catalog view first.'); return; }
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded. Check internet connection.'); return; }
-  if (!currentTileParts) { alert('No tile parts loaded. Load a level first.'); return; }
+  // Shop / world-map screens legitimately have no tile parts — they carry no
+  // Map32 terrain, only a tilemap. Their export is driven by catalogData.owLayers.
+  if (!currentTileParts && !catalogData.isOverworld) {
+    alert('No tile parts loaded. Load a level first.'); return;
+  }
 
   // The HD pipeline (clusters, container save, Mesen export) is fundamentally
   // gfxset-scoped, but this function reads the ambient `catalogData` global — which
@@ -6748,10 +7043,16 @@ async function exportCatalogAsZip() {
     const tilesFolder = rootFolder.folder('tiles');
     const clustersFolder = rootFolder.folder('clusters');
 
-    // Prepare tile source canvas
-    const tpCanvas = new OffscreenCanvas(currentTileParts.width, currentTileParts.height);
-    tpCanvas.getContext('2d').putImageData(currentTileParts, 0, 0);
-    const tc = currentTileParts.width / 32;
+    // Prepare tile source canvas. Shop / world-map screens have no Map32 tile
+    // parts; their tiles/clusters lists are empty, so every consumer below is
+    // skipped and the canvas is simply never needed.
+    let tpCanvas = null;
+    let tc = 0;
+    if (currentTileParts) {
+      tpCanvas = new OffscreenCanvas(currentTileParts.width, currentTileParts.height);
+      tpCanvas.getContext('2d').putImageData(currentTileParts, 0, 0);
+      tc = currentTileParts.width / 32;
+    }
 
     // === Step 1: Determine which tiles are covered by clusters ===
     const allClusters = [...(catalogData.clusters || []), ...manualClusters];
@@ -7155,9 +7456,14 @@ async function exportCatalogAsZip() {
     // Falls catalogData.bg2Image null ist (z.B. in gfxset-mode), Fallback auf aktuelles Level-BG.
     const expBg2 = document.getElementById('expBg2')?.checked === true;
     const expBg3 = document.getElementById('expBg3')?.checked === true;
-    const bg2Src = catalogData.bg2Image || (expBg2 ? buildBgImageFromCurrentLevel('bg2') : null);
-    const bg3Src = catalogData.bg3Image || (expBg3 ? buildBgImageFromCurrentLevel('bg3') : null);
-    const wallSrc = catalogData.wallImage || (expBg2 ? buildBgImageFromCurrentLevel('wall') : null);
+    // Never fall back to the loaded level for a shop / world map: their BG2/BG3
+    // come from their own catalog (owLayers) or not at all. The fallback reads
+    // the ambient currentBgData, which shipped the previously loaded level's
+    // layers under this screen's gfxset.
+    const owOnly = !!catalogData.isOverworld;
+    const bg2Src = catalogData.bg2Image || (expBg2 && !owOnly ? buildBgImageFromCurrentLevel('bg2') : null);
+    const bg3Src = catalogData.bg3Image || (expBg3 && !owOnly ? buildBgImageFromCurrentLevel('bg3') : null);
+    const wallSrc = catalogData.wallImage || (expBg2 && !owOnly ? buildBgImageFromCurrentLevel('wall') : null);
     if (expBg2 && bg2Src && bg2Src.canvas) {
       rootFolder.file('bg2.png', await canvasToBlob(bg2Src.canvas));
       manifest.bg2 = { file: 'bg2.png', widthPx: bg2Src.widthPx, heightPx: bg2Src.heightPx };
@@ -7173,6 +7479,38 @@ async function exportCatalogAsZip() {
       manifest.bg3 = { file: 'bg3.png', widthPx: bg3Src.widthPx, heightPx: bg3Src.heightPx };
     } else if (expBg3) {
       console.warn('BG3 export skipped: kein BG3-Layer im aktuellen Level verfügbar.');
+    }
+
+    // === Shop / world-map screens ===
+    // Shipped whole, exactly like bg2/bg3 — the pack-export slicer derives the
+    // scale from the image width, so a 4x upscale needs no other change. One file
+    // per BG layer; today that is only BG1, but the loop is what lets the hub's
+    // sky/clouds and Funky's BG2 be added later without touching this code.
+    if (catalogData.owLayers && catalogData.owLayers.length > 0) {
+      manifest.owLayers = [];
+      for (const ol of catalogData.owLayers) {
+        // Crop away tilemap rows the PPU never shows (see visibleRows) so the
+        // garbage strip at the bottom is not handed to the upscaler.
+        let srcCanvas = ol.image.canvas;
+        let outH = ol.image.heightPx;
+        if (ol.visibleRows < ol.tilesH) {
+          outH = ol.visibleRows * 8;
+          const cropped = new OffscreenCanvas(ol.image.widthPx, outH);
+          cropped.getContext('2d').drawImage(srcCanvas, 0, 0, ol.image.widthPx, outH,
+                                             0, 0, ol.image.widthPx, outH);
+          srcCanvas = cropped;
+        }
+        const fileName = `ow_bg${ol.layer}.png`;
+        rootFolder.file(fileName, await canvasToBlob(srcCanvas));
+        manifest.owLayers.push({
+          file: fileName, layer: ol.layer,
+          widthPx: ol.image.widthPx, heightPx: outH,
+          tilesW: ol.tilesW, tilesH: ol.tilesH, visibleRows: ol.visibleRows,
+          chrBase: ol.chrBase, tilemapBase: ol.tilemapBase, is4bpp: ol.is4bpp,
+        });
+        console.log(`[overworld] exported ${fileName} ` +
+          `(${ol.image.widthPx}x${outH}px, ${ol.tilesW}x${ol.visibleRows} tiles of ${ol.tilesH})`);
+      }
     }
 
     // Foreground overlay (Rambi Rumble honey, SSB drips): source='bg1' means the
@@ -7962,6 +8300,24 @@ async function importHDPack(file) {
       hdCmFg = await loadImage(manifest.cmFg.file);
     }
 
+    // Shop / world-map layers. Keyed by BG layer so the hub's sky and clouds can
+    // be added later without changing the shape.
+    const hdOwLayers = {};
+    if (Array.isArray(manifest.owLayers)) {
+      for (const ol of manifest.owLayers) {
+        if (!ol || !ol.file) continue;
+        const img = await loadImage(ol.file);
+        if (!img) continue;
+        const scale = ol.widthPx ? (img.width / ol.widthPx) : 1;
+        if (scale <= 1) {
+          console.warn(`[overworld] ${ol.file} is ${img.width}px for a ${ol.widthPx}px source ` +
+            `— that is not an upscale, it will look like SD in the pack`);
+        }
+        hdOwLayers[ol.layer] = { img, meta: ol, scale };
+        console.log(`[overworld] imported ${ol.file}: ${img.width}x${img.height} (${scale}x)`);
+      }
+    }
+
     // Merge into existing hdPack rather than replacing — allows importing multiple
     // ZIPs one after another (e.g. tiles first, then BG2 separately).
     const isFirstImport = !hdPack;
@@ -8087,6 +8443,19 @@ async function importHDPack(file) {
     // BG2/BG3: overwrite if present in this pack
     if (hdBg2) { hdPack.bg2 = hdBg2; hdPack.bg2GfxSet = manifest.gfxSetIndex; }
     if (hdBg3) { hdPack.bg3 = hdBg3; hdPack.bg3GfxSet = manifest.gfxSetIndex; }
+    if (Object.keys(hdOwLayers).length > 0) {
+      // Keyed by gfxset AND layer. Keying by layer alone made each import
+      // overwrite the previous screen's BG1, so only the most recent one still
+      // displayed as HD (the art itself was fine — container and pack export
+      // read it per set).
+      if (!hdPack.owLayers) hdPack.owLayers = {};
+      hdPack.owLayers[manifest.gfxSetIndex] = {
+        ...(hdPack.owLayers[manifest.gfxSetIndex] || {}),
+        ...hdOwLayers,
+      };
+      console.log(`[overworld] hdPack now holds HD layers for gfxsets: ` +
+        Object.keys(hdPack.owLayers).join(', '));
+    }
     if (hdCmFg) {
       hdPack.cmFg = hdCmFg;
       hdPack.cmFgGfxSet = manifest.gfxSetIndex;
@@ -8139,7 +8508,7 @@ async function importHDPack(file) {
 // ============================================================
 
 const HD_DB_NAME = 'dkc2-hd-remaster';
-const HD_DB_VERSION = 1;
+const HD_DB_VERSION = 2;   // v2 adds the 'recordings' store (spritecap)
 let hdDb = null;
 let activeContainerName = null; // currently active container
 
@@ -8156,10 +8525,72 @@ async function getHDDB() {
         const store = db.createObjectStore('sets', { keyPath: 'key' });
         store.createIndex('container', 'container', { unique: false });
       }
+      // Mesen runtime recordings that used to be re-uploaded on every session.
+      // The spritecap is required for the sprite part of the pack export, and
+      // forgetting it wasted a whole export run.
+      if (!db.objectStoreNames.contains('recordings')) {
+        db.createObjectStore('recordings', { keyPath: 'name' });
+      }
     };
     req.onsuccess = (e) => { hdDb = e.target.result; resolve(hdDb); };
     req.onerror = (e) => reject(e.target.error);
   });
+}
+
+// --- Mesen recordings (spritecap) ---
+// Stored so they survive a reload. Loading a newer file simply overwrites the
+// entry, so "update" is just re-picking the file.
+
+async function saveRecording(name, payload) {
+  const db = await getHDDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('recordings', 'readwrite');
+    tx.objectStore('recordings').put({ name, savedAt: new Date().toISOString(), ...payload });
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadRecording(name) {
+  const db = await getHDDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('recordings', 'readonly');
+    const req = tx.objectStore('recordings').get(name);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Reflect spritecap state on the button — one place, used by both the file
+// picker and the restore path.
+function updateSpriteCapButton(count, pairs, savedAt) {
+  const btn = document.getElementById('spriteCapBtn');
+  if (!btn) return;
+  if (!count) {
+    btn.textContent = 'Spritecap';
+    btn.style.background = '#0f3460';
+    btn.title = 'snes_hd_spritecap.txt laden (Mesen-Recording der Runtime-Palette-Slots — nötig für den Sprite-Anteil des Texture-Pack-Exports)';
+    return;
+  }
+  btn.textContent = `Spritecap ✓ ${count}`;
+  btn.style.background = '#2e7d32';
+  const when = savedAt ? new Date(savedAt).toLocaleString() : 'jetzt';
+  btn.title = `${count} Hashes / ${pairs} (hash,pal)-Paare — geladen am ${when}.\n` +
+              `Bleibt über Reloads erhalten. Zum Aktualisieren einfach eine neue ` +
+              `snes_hd_spritecap.txt wählen.`;
+}
+
+async function restoreSpriteCapFromDb() {
+  try {
+    const rec = await loadRecording('spritecap');
+    if (!rec || !rec.entries || rec.entries.length === 0) return;
+    spriteCapPairs = new Map(rec.entries);
+    updateSpriteCapButton(spriteCapPairs.size, rec.pairs, rec.savedAt);
+    console.log(`[spritecap] ${spriteCapPairs.size} Hashes aus der Datenbank wiederhergestellt ` +
+                `(gespeichert am ${rec.savedAt}) — kein erneutes Hochladen nötig`);
+  } catch (e) {
+    console.warn('[spritecap] restore failed:', e);
+  }
 }
 
 // --- Container CRUD ---
@@ -8453,6 +8884,23 @@ async function saveCurrentHDToContainer(containerName) {
   if (!bg3Blob && existingSet?.bg3Blob) {
     bg3Blob = existingSet.bg3Blob;
     console.log(`[save] "${setId}": gespeichertes BG3-Bild übernommen (keines im Speicher).`);
+  }
+  // Shop / world-map layers, same rule as bg2/bg3: keep what is stored when
+  // nothing is in memory, so a re-save cannot wipe imported HD art.
+  let owBlobs = null;
+  const owForThisSet = hdPack.owLayers ? hdPack.owLayers[activeGfxIdx] : null;
+  if (owForThisSet) {
+    owBlobs = {};
+    for (const [layer, entry] of Object.entries(owForThisSet)) {
+      if (entry && entry.img) {
+        owBlobs[layer] = { blob: await bitmapToBlob(entry.img), meta: entry.meta, scale: entry.scale };
+      }
+    }
+    if (Object.keys(owBlobs).length === 0) owBlobs = null;
+  }
+  if (!owBlobs && existingSet?.owBlobs) {
+    owBlobs = existingSet.owBlobs;
+    console.log(`[save] "${setId}": gespeicherte Overworld-Ebenen übernommen (keine im Speicher).`);
   }
   // Wall blob: convert wallData ImageData to PNG blob (no HD version yet, always native res)
   if (currentMatchesActive && currentBgData && currentBgData.wallData) {
@@ -8770,7 +9218,7 @@ async function saveCurrentHDToContainer(containerName) {
   await hdSaveSet(containerName, 'level', setId, {
     scaleFactor: hdPack.scaleFactor,
     tileCount: tiles.length,
-    tiles, clusters, bg2Blob, bg3Blob, wallBlob, cmFgBlob,
+    tiles, clusters, bg2Blob, bg3Blob, wallBlob, cmFgBlob, owBlobs,
     animTiles,
     tileArrangementData: tileArrangementData ? Array.from(tileArrangementData) : null,
     tileArrangementTileCount: currentTileRawData ? currentTileRawData.tileCount : 0,
@@ -8892,6 +9340,26 @@ function _b64ToUint8Array(b64) {
   return out;
 }
 
+// Restore a container set's shop / world-map HD layers into hdPack.
+// Kept as one helper because both container-load paths need it.
+async function restoreOwLayersFromSet(set) {
+  if (!set || !set.owBlobs) return;
+  const layers = {};
+  for (const [layer, entry] of Object.entries(set.owBlobs)) {
+    if (!entry || !entry.blob) continue;
+    layers[layer] = {
+      img: await createImageBitmap(entry.blob),
+      meta: entry.meta || null,
+      scale: entry.scale || 1,
+    };
+  }
+  if (Object.keys(layers).length === 0) return;
+  // Merge per gfxset — loading a container restores many screens in a row.
+  if (!hdPack.owLayers) hdPack.owLayers = {};
+  hdPack.owLayers[set.gfxSetIndex] = layers;
+  console.log(`[overworld] restored ${Object.keys(layers).length} HD layer(s) for ${set.setId}`);
+}
+
 // For each level set without a vramSnapshot, check VRAM_GROUND_TRUTH and auto-apply.
 // Called after loading sets from IndexedDB so all downstream operations benefit.
 function applyGroundTruthVram(sets) {
@@ -8937,6 +9405,7 @@ async function loadContainerToHDPack(containerName) {
     if (set.bg2Blob) { hdPack.bg2 = await createImageBitmap(set.bg2Blob); hdPack.bg2GfxSet = set.gfxSetIndex; }
     if (set.bg3Blob) { hdPack.bg3 = await createImageBitmap(set.bg3Blob); hdPack.bg3GfxSet = set.gfxSetIndex; }
     if (set.wallBlob) { hdPack.wall = await createImageBitmap(set.wallBlob); hdPack.wallGfxSet = set.gfxSetIndex; }
+    await restoreOwLayersFromSet(set);
     // Restore color math foreground (SSB overlay — source='bg1')
     if (set.cmFgBlob) {
       hdPack.cmFg = await createImageBitmap(set.cmFgBlob);
@@ -9075,6 +9544,7 @@ async function ensureGfxSetHDLoaded(gfxIdx) {
   if (set.bg2Blob) { hdPack.bg2 = await createImageBitmap(set.bg2Blob); hdPack.bg2GfxSet = set.gfxSetIndex; }
   if (set.bg3Blob) { hdPack.bg3 = await createImageBitmap(set.bg3Blob); hdPack.bg3GfxSet = set.gfxSetIndex; }
   if (set.wallBlob) { hdPack.wall = await createImageBitmap(set.wallBlob); hdPack.wallGfxSet = set.gfxSetIndex; }
+  await restoreOwLayersFromSet(set);
   if (set.cmFgBlob) {
     hdPack.cmFg = await createImageBitmap(set.cmFgBlob);
     hdPack.cmFgGfxSet = set.gfxSetIndex;
@@ -9429,6 +9899,51 @@ const _yieldToBrowser = () => new Promise(r => setTimeout(r, 0));
 async function exportAsTexturePack(containerName) {
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
 
+  // Warn about a missing spritecap BEFORE the long run, not after it — finding
+  // out at the end that the sprites were skipped wastes the whole export.
+  if (!spriteCapPairs || spriteCapPairs.size === 0) {
+    const goOn = confirm(
+      'Kein Spritecap geladen.\n\n' +
+      'Ohne snes_hd_spritecap.txt (Mesen-Recording) sind die Runtime-Palette-Slots ' +
+      'unbekannt, und das Pack wird OHNE Sprite-Tiles exportiert.\n\n' +
+      'OK = trotzdem exportieren\nAbbrechen = erst Spritecap laden ' +
+      '(Button in der Katalog-Toolbar)');
+    if (!goOn) return;
+  }
+
+  // Ask for the target folder FIRST, before any of the long export work.
+  // showDirectoryPicker() needs transient user activation, and that expires a
+  // few seconds after the click — asking at the end of a minutes-long export
+  // always throws, which is why the first attempt silently fell back to ZIP.
+  let outDirHandle = null;
+  const wantFolder = document.getElementById('expToFolder')?.checked === true;
+  if (wantFolder) {
+    if (!window.showDirectoryPicker) {
+      alert('Dieser Browser kann nicht direkt in Ordner schreiben.\n\n' +
+            'Es wird stattdessen eine ZIP erzeugt.');
+    } else {
+      try {
+        outDirHandle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'mesenHdPack' });
+        // Ask for write permission up front too — same reason.
+        if (outDirHandle.requestPermission) {
+          const perm = await outDirHandle.requestPermission({ mode: 'readwrite' });
+          if (perm !== 'granted') {
+            alert('Kein Schreibrecht für den Ordner erteilt.\n\nEs wird stattdessen eine ZIP erzeugt.');
+            outDirHandle = null;
+          }
+        }
+      } catch (e) {
+        if (e && e.name === 'AbortError') {
+          console.log('[export] folder pick cancelled — falling back to ZIP');
+        } else {
+          console.error('[export] folder pick failed:', e);
+          alert(`Ordnerauswahl fehlgeschlagen:\n${e.message}\n\nEs wird stattdessen eine ZIP erzeugt.`);
+        }
+        outDirHandle = null;
+      }
+    }
+  }
+
   try {
   showMesenExportProgress('Container wird gelesen…', 0);
   await _yieldToBrowser();
@@ -9439,7 +9954,10 @@ async function exportAsTexturePack(containerName) {
 
   // Check if tileArrangement data is available
   const setsWithArrangement = levelSets.filter(s => s.tileArrangementData && s.ppuConfig);
-  if (setsWithArrangement.length === 0) {
+  // Shop / world-map sets legitimately have no tile arrangement — they carry no
+  // Map32 terrain. A container holding only those is still exportable.
+  const setsWithOverworld = levelSets.filter(s => s.owBlobs && isOverworldSet(s.gfxSetIndex));
+  if (setsWithArrangement.length === 0 && setsWithOverworld.length === 0) {
     alert('Container enthält keine Tile-Arrangement-Daten.\n\nBitte die Tiles erneut speichern (Container → Save), damit die nötigen VRAM-Metadaten gespeichert werden.');
     return;
   }
@@ -10036,6 +10554,94 @@ async function exportAsTexturePack(containerName) {
   // Fallback: if the stored set is missing bg2TilemapData or ppuConfig (e.g. imported
   // from an old ZIP that pre-dates container support), use the live catalogData from
   // the current session — so the user just needs gfxset open, not a re-save.
+  // ---- Shop / world-map screen export ----
+  // Same slicing as BG2 below, but the tilemap is re-derived from the set's VRAM
+  // snapshot rather than carried through the ZIP: image and tilemap must come
+  // from the same VRAM or tiles get named after the wrong addresses, and the
+  // ground truth already holds a real dump for every one of these screens.
+  let owExportedTiles = 0;
+  showMesenExportProgress('Shop-/Weltkarten-Tiles exportieren…', 0.60);
+  await _yieldToBrowser();
+
+  for (const set of levelSets) {
+    if (!set.owBlobs || set.gfxSetIndex == null) continue;
+    if (!isOverworldSet(set.gfxSetIndex)) continue;
+    const vram = set.vramSnapshot;
+    if (!vram || vram.length < 0x10000) {
+      console.warn(`[overworld] gfxset ${set.gfxSetIndex}: no VRAM snapshot — skipping`);
+      continue;
+    }
+
+    for (const [layerKey, entry] of Object.entries(set.owBlobs)) {
+      if (!entry || !entry.blob) continue;
+      const layer = Number(layerKey);
+      const meta = entry.meta || {};
+      const chrBase = meta.chrBase != null ? meta.chrBase : OVERWORLD_SETS[set.gfxSetIndex].chr;
+      const tmBase = meta.tilemapBase != null ? meta.tilemapBase : OVERWORLD_SETS[set.gfxSetIndex].tm;
+      const tilesW = meta.tilesW || 32;
+      const tilesH = meta.tilesH || 32;
+      const rows = Math.min(meta.visibleRows || tilesH, tilesH);
+      const wordsPerTile = (meta.is4bpp === false) ? 8 : 16;
+
+      const bitmap = await createImageBitmap(entry.blob);
+      // The HD image may be cropped to visibleRows, so derive the tile size from
+      // the width — which is never cropped.
+      const srcTileSize = Math.round(bitmap.width / tilesW);
+
+      const gfxIdStr = String(set.gfxSetIndex).padStart(2, '0');
+      const folder = root.folder(`bg/bg${layer}/gfxset_${gfxIdStr}`);
+      const exportedKeys = new Set();
+
+      for (let ty = 0; ty < rows; ty++) {
+        if (ty % 8 === 0) await _yieldToBrowser();
+        for (let tx = 0; tx < tilesW; tx++) {
+          // Mirror renderBgLayer's screen layout so a 64-wide or 64-tall map
+          // reads the same tilemap entries it was rendered from.
+          let screenOffset = 0;
+          if (tx >= 32) screenOffset += 0x800;
+          if (ty >= 32) screenOffset += (tilesW > 32) ? 0x1000 : 0x800;
+          const tmOffset = tmBase * 2 + screenOffset + ((ty & 31) * 32 + (tx & 31)) * 2;
+          if (tmOffset + 1 >= vram.length) continue;
+
+          const word = vram[tmOffset] | (vram[tmOffset + 1] << 8);
+          const tileNum = word & 0x3FF;
+          const palRow = (word >> 10) & 7;
+          const flipH = !!(word & 0x4000);
+          const flipV = !!(word & 0x8000);
+
+          const vramWordAddr = (chrBase + tileNum * wordsPerTile) & 0x7FFF;
+          const fileKey = `${vramWordAddr.toString(16).padStart(4, '0')}_P${String(palRow).padStart(2, '0')}`;
+          if (exportedKeys.has(fileKey)) continue;
+          exportedKeys.add(fileKey);
+
+          const srcX = tx * srcTileSize, srcY = ty * srcTileSize;
+          const outCanvas = document.createElement('canvas');
+          outCanvas.width = 32; outCanvas.height = 32;
+          const ctx = outCanvas.getContext('2d');
+          ctx.imageSmoothingEnabled = false;
+          if (flipH || flipV) {
+            ctx.save();
+            if (flipH) { ctx.scale(-1, 1); ctx.translate(-32, 0); }
+            if (flipV) { ctx.scale(1, -1); ctx.translate(0, -32); }
+          }
+          ctx.drawImage(bitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
+          if (flipH || flipV) ctx.restore();
+
+          const dataUrl = outCanvas.toDataURL('image/png');
+          const raw = atob(dataUrl.slice(dataUrl.indexOf(',') + 1));
+          const arr = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+          folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
+          owExportedTiles++;
+        }
+      }
+      console.log(`[overworld] gfxset_${gfxIdStr} BG${layer}: ${exportedKeys.size} unique tiles ` +
+        `from ${tilesW}x${rows} cells (chr $${chrBase.toString(16).toUpperCase()}, ` +
+        `tm $${tmBase.toString(16).toUpperCase()}, ${srcTileSize}px source tiles)`);
+      bitmap.close();
+    }
+  }
+
   let bg2ExportedTiles = 0;
   showMesenExportProgress('BG2-Tiles exportieren…', 0.62);
   await _yieldToBrowser();
@@ -10449,7 +11055,12 @@ async function exportAsTexturePack(containerName) {
       injectedGfxSets.add(gfxIdx);
       const setInfo = graphicsSetsMap.get(gfxIdx);
       if (!setInfo || !setInfo.levels || setInfo.levels.length === 0) continue;
-      const vblankType = setInfo.levels[0].style.vblankType;
+      // Shop / world-map sets have no style at all (no ROM level behind them),
+      // so there is no VBlank tile animation to inject — and dereferencing
+      // .style here would throw and abort the whole pack export.
+      const refStyle = setInfo.levels[0].style;
+      if (!refStyle) continue;
+      const vblankType = refStyle.vblankType;
       if (vblankType == null) continue;
       // Ensure vramSnapshot is a mutable Uint8Array
       let vram = set.vramSnapshot instanceof Uint8Array
@@ -10623,7 +11234,8 @@ async function exportAsTexturePack(containerName) {
     const dedupKey = new Set();
 
 
-    const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3, ...setsWithCmFg];
+    const allHashSets = [...setsWithArrangement, ...setsWithBg2, ...setsWithBg3, ...setsWithCmFg,
+                         ...setsWithOverworld];
     console.log(`[hashes] Processing ${allHashSets.length} set(s) for hashes.bin`);
     for (const set of allHashSets) {
       await _yieldToBrowser();
@@ -10698,6 +11310,45 @@ async function exportAsTexturePack(containerName) {
         console.log(`[hashes] gfxset ${gfxset}: BG1 → ${bg1Count} hash entries (chrBases: ${[...hashChrBases].map(c => '$' + c.toString(16).toUpperCase()).join(', ')})`);
       } else {
         console.warn(`[hashes] gfxset ${gfxset}: BG1 SKIPPED — vramSnapshot: ${!!set.vramSnapshot}, tileArr: ${!!set.tileArrangementData}`);
+      }
+
+      // Shop / world-map hashes. Without these the exported PNGs carry no
+      // ContentHash and Mesen can never match them, however well they scope.
+      if (set.owBlobs && set.vramSnapshot && isOverworldSet(set.gfxSetIndex)) {
+        const vram = set.vramSnapshot instanceof Uint8Array
+          ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        for (const [layerKey, oentry] of Object.entries(set.owBlobs)) {
+          const layerIdx = Number(layerKey) - 1;   // BG1 → layer 0
+          const ometa = (oentry && oentry.meta) || {};
+          const oChr = ometa.chrBase != null ? ometa.chrBase : OVERWORLD_SETS[set.gfxSetIndex].chr;
+          const oTm = ometa.tilemapBase != null ? ometa.tilemapBase : OVERWORLD_SETS[set.gfxSetIndex].tm;
+          const oW = ometa.tilesW || 32, oH = ometa.tilesH || 32;
+          const oRows = Math.min(ometa.visibleRows || oH, oH);
+          const oWords = (ometa.is4bpp === false) ? 8 : 16;
+          const oBytes = oWords * 2;
+          let added = 0;
+          for (let ty = 0; ty < oRows; ty++) {
+            for (let tx = 0; tx < oW; tx++) {
+              let so = 0;
+              if (tx >= 32) so += 0x800;
+              if (ty >= 32) so += (oW > 32) ? 0x1000 : 0x800;
+              const tmo = oTm * 2 + so + ((ty & 31) * 32 + (tx & 31)) * 2;
+              if (tmo + 1 >= vram.length) continue;
+              const entry = vram[tmo] | (vram[tmo + 1] << 8);
+              const vramWordAddr = (oChr + (entry & 0x3FF) * oWords) & 0x7FFF;
+              const dk = `${gfxset}_${layerIdx}_${vramWordAddr}`;
+              if (dedupKey.has(dk)) continue;
+              dedupKey.add(dk);
+              const byteOff = vramWordAddr * 2;
+              if (byteOff + oBytes <= vram.length) {
+                hashEntries.push({ vramAddr: vramWordAddr, layer: layerIdx, gfxset,
+                                   hash: fnv1a_64(vram, byteOff, oBytes) });
+                added++;
+              }
+            }
+          }
+          console.log(`[hashes] overworld gfxset ${gfxset} BG${layerKey}: ${added} content hashes`);
+        }
       }
 
       // BG2 hashes from stored vramSnapshot
@@ -11059,6 +11710,7 @@ async function exportAsTexturePack(containerName) {
     lookup_mode: usesContentHash ? 'content_hash' : 'tile_address_palette',
     flip_handling: 'runtime',
     total_bg1_tiles: exportedTiles,
+    total_overworld_tiles: owExportedTiles,
     total_bg2_tiles: bg2ExportedTiles,
     total_wall_tiles: wallExportedTiles,
     total_bg3_tiles: bg3ExportedTiles,
@@ -11070,19 +11722,113 @@ async function exportAsTexturePack(containerName) {
     notes: `Exported from DKC2 Viewer container "${containerName}"`
   }, null, 2));
 
-  // Generate and download ZIP
-  const zipBlob = await zip.generateAsync(
-    { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
-    (meta) => showMesenExportProgress(`ZIP komprimieren… ${Math.round(meta.percent)}%`, 0.95 + meta.percent / 100 * 0.05));
-  const url = URL.createObjectURL(zipBlob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${containerName}_mesen2_hdpack.zip`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Deliver the pack. Everything above built a JSZip tree; only this last step
+  // differs, so the folder option cannot affect what gets exported.
+  //
+  // Folder mode writes the files straight into a directory you pick (ideally the
+  // Mesen HdPacks folder), skipping zip → unzip → copy. Chromium only; the
+  // checkbox is hidden without browser support and the ZIP stays the default.
+  let wroteToFolder = false;
+  if (outDirHandle) {
+    try {
+      const dirHandle = outDirHandle;
 
+      // Keep the entry object itself — re-looking it up by path via zip.file()
+      // is an extra failure mode for no benefit.
+      const files = [];
+      zip.forEach((relPath, entry) => { if (!entry.dir) files.push({ path: relPath, entry }); });
+
+      // Cache the PROMISE, not the resolved handle. Caching the handle only
+      // helped after the first call had finished awaiting, so a parallel batch
+      // all missed the cache and each walked the full parent chain — five
+      // redundant directory lookups per file until the cache filled.
+      const dirCache = new Map([['', Promise.resolve(dirHandle)]]);
+      const getDir = (path) => {
+        let p = dirCache.get(path);
+        if (p) return p;
+        const idx = path.lastIndexOf('/');
+        const parentPath = idx < 0 ? '' : path.slice(0, idx);
+        const name = idx < 0 ? path : path.slice(idx + 1);
+        p = getDir(parentPath).then(parent => parent.getDirectoryHandle(name, { create: true }));
+        dirCache.set(path, p);
+        return p;
+      };
+
+      // Write in parallel batches. Each file costs a handle lookup, a stream open
+      // and a close; done strictly one after another that is minutes of pure
+      // waiting for a pack of this size (~34k files). These are independent async
+      // I/O operations, so overlapping them is where the time actually goes.
+      let written = 0;
+      const failures = [];
+      const BATCH = 24;
+      const t0 = performance.now();
+
+      const writeOne = async ({ path: relPath, entry }) => {
+        try {
+          const idx = relPath.lastIndexOf('/');
+          const dirPath = idx < 0 ? '' : relPath.slice(0, idx);
+          const fileName = idx < 0 ? relPath : relPath.slice(idx + 1);
+          if (!fileName) return;
+          const targetDir = await getDir(dirPath);
+          const fileHandle = await targetDir.getFileHandle(fileName, { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(await entry.async('blob'));
+          await writable.close();
+          written++;
+        } catch (fileErr) {
+          // One bad file must not throw away the other 34000 — collect and report.
+          failures.push(`${relPath}: ${fileErr.name} ${fileErr.message}`);
+          if (failures.length <= 5) console.error(`[export] failed on ${relPath}:`, fileErr);
+        }
+      };
+
+      for (let i = 0; i < files.length; i += BATCH) {
+        await Promise.all(files.slice(i, i + BATCH).map(writeOne));
+        if (failures.length > 200) {
+          throw new Error(`Zu viele Schreibfehler (${failures.length}), Abbruch. ` +
+            `Erster: ${failures[0]}`);
+        }
+        const done = Math.min(i + BATCH, files.length);
+        const elapsed = (performance.now() - t0) / 1000;
+        const rate = done / Math.max(elapsed, 0.001);
+        const etaS = Math.round((files.length - done) / Math.max(rate, 0.001));
+        showMesenExportProgress(
+          `Dateien schreiben… ${done}/${files.length} (${Math.round(rate)}/s, noch ~${etaS}s)`,
+          0.95 + (done / files.length) * 0.05);
+        await _yieldToBrowser();
+      }
+      console.log(`[export] folder write took ${((performance.now() - t0) / 1000).toFixed(1)}s ` +
+        `for ${written} files`);
+      if (failures.length > 0) {
+        console.warn(`[export] ${failures.length} file(s) could not be written:`, failures.slice(0, 20));
+        alert(`${written} von ${files.length} Dateien geschrieben.\n\n` +
+              `${failures.length} fehlgeschlagen, erste:\n${failures.slice(0, 3).join('\n')}\n\n` +
+              `Der Ordner ist damit unvollständig.`);
+      }
+      wroteToFolder = true;
+      console.log(`[export] wrote ${written}/${files.length} files into the chosen folder (no ZIP)`);
+    } catch (e) {
+      console.error('[export] writing to folder failed, falling back to ZIP:', e);
+      alert(`Schreiben in den Ordner fehlgeschlagen:\n${e.message}\n\nEs wird stattdessen eine ZIP erzeugt.`);
+    }
+  }
+
+  if (!wroteToFolder) {
+    // Generate and download ZIP
+    const zipBlob = await zip.generateAsync(
+      { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
+      (meta) => showMesenExportProgress(`ZIP komprimieren… ${Math.round(meta.percent)}%`, 0.95 + meta.percent / 100 * 0.05));
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${containerName}_mesen2_hdpack.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  const owMsg = owExportedTiles > 0 ? `\n${owExportedTiles} Shop-/Weltkarten-Tiles` : '';
   const bg2Msg = bg2ExportedTiles > 0 ? `\n${bg2ExportedTiles} unique BG2-Tiles` : '';
   const wallMsg = wallExportedTiles > 0 ? `\n${wallExportedTiles} unique Wall-Tiles (Schiffswand)` : '';
   const bg3Msg = bg3ExportedTiles > 0 ? `\n${bg3ExportedTiles} unique BG3-Tiles` : '';
@@ -11093,9 +11839,12 @@ async function exportAsTexturePack(containerName) {
     ? `\n(davon ${bg1PaletteVariants} Palette-Varianten via ROM-Scan)` : '';
   const sprMsg = spriteExportedTiles > 0 ? `\n${spriteExportedTiles} HD-Sprite-Tiles (hash-keyed)` : '';
   const animMsg = animExportedTiles > 0 ? `\n${animExportedTiles} HD-Anim-Tiles (hash-keyed, h-Präfix)` : '';
-  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${bg2Msg}${wallMsg}${bg3Msg}${cmFgMsg}${sprMsg}${animMsg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`);
+  const deliveryMsg = wroteToFolder
+    ? `\n\nDirekt in den gewählten Ordner geschrieben (kein ZIP).\nDer Unterordner HdPacks\\Donkey Kong Country 2\\ wurde dort angelegt.`
+    : `\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`;
+  alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${owMsg}${bg2Msg}${wallMsg}${bg3Msg}${cmFgMsg}${sprMsg}${animMsg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.${deliveryMsg}`);
   if (animExportedTiles > 0) console.log(`[animtiles] ${animExportedTiles} Anim-Tile-PNGs als h{hash}_P{pal}.png exportiert`);
-  return { exportedTiles, bg2ExportedTiles, wallExportedTiles, bg3ExportedTiles, cmFgExportedTiles, animExportedTiles, sets: setsWithArrangement.length };
+  return { exportedTiles, owExportedTiles, bg2ExportedTiles, wallExportedTiles, bg3ExportedTiles, cmFgExportedTiles, animExportedTiles, sets: setsWithArrangement.length };
 
   } catch(err) {
     console.error('[Mesen2 Export] Fehler:', err);
@@ -13759,10 +14508,14 @@ document.getElementById('spriteCapInput').addEventListener('change', async (e) =
     return;
   }
   spriteCapPairs = res.map;
-  const btn = document.getElementById('spriteCapBtn');
-  btn.textContent = `Spritecap ✓ ${res.map.size}`;
-  btn.style.background = '#2e7d32';
-  btn.title = `${res.map.size} Hashes / ${res.pairs} (hash,pal)-Paare geladen (${res.bad} verworfen)`;
+  updateSpriteCapButton(res.map.size, res.pairs, null);
+  // Persist so it survives reloads — re-picking a file just overwrites it.
+  try {
+    await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs });
+    console.log(`[spritecap] ${res.map.size} Hashes gespeichert — bleibt über Reloads erhalten`);
+  } catch (err) {
+    console.warn('[spritecap] konnte nicht gespeichert werden:', err);
+  }
 });
 document.getElementById('bgCapBtn').addEventListener('click', () => {
   document.getElementById('bgCapInput').click();
@@ -14259,6 +15012,18 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 's') { toggleClusterSelectMode(); }
   else if (e.key === 'h') { if (hdPack) { hdEnabled = !hdEnabled; updateHDToggleUI(); redraw(); if (catalogView) renderCatalog(); } }
 });
+
+// Only offer the folder option where the File System Access API exists
+// (Chromium). Elsewhere the checkbox stays hidden and the ZIP path is unchanged.
+if (window.showDirectoryPicker) {
+  const wrap = document.getElementById('expToFolderWrap');
+  if (wrap) wrap.style.display = 'block';
+} else {
+  console.log('[export] no File System Access API in this browser — ZIP export only');
+}
+
+// Bring the stored spritecap back, so it no longer has to be re-uploaded.
+restoreSpriteCapFromDb();
 
 console.log('DKC2 Viewer: All scripts loaded and event listeners registered.');
 </script>
