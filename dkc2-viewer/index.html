@@ -409,9 +409,10 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <input type="file" id="containerZipInput" accept=".zip" style="display:none;">
       <input type="file" id="vramDumpInput" accept=".bin,.dmp" style="display:none;">
     </div>
-    <label id="expToFolderWrap" style="display:none;font-size:12px;color:#ccc;cursor:pointer;margin-bottom:8px;"
-           title="Statt einer ZIP die Dateien direkt in einen Ordner schreiben — spart Packen, Entpacken und Kopieren. Beim Export wird einmal ein Zielordner abgefragt (idealerweise der Mesen-HdPacks-Ordner).">
-      <input type="checkbox" id="expToFolder"> „Texture Pack" direkt in einen Ordner schreiben (statt ZIP)
+    <label id="expToFolderWrap" style="display:none;font-size:12px;color:#999;cursor:pointer;margin-bottom:8px;"
+           title="EXPERIMENTELL und derzeit DEUTLICH LANGSAMER als der ZIP-Weg: Windows legt pro Datei eine Swap-Datei an und benennt sie um, bei ~34000 Dateien dauert das sehr lange und belastet das ganze System. Der ZIP-Weg ist bis auf Weiteres der empfohlene.">
+      <input type="checkbox" id="expToFolder"> „Texture Pack" direkt in einen Ordner schreiben
+      <span style="color:#e57373;">(experimentell — deutlich langsamer als ZIP)</span>
     </label>
     <div id="containerStatusMsg" style="color:#ff9800;font-size:12px;min-height:18px;"></div>
   </div>
@@ -4728,11 +4729,24 @@ function populateGfxSetSelect() {
 // scratchpad/check_owconfig.py if the dumps are ever retaken.
 const OVERWORLD_SETS = {
   0x08: { kind: 'shop', shop: 'cranky',  levelId: 0x39, name: "Cranky's Monkey Museum",  chr: 0x2000, tm: 0x7000 },
-  0x09: { kind: 'shop', shop: 'funky',   levelId: 0x50, name: "Funky's Flights II",      chr: 0x2000, tm: 0x7400 },
+  // Funky is the one shop with a second scenic layer. 252 of its 256 BG2 tiles
+  // also exist in gfxset 0x25 (Mainbrace's set) — deliberate reuse by the game,
+  // and the reason P4.2 saw a shop "sharing BG2 with set 37".
+  // BG3 ($5000/$4800) is the text font and is deliberately left out: it belongs
+  // in the global font work, not scoped to one shop.
+  0x09: { kind: 'shop', shop: 'funky',   levelId: 0x50, name: "Funky's Flights II",      chr: 0x2000, tm: 0x7400,
+          extraLayers: [{ layer: 2, chr: 0x6000, tm: 0x7C00 }] },
   0x0A: { kind: 'shop', shop: 'wrinkly', levelId: 0x40, name: "Wrinkly's Kong Kollege",  chr: 0x2000, tm: 0x7000 },
   0x0B: { kind: 'shop', shop: 'swanky',  levelId: 0x48, name: "Swanky's Bonus Bonanza",  chr: 0x2000, tm: 0x7000 },
   0x0C: { kind: 'shop', shop: 'klubba',  levelId: 0x58, name: "Klubba's Kiosk",          chr: 0x2000, tm: 0x7000 },
-  0x35: { kind: 'map', world: 0, levelId: 0x38, name: 'Crocodile Isle (hub)',   chr: 0x2000, tm: 0x7800, tall: true },
+  // The hub is the most layered screen of the fifteen: main = BG1+BG2+OBJ,
+  // sub = BG3+OBJ, colour math on. BG2 is the green sky with its cloud bands,
+  // BG1 the island itself (only ~40% opaque — the sky shows through, which is
+  // why it looked sparse), BG3 the darker cloud bank around the island's foot,
+  // added in as a colour-math operand. All three are 32x64.
+  0x35: { kind: 'map', world: 0, levelId: 0x38, name: 'Crocodile Isle (hub)',   chr: 0x2000, tm: 0x7800, tall: true,
+          extraLayers: [{ layer: 2, chr: 0x5000, tm: 0x6800, tall: true },
+                        { layer: 3, chr: 0x7000, tm: 0x1800, tall: true, is4bpp: false }] },
   0x36: { kind: 'map', world: 1, levelId: 0x30, name: 'Gangplank Galleon',      chr: 0x2000, tm: 0x7800 },
   0x37: { kind: 'map', world: 2, levelId: 0x31, name: 'Crocodile Cauldron',     chr: 0x2000, tm: 0x7800 },
   0x38: { kind: 'map', world: 3, levelId: 0x32, name: 'Krem Quay',              chr: 0x2000, tm: 0x7000, wide: true },
@@ -4740,7 +4754,14 @@ const OVERWORLD_SETS = {
   0x3A: { kind: 'map', world: 5, levelId: 0x34, name: 'Gloomy Gulch',           chr: 0x2000, tm: 0x7800 },
   0x3B: { kind: 'map', world: 6, levelId: 0x35, name: "K. Rool's Keep",         chr: 0x2000, tm: 0x7000, tall: true },
   0x3C: { kind: 'map', world: 7, levelId: 0x36, name: 'The Flying Krock',       chr: 0x2000, tm: 0x7800 },
-  0x3D: { kind: 'map', world: 8, levelId: 0x37, name: 'Lost World',             chr: 0x6000, tm: 0x7C00 },
+  // Lost World is inverted compared to the other maps: BG1 ($6000/$7C00) is the
+  // volcano's animated smoke plume — the only moving world map — and the actual
+  // map sits on BG2 ($2000/$7800). That BG1 is a CHR animation, so one snapshot
+  // only covers the frame that was dumped; full coverage needs the S6b anim
+  // pipeline, where each frame is its own content hash.
+  0x3D: { kind: 'map', world: 8, levelId: 0x37, name: 'Lost World',             chr: 0x6000, tm: 0x7C00,
+          animated: true,
+          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x7800 }] },
   // Krazy Kremland's map is two separate screens, not one scrolled screen.
   0x3E: { kind: 'map', world: 4, levelId: 0x33, name: 'Krazy Kremland (screen 2)', chr: 0x2000, tm: 0x7800 },
 };
@@ -4770,18 +4791,30 @@ function overworldSetForLevel(levelId) {
   return isOverworldSet(gfx) ? gfx : null;
 }
 
-// BG1 layer geometry for an overworld set, straight from its dump-verified entry.
+// Every BG layer this screen contributes, in draw order (back to front is not
+// implied — each is exported on its own). BG1 always comes from the entry
+// itself; extraLayers adds the screens that use more than one.
 // Three screens are not 32x32: the hub and K. Rool's Keep are 32x64, Krem Quay
 // is 64x32.
-function getOverworldBgConfig(gfxSetIndex) {
+function getOverworldLayers(gfxSetIndex) {
   const def = OVERWORLD_SETS[gfxSetIndex];
   if (!def) return null;
-  return {
-    tilemapBase: def.tm,
-    chrBase: def.chr,
-    wide: !!def.wide,
-    tall: !!def.tall,
-  };
+  const mk = (o) => ({
+    layer: o.layer || 1,
+    chrBase: o.chr,
+    tilemapBase: o.tm,
+    wide: !!o.wide,
+    tall: !!o.tall,
+    // Mode 1: BG1/BG2 are 4bpp, BG3 is 2bpp.
+    is4bpp: o.is4bpp !== false,
+    // A CHR-animated layer must never supply fingerprint reference tiles: the
+    // hash changes with the animation phase, detection fails, and strict scoping
+    // then blocks HD for the WHOLE screen — not just the animated part.
+    animated: !!o.animated,
+  });
+  return [mk({ layer: 1, chr: def.chr, tm: def.tm, wide: def.wide, tall: def.tall,
+               animated: def.animated }),
+          ...(def.extraLayers || []).map(mk)];
 }
 
 // Build the catalog for a shop or world map.
@@ -4826,47 +4859,72 @@ function buildOverworldCatalog(gfxSetIndex) {
     }
   }
 
-  const bgConfig = getOverworldBgConfig(gfxSetIndex);
-  if (!bgConfig) {
+  const layerCfgs = getOverworldLayers(gfxSetIndex);
+  if (!layerCfgs || layerCfgs.length === 0) {
     console.error(`[overworld] no layer config for ${setId} (${def.name})`);
     return null;
   }
 
-  const tilesW = bgConfig.wide ? 64 : 32;
-  const tilesH = bgConfig.tall ? 64 : 32;
-  const widthPx = tilesW * 8, heightPx = tilesH * 8;
+  const owLayers = [];
+  for (const cfg of layerCfgs) {
+    const tilesW = cfg.wide ? 64 : 32;
+    const tilesH = cfg.tall ? 64 : 32;
+    const widthPx = tilesW * 8, heightPx = tilesH * 8;
 
-  const imgData = new ImageData(widthPx, heightPx);
-  renderBgLayer(vram, bgConfig, palette, true /* mode 1: BG1 is 4bpp */,
-                imgData, widthPx, heightPx, null);
+    const tmByteOffset = cfg.tilemapBase * 2;
+    const tmByteLength = tilesW * tilesH * 2;
+    if (tmByteOffset < 0 || tmByteOffset + tmByteLength > vram.length) {
+      console.error(`[overworld] ${setId} BG${cfg.layer}: tilemap ` +
+        `$${cfg.tilemapBase.toString(16)} +${tmByteLength}B is outside the ` +
+        `${vram.length}B VRAM dump — skipping this layer`);
+      continue;
+    }
+    const tilemapData = [];
+    for (let i = 0; i < tmByteLength; i++) tilemapData.push(vram[tmByteOffset + i] || 0);
 
-  const canvas = new OffscreenCanvas(widthPx, heightPx);
-  canvas.getContext('2d').putImageData(imgData, 0, 0);
+    const imgData = new ImageData(widthPx, heightPx);
+    renderBgLayer(vram, cfg, palette, cfg.is4bpp, imgData, widthPx, heightPx, null);
+    const canvas = new OffscreenCanvas(widthPx, heightPx);
+    canvas.getContext('2d').putImageData(imgData, 0, 0);
 
-  // Tilemap bytes for the pack export (same slicing the BG2 path uses)
-  const tmByteOffset = bgConfig.tilemapBase * 2;
-  const tmByteLength = tilesW * tilesH * 2;
-  let bg1TilemapData = null;
-  if (tmByteOffset >= 0 && tmByteOffset + tmByteLength <= vram.length) {
-    bg1TilemapData = [];
-    for (let i = 0; i < tmByteLength; i++) bg1TilemapData.push(vram[tmByteOffset + i] || 0);
-  } else {
-    console.error(`[overworld] tilemap $${bgConfig.tilemapBase.toString(16)} ` +
-      `+${tmByteLength}B is outside the ${vram.length}B VRAM dump for ${setId}`);
+    // Rows 28-31 of a 32-row tilemap sit below the 224 visible scanlines and
+    // hold leftover data — visible as a garbage strip along the bottom.
+    // Excluded for shops, which are static single screens. NOT excluded for
+    // maps: those scroll, so material outside the initial view is reachable.
+    const visibleRows = (def.kind === 'shop' && tilesH === 32) ? 28 : tilesH;
+
+    owLayers.push({
+      layer: cfg.layer,
+      image: { canvas, widthPx, heightPx, tilesW, tilesH, tileSize: 8 },
+      chrBase: cfg.chrBase,
+      tilemapBase: cfg.tilemapBase,
+      tilesW, tilesH, visibleRows,
+      is4bpp: cfg.is4bpp,
+      animated: cfg.animated,
+      tilemapData,
+    });
+  }
+  if (owLayers.length === 0) {
+    console.error(`[overworld] ${setId}: no layer could be rendered`);
     return null;
   }
 
+  const bg1 = owLayers.find(l => l.layer === 1) || owLayers[0];
+  const byLayer = (n) => owLayers.find(l => l.layer === n) || null;
   const ppuConfig = {
     bgMode: 1,
-    bg1ChrBase: bgConfig.chrBase,
-    bg2ChrBase: 0,
-    bg3ChrBase: 0,
-    terrainChrBase: bgConfig.chrBase,
-    bg1TilesW: tilesW, bg1TilesH: tilesH,
-    bg2TilesW: 32, bg2TilesH: 32,
-    bg3TilesW: 32, bg3TilesH: 32,
+    bg1ChrBase: bg1.chrBase,
+    bg2ChrBase: byLayer(2) ? byLayer(2).chrBase : 0,
+    bg3ChrBase: byLayer(3) ? byLayer(3).chrBase : 0,
+    terrainChrBase: bg1.chrBase,
+    bg1TilesW: bg1.tilesW, bg1TilesH: bg1.tilesH,
+    bg2TilesW: byLayer(2) ? byLayer(2).tilesW : 32,
+    bg2TilesH: byLayer(2) ? byLayer(2).tilesH : 32,
+    bg3TilesW: byLayer(3) ? byLayer(3).tilesW : 32,
+    bg3TilesH: byLayer(3) ? byLayer(3).tilesH : 32,
     wallTilesW: 0, wallTilesH: 0, wallTilemapBase: 0,
   };
+  const bg1TilemapData = bg1.tilemapData;
 
   const setInfo = {
     graphics: gfxSetIndex,
@@ -4875,38 +4933,23 @@ function buildOverworldCatalog(gfxSetIndex) {
     mapIds: new Set(),
   };
 
-  console.log(`[overworld] ${setId} "${def.name}": ${widthPx}x${heightPx}px, ` +
-    `chr $${bgConfig.chrBase.toString(16).toUpperCase()}, ` +
-    `tm $${bgConfig.tilemapBase.toString(16).toUpperCase()}`);
-
-  // Rows 28-31 of a 32-row tilemap sit below the 224 visible scanlines and hold
-  // leftover data — visible as a garbage strip along the bottom of the render.
-  // Excluded for shops, which are static single screens. NOT excluded for maps:
-  // those scroll, so material outside the initial view can still be reached, and
-  // exporting a few unused tiles is cheaper than losing visible art.
-  const visibleRows = (def.kind === 'shop' && tilesH === 32) ? 28 : tilesH;
-
-  const image = { canvas, widthPx, heightPx, tilesW, tilesH, tileSize: 8 };
+  console.log(`[overworld] ${setId} "${def.name}": ` + owLayers.map(l =>
+    `BG${l.layer} ${l.image.widthPx}x${l.image.heightPx} ` +
+    `chr $${l.chrBase.toString(16).toUpperCase()} ` +
+    `tm $${l.tilemapBase.toString(16).toUpperCase()}${l.is4bpp ? '' : ' 2bpp'}`
+  ).join(' | '));
 
   return {
     // No Map32 parts exist here, so there is no tile gallery — the screen is
     // shown as one image, and after an HD import the HD version replaces it.
     bg1Tiles: [],
     bg2Image: null, bg3Image: null, wallImage: null, ssbFgImage: null,
-    // One entry per BG layer. Today always just BG1, but the hub (sky on BG2,
-    // clouds on BG3), Funky's Flights (BG2) and Lost World (map on BG2, animated
-    // smoke on BG1) need more — everything downstream iterates this list so
-    // those are added as data, not as new code paths.
-    owLayers: [{
-      layer: 1,
-      image,
-      chrBase: bgConfig.chrBase,
-      tilemapBase: bgConfig.tilemapBase,
-      tilesW, tilesH, visibleRows,
-      is4bpp: true,
-      tilemapData: bg1TilemapData,
-    }],
-    owImage: image,          // convenience alias for the catalog display
+    // One entry per BG layer this screen uses. Twelve screens are BG1 only; the
+    // hub (sky on BG2, clouds on BG3), Funky's Flights (BG2) and Lost World (map
+    // on BG2, animated smoke on BG1) add more. Everything downstream iterates
+    // this list, so those are data rather than extra code paths.
+    owLayers,
+    owImage: bg1.image,      // convenience alias for the catalog display
     isOverworld: true,
     gfxSetIndex, refLevelId: def.levelId, setInfo, clusters: [],
     ppuConfig,
@@ -6453,15 +6496,19 @@ function renderCatalog() {
   // Shop / world-map screens are shown as one composed image instead of a tile
   // gallery — they have no Map32 parts to list. Same HD swap as the BG layers:
   // once an HD version is imported, it replaces the SD render.
-  if (catalogData.owImage) {
+  if (catalogData.owLayers && catalogData.owLayers.length > 0) {
     const owName = OVERWORLD_SETS[catalogData.gfxSetIndex]
       ? OVERWORLD_SETS[catalogData.gfxSetIndex].name : 'Overworld';
     // Look the HD art up by this screen's gfxset, so every imported screen keeps
     // showing HD — not just the one imported last.
     const hdOwSet = (hdEnabled && hdPack && hdPack.owLayers)
       ? hdPack.owLayers[catalogData.gfxSetIndex] : null;
-    const hdOw = (hdOwSet && hdOwSet[1]) ? hdOwSet[1].img : null;
-    renderBgImageSection(grid, catalogData.owImage, `BG1 — ${owName}`, '#9ccc65', scale, hdOw);
+    const layerColors = { 1: '#9ccc65', 2: '#4fc3f7', 3: '#ba68c8' };
+    for (const ol of catalogData.owLayers) {
+      const hdOw = (hdOwSet && hdOwSet[ol.layer]) ? hdOwSet[ol.layer].img : null;
+      renderBgImageSection(grid, ol.image, `BG${ol.layer} — ${owName}`,
+        layerColors[ol.layer] || '#9ccc65', scale, hdOw);
+    }
   }
 
   // Render BG2 as composed background image with grid overlay
@@ -7507,6 +7554,7 @@ async function exportCatalogAsZip() {
           widthPx: ol.image.widthPx, heightPx: outH,
           tilesW: ol.tilesW, tilesH: ol.tilesH, visibleRows: ol.visibleRows,
           chrBase: ol.chrBase, tilemapBase: ol.tilemapBase, is4bpp: ol.is4bpp,
+          animated: !!ol.animated,
         });
         console.log(`[overworld] exported ${fileName} ` +
           `(${ol.image.widthPx}x${outH}px, ${ol.tilesW}x${ol.visibleRows} tiles of ${ol.tilesH})`);
@@ -11317,9 +11365,16 @@ async function exportAsTexturePack(containerName) {
       if (set.owBlobs && set.vramSnapshot && isOverworldSet(set.gfxSetIndex)) {
         const vram = set.vramSnapshot instanceof Uint8Array
           ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+        // The layer configs are the authority for "is this animated", NOT the
+        // meta stored in the container: containers written before the flag
+        // existed carry no `animated`, which silently made every layer look
+        // stable and let the animated one supply fingerprint tiles again.
+        const owCfgs = getOverworldLayers(set.gfxSetIndex) || [];
         for (const [layerKey, oentry] of Object.entries(set.owBlobs)) {
           const layerIdx = Number(layerKey) - 1;   // BG1 → layer 0
           const ometa = (oentry && oentry.meta) || {};
+          const owCfg = owCfgs.find(c => c.layer === Number(layerKey));
+          const layerAnimated = owCfg ? owCfg.animated : !!ometa.animated;
           const oChr = ometa.chrBase != null ? ometa.chrBase : OVERWORLD_SETS[set.gfxSetIndex].chr;
           const oTm = ometa.tilemapBase != null ? ometa.tilemapBase : OVERWORLD_SETS[set.gfxSetIndex].tm;
           const oW = ometa.tilesW || 32, oH = ometa.tilesH || 32;
@@ -11342,7 +11397,10 @@ async function exportAsTexturePack(containerName) {
               const byteOff = vramWordAddr * 2;
               if (byteOff + oBytes <= vram.length) {
                 hashEntries.push({ vramAddr: vramWordAddr, layer: layerIdx, gfxset,
-                                   hash: fnv1a_64(vram, byteOff, oBytes) });
+                                   hash: fnv1a_64(vram, byteOff, oBytes),
+                                   // Steers the fingerprint pick away from CHR-animated
+                                   // layers, whose hashes change with the phase.
+                                   stable: !layerAnimated });
                 added++;
               }
             }

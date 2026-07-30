@@ -1,5 +1,94 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-30] — Nachtrag: der Fingerprint-Fix war zunächst wirkungslos
+
+Der Fix unten griff im Test nicht — Lost World stand weiter auf `gfx=-1`. Ursache war die
+Herkunft des Flags: die Hash-Erzeugung las `animated` aus der **im Container gespeicherten**
+`meta`, die aber aus einem Manifest von *vor* Einführung des Flags stammt. `undefined` ließ
+alle Ebenen als stabil gelten, und die Referenzkacheln kamen weiter aus der Rauchsäule.
+
+Jetzt wird `animated` aus `getOverworldLayers()` gelesen — die Registry ist die Autorität,
+nicht der gespeicherte Datensatz. Damit wirkt es auch für Container, die vorher geschrieben
+wurden; ein Neuimport ist nicht nötig, ein Pack-Export genügt.
+
+**User-bestätigt:** Lost World jetzt `gfx=61`, Karte und geöffnetes Vulkanmaul durchgehend
+in HD. Die Rauchsäule bleibt SD — erwartet, dafür fehlt noch die Anim-Pipeline.
+
+*Lehre für künftige Flags: gespeicherte Metadaten sind für neu eingeführte Felder
+unzuverlässig; immer aus der Registry ableiten.*
+
+**Nebenergebnis, das der Fix erst möglich gemacht hat:** Weil der bgcap-Recorder auf
+`ActiveGfxset >= 0` gegated ist, konnte er bei `gfx=-1` nichts aufzeichnen. Jetzt liegen
+**128 Frames der Rauchsäule** vor — ~19 Kachelpositionen zwischen `$63B0` und `$6540`, alle
+auf BG1/Palette 7, rund sieben Phasen je Position. Gleiche Struktur wie Hot Heads Lava.
+
+## [2026-07-30] — Lost World fiel komplett auf SD zurück, sobald der Rauch sich bewegte
+
+Im Test war die Karte in HD, solange die Rauchsäule in genau der Phase stand, die im
+VRAM-Dump steckte. Bei jeder anderen Phase fiel **das ganze Bild** auf SD zurück — nicht
+nur der Rauch. Das Diagnose-Log zeigt die Ursache eindeutig: die Signatur der Karte
+erscheint 115-mal, und in **jedem** Frame steht `gfx=-1`.
+
+Der Fingerprint schlug also fehl, und das strikte Gfxset-Scoping blockt bei `gfx=-1`
+konsequenterweise *alle* HD-Kacheln des Schirms. Referenzkacheln waren aus der animierten
+BG1-Ebene gewählt worden, deren Hashes sich mit jeder Animationsphase ändern.
+
+Die Fingerprint-Auswahl bevorzugt eigentlich schon „stabile" Kacheln — nur wurde das Feld
+`stable` für die Overworld-Einträge nie gesetzt, also waren alle Kandidaten gleichrangig
+und die animierten kamen genauso infrage.
+
+- `OVERWORLD_SETS` kennt jetzt `animated` je Ebene (gesetzt für Lost Worlds BG1).
+- Die Hash-Einträge tragen `stable: !animated`, wodurch die Auswahl auf die statische
+  Karte (BG2, 764 Kacheln) ausweicht.
+
+*Nicht* behoben ist damit die Abdeckung der Rauchsäule selbst — dafür braucht es die
+S6b-Anim-Pipeline mit einem Content-Hash je Frame. Neu ist nur, dass ihr Fehlen nicht mehr
+den restlichen Schirm mitreißt.
+
+## [2026-07-30] — Ordner-Export als experimentell gekennzeichnet
+
+Der Export in einen Ordner ist auch nach den bisherigen Optimierungen unbrauchbar langsam
+(über 2000 s veranschlagt) und belastet dabei das ganze System, während der ZIP-Weg für
+dieselbe Datenmenge zügig durchläuft. Die Checkbox sagt das jetzt deutlich, statt eine
+gleichwertige Alternative vorzutäuschen.
+
+Der Grund liegt in der Bauart der File System Access API: Chromium legt pro Datei eine
+Swap-Datei an und benennt sie beim Schließen um. Bei ~34 000 Dateien sind das über 100 000
+Dateisystem-Operationen, die unter Windows zusätzlich den Virenscanner beschäftigen — der
+ZIP-Weg schreibt dagegen **eine** Datei. Eine sinnvolle Lösung müsste die Dateimenge
+angehen (nur Geändertes schreiben) statt das Schreiben selbst zu beschleunigen.
+
+## [2026-07-30] — Die drei mehrschichtigen Schirme bekommen ihre fehlenden Ebenen
+
+Zwölf der fünfzehn Schirme sind reines BG1 und liefen bereits. Drei nicht — und bei ihnen
+fehlte jeweils der *größere* Teil des Bildes:
+
+| Schirm | Ebene | Inhalt | Deckung |
+|---|---|---|---|
+| Crocodile Isle (Hub) | BG2 | grüner Himmel mit Wolkenbändern | 99,3 % |
+| | BG3 (2bpp) | Wolkenbank am Inselfuß, Color-Math-Operand | 13,2 % |
+| Funky's Flights II | BG2 | zweite Szenenebene | 100 % |
+| Lost World | BG2 | **die eigentliche Karte** — Vulkan, Lava, Dschungel | 100 % |
+
+Lost World ist der auffälligste Fall: dessen BG1 ist die animierte Rauchsäule (nur 6 %
+Deckung, 85 Kacheln), die Karte selbst liegt auf BG2 mit 764 Kacheln. Bisher wurde also
+ausschließlich der Rauch exportiert. Umgekehrt beim Hub: BG1 ist die Insel mit nur 40 %
+Deckung, weil der Himmel dahinter durchscheinen soll — das sah nach einem Fehler aus, ist
+aber korrekt.
+
+- `OVERWORLD_SETS` bekommt ein optionales `extraLayers`. Da `owLayers[]` von Anfang an ein
+  Array war, sind die Zusatzebenen reine **Daten** — Container, SD-Export, HD-Import und
+  Pack-Export iterieren sie bereits und mussten nicht angefasst werden.
+- Der Katalog zeigt jetzt eine Sektion pro Ebene, jede mit eigenem HD-Tausch.
+- 2bpp wird durchgereicht (Hub-BG3): 8 Wörter statt 16 pro Kachel, 4 Farben pro
+  Palettenzeile. Die Fingerprint-Auswahl überspringt Layer ≥ 2 ohnehin, da sie 4bpp
+  voraussetzt — Hub-BG3 wird also korrekt nicht als Referenzkachel benutzt.
+- **Funkys BG3 bleibt bewusst draußen:** das ist die Textschrift und gehört in die globale
+  Font-Arbeit, nicht an ein einzelnes Gfxset gebunden.
+- **Lost Worlds BG1 bleibt unvollständig, mit Absicht:** eine CHR-Animation, von der ein
+  VRAM-Schnappschuss nur den gedumpten Frame enthält. Volle Abdeckung braucht die
+  S6b-Anim-Pipeline, wo jeder Frame seinen eigenen Content-Hash bekommt.
+
 ## [2026-07-29] — NPC-Shops und Weltkarten: Katalog-Builder (Teil 1 von 4)
 
 Shops und Weltkarten waren bisher vom HD-Pack ausgeschlossen. Sie haben im ROM
