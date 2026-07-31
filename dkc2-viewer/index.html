@@ -6954,6 +6954,88 @@ function buildAnimTerrainContext(animAddrSet, mLayer) {
   return { cells, objects, layer: mLayer, drawRegion, source: 'terrain' };
 }
 
+// Context builder for shop and world-map screens — the third case, and the
+// simplest of the three. Neither of the others fits: buildAnimOverlayContexts
+// reads the level runtime (currentBgData.vram + ppu) and buildAnimTerrainContext
+// the level's Map32 grid; an overworld screen has neither. What it does have is
+// better than both — buildOverworldCatalog already rendered every layer from the
+// screen's own VRAM dump and kept the dump, the geometry and the rendered
+// canvas, so the context is a plain lookup over data that is already there, with
+// no runtime state involved.
+//
+// This is what Lost World's smoke plume needs (22 addresses $63A0-$6540 on BG1,
+// 4-8 phases each), and the same path covers any other CHR animation on these
+// screens: Krazy Kremland's blinking sign on the hub, Swanky's light strip.
+//
+// bgcap counts layers Mesen's way (0 = BG1); owLayers counts BG1 as 1.
+function buildAnimOverworldContexts(animEntries, cat) {
+  if (!cat || !cat.isOverworld || !cat.vram || !cat.owLayers) return null;
+  const vram = cat.vram;
+
+  const addrByLayer = new Map();      // mesenLayer -> Set(wordAddr)
+  for (const e of animEntries) {
+    if (!addrByLayer.has(e.layer)) addrByLayer.set(e.layer, new Set());
+    addrByLayer.get(e.layer).add(e.addr);
+  }
+
+  const contexts = new Map();
+  for (const [mLayer, animAddrSet] of addrByLayer) {
+    const l = cat.owLayers.find(x => x.layer === mLayer + 1);
+    if (!l) {
+      // The recording saw animated tiles on a layer this screen does not export.
+      // That is a missing extraLayers entry in OVERWORLD_SETS, not a bad capture.
+      console.warn(`[animtiles] BG${mLayer + 1}: diese Ebene wird für den Schirm nicht exportiert ` +
+        `(vorhanden: ${cat.owLayers.map(x => 'BG' + x.layer).join(', ')}) — ` +
+        `${animAddrSet.size} Anim-Adresse(n) übersprungen. Fehlt ein extraLayers-Eintrag in OVERWORLD_SETS?`);
+      continue;
+    }
+    const wordsPerTile = l.is4bpp ? 16 : 8;
+    const tmBase = l.tilemapBase * 2;
+
+    // Same cell walk as renderBgLayer, including the 32x32 screen offsets — the
+    // hub and K. Rool's Keep are 32x64 and Krem Quay is 64x32, so a flat index
+    // would read the wrong cells there.
+    const cells = new Map();          // "tx,ty" -> {addr(word), flipH, flipV}
+    const animCells = [];
+    for (let ty = 0; ty < l.tilesH; ty++) {
+      for (let tx = 0; tx < l.tilesW; tx++) {
+        let screenOffset = 0;
+        const localTx = tx & 31, localTy = ty & 31;
+        if (tx >= 32) screenOffset += 0x800;
+        if (ty >= 32) screenOffset += (l.tilesW === 64) ? 0x1000 : 0x800;
+        const tmOffset = tmBase + screenOffset + (localTy * 32 + localTx) * 2;
+        if (tmOffset + 1 >= vram.length) continue;
+        const tileWord = vram[tmOffset] | (vram[tmOffset + 1] << 8);
+        const wordAddr = l.chrBase + (tileWord & 0x03FF) * wordsPerTile;
+        cells.set(`${tx},${ty}`, { addr: wordAddr, flipH: !!(tileWord & 0x4000), flipV: !!(tileWord & 0x8000) });
+        if (animAddrSet.has(wordAddr)) animCells.push({ tx, ty });
+      }
+    }
+
+    if (animCells.length === 0) {
+      const fmt = a => '$' + a.toString(16).toUpperCase();
+      const want = [...animAddrSet].sort((a, b) => a - b);
+      const have = [...new Set([...cells.values()].map(c => c.addr))].sort((a, b) => a - b);
+      console.warn(
+        `[animtiles] BG${mLayer + 1}: 0 von ${animAddrSet.size} Anim-Adressen in der Tilemap gefunden ` +
+        `(chrBase=${fmt(l.chrBase)}, tilemapBase=${fmt(l.tilemapBase)}, ${l.tilesW}x${l.tilesH})\n` +
+        `   gesucht: ${want.slice(0, 8).map(fmt).join(' ')}${want.length > 8 ? ' …' : ''}\n` +
+        `   Tilemap belegt: ${fmt(have[0])}–${fmt(have[have.length - 1])} (${have.length} distinkt)\n` +
+        `   Wurde die Aufzeichnung auf einem anderen Schirm gemacht, oder ist der VRAM-Dump älter als das Spiel-Ereignis?`);
+      continue;
+    }
+
+    const baseCanvas = l.image.canvas;
+    contexts.set(mLayer, {
+      cells, objects: clusterAnimCells(animCells, cells, l.tilesW, l.tilesH).objects,
+      layer: mLayer, source: 'overworld-dump',
+      drawRegion: (octx, region, cw, ch) =>
+        octx.drawImage(baseCanvas, region.x0 * 8, region.y0 * 8, region.w * 8, region.h * 8, 0, 0, cw, ch),
+    });
+  }
+  return contexts.size ? contexts : null;
+}
+
 // Pick the minimum set of object occurrences that still covers every animated
 // address. The same art is repeated all over a level — Mainbrace's flag occurs 6x,
 // Hot Head's lava pools 125x — and every occurrence yields byte-identical sheets,
@@ -7415,14 +7497,20 @@ async function exportCatalogAsZip() {
       if (animForGfx.length > 0) {
         btn.textContent = 'Exporting anim frames...';
         await new Promise(r => setTimeout(r, 0));
-        const contexts = buildAnimOverlayContexts(animForGfx);
+        // Shops and world maps carry no level runtime at all — they get their
+        // context straight from the VRAM dump the catalog was built from.
+        const contexts = catalogData.isOverworld
+          ? buildAnimOverworldContexts(animForGfx, catalogData)
+          : buildAnimOverlayContexts(animForGfx);
         if (contexts) {
           for (const [mL, c] of contexts) {
             const sizes = c.objects.map(o => `${o.w}x${o.h}(${o.tiles})`).join(' ');
             console.log(`[animtiles] BG${mL + 1} (${c.source || 'vram-tilemap'}): ${c.objects.length} Objekte erkannt — Größen ${sizes}`);
           }
         } else {
-          console.warn('[animtiles] kein Layer-Kontext (Level mit den Anim-Elementen geladen?) — Fallback: transparentes Padding pro Kachel');
+          console.warn(`[animtiles] kein Layer-Kontext (${catalogData.isOverworld
+            ? 'Schirm ohne VRAM-Dump, oder die Anim-Adressen stehen nicht in seiner Tilemap'
+            : 'Level mit den Anim-Elementen geladen?'}) — Fallback: transparentes Padding pro Kachel`);
         }
         const animFolder = rootFolder.folder('animtiles');
         manifest.animTiles = [];
@@ -8366,6 +8454,28 @@ async function importHDPack(file) {
       }
     }
 
+    // A shop / world-map ZIP carries no tiles/ and no clusters/, so the scale
+    // auto-detection above never ran and scaleFactor is still the manifest's 1
+    // (the SD export writes 1 and the upscaler leaves the manifest alone). That
+    // number is the anim import's TARGET cell size — dst = 8 * scaleFactor — so
+    // leaving it at 1 would resample every upscaled animation cell down to 8px.
+    // The overworld layers were just measured against their SD width, which is
+    // exactly the factor the upscaler applied; a previous import in this session
+    // is the last resort.
+    if (!scaleDetected && !(manifest.scaleFactor > 1)) {
+      const owScales = Object.values(hdOwLayers).map(o => Math.round(o.scale)).filter(s => s > 1);
+      if (owScales.length) {
+        scaleFactor = Math.max(...owScales);
+        console.log(`[import] Skalierung ${scaleFactor}x aus den Schirm-Ebenen abgeleitet (das ZIP hat keine tiles/)`);
+      } else if (hdPack?.scaleFactor > 1) {
+        scaleFactor = hdPack.scaleFactor;
+        console.log(`[import] Skalierung ${scaleFactor}x aus dem laufenden hdPack übernommen (das ZIP hat weder tiles/ noch Schirm-Ebenen)`);
+      } else if (Array.isArray(manifest.animTiles) && manifest.animTiles.length) {
+        console.warn('[import] Skalierung unbekannt (1x) — die Anim-Kacheln würden auf 8px verkleinert. ' +
+                     'Wurde das ZIP wirklich durch den Upscaler geschickt?');
+      }
+    }
+
     // Merge into existing hdPack rather than replacing — allows importing multiple
     // ZIPs one after another (e.g. tiles first, then BG2 separately).
     const isFirstImport = !hdPack;
@@ -8773,7 +8883,15 @@ async function bitmapToBlob(bmp) {
 // --- Save current hdPack level tiles to container ---
 
 async function saveCurrentHDToContainer(containerName) {
-  if (!hdPack || hdPack.tiles.size === 0) return 0;
+  // Anim tiles and overworld layers can legitimately arrive WITHOUT any Map32
+  // tiles: a shop or world map has no tile gallery at all (bg1Tiles is empty by
+  // construction), and re-importing only an animation's frames carries nothing
+  // else either. Both are keyed by content hash / layer with nothing left to
+  // re-derive them from, so returning here would silently drop them — the same
+  // class of loss as the empty-tile-list overwrite guarded against below.
+  if (!hdPack) return 0;
+  const hasOwLayers = hdPack.owLayers && Object.keys(hdPack.owLayers).length > 0;
+  if (hdPack.tiles.size === 0 && !hdPack.animTiles?.size && !hasOwLayers) return 0;
 
   // Determine which gfxset this save belongs to. Prefer hdPack.gfxSetIndex — set from
   // the just-imported ZIP's own manifest (see importHDPack), always correct regardless
@@ -10020,7 +10138,10 @@ async function exportAsTexturePack(containerName) {
   let exportedTiles = 0;
   let bg1PaletteVariants = 0;  // count of extra tiles added by ROM palette scan
   let animExportedTiles = 0;
-  const animExportedKeys = new Set();  // "{layer}/h{hash}_P{pal}" — hashes are gfxset-independent
+  // "{gfxset}/{layer}/h{hash}_P{pal}". Scoped per gfxset on purpose: the hash
+  // identifies the art, but Mesen's strict scoping only matches tiles inside the
+  // recognised gfxset, so two sets sharing an animated tile each need their own copy.
+  const animExportedKeys = new Set();
   // hash -> every BG layer it was recorded on. Built from the live bgcap rather than
   // from what the container happens to store, so a pack export fixes the layer set
   // without a re-import (see the use site).
@@ -10555,17 +10676,26 @@ async function exportAsTexturePack(containerName) {
       }
     }
 
-    // --- S6b step 4b: CHR-animation frames, keyed by content hash ---
-    // These deliberately do NOT go through the vramAddr naming above: an animation
-    // streams several different tiles through the SAME address, so the address cannot
-    // identify the art. The "h" prefix tells Mesen's loader to read the 16 hex digits
-    // as a content hash directly (same idea as sprites/{hash}_P{pal}.png). The gfxset
-    // folder still scopes them, and the layer picks bg1 vs bg2.
-    // One PNG per layer the content was actually observed on. Mesen's tile key
-    // includes the layer, and some levels point BG1 and BG2 at the same CHR window
-    // (Hot Head: 203 of 1110 hashes show up on both) — shipping only one layer would
-    // silently miss every lookup on the other. Same bytes, so the copy is exact.
-    for (const a of (set.animTiles || [])) {
+  }
+
+  // --- S6b step 4b: CHR-animation frames, keyed by content hash ---
+  // These deliberately do NOT go through the vramAddr naming above: an animation
+  // streams several different tiles through the SAME address, so the address cannot
+  // identify the art. The "h" prefix tells Mesen's loader to read the 16 hex digits
+  // as a content hash directly (same idea as sprites/{hash}_P{pal}.png). The gfxset
+  // folder still scopes them, and the layer picks bg1 vs bg2.
+  // One PNG per layer the content was actually observed on. Mesen's tile key
+  // includes the layer, and some levels point BG1 and BG2 at the same CHR window
+  // (Hot Head: 203 of 1110 hashes show up on both) — shipping only one layer would
+  // silently miss every lookup on the other. Same bytes, so the copy is exact.
+  //
+  // This walks EVERY set rather than only the ones with Map32 terrain, which is
+  // where it used to sit. Shops and world maps have no tile arrangement by
+  // definition, so Lost World's smoke plume would never have reached the pack.
+  for (const set of levelSets) {
+    if (set.gfxSetIndex == null || !set.animTiles || !set.animTiles.length) continue;
+    const gfxIdStr = String(set.gfxSetIndex).padStart(2, '0');
+    for (const a of set.animTiles) {
       // Layer set, best source first:
       //  1. the live bgcap recording — authoritative and always current, and the only
       //     source that fixes containers filled before layers[] existed (the field
@@ -10580,7 +10710,7 @@ async function exportAsTexturePack(containerName) {
       const fileName = `h${String(a.hash).toUpperCase()}_P${String(a.pal).padStart(2, '0')}.png`;
       for (const layer of layers) {
         if (layer < 0 || layer > 2) continue;
-        const dedupKey = `${layer}/${fileName}`;
+        const dedupKey = `${gfxIdStr}/${layer}/${fileName}`;
         if (animExportedKeys.has(dedupKey)) continue;
         animExportedKeys.add(dedupKey);
         root.folder(`bg/bg${layer + 1}/gfxset_${gfxIdStr}`).file(fileName, a.blob);

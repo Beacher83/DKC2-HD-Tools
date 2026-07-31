@@ -1,5 +1,63 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-07-31] — CHR-Animationen auf Weltkarten und in Shops
+
+Lost Worlds Rauchsäule war der letzte sichtbar in SD verbliebene Teil der Weltkarten. Die
+128 aufgezeichneten Frames lagen seit gestern vor, konnten aber nirgends verarbeitet werden:
+die S6b-Pipeline braucht zu jedem Anim-Frame seinen **Bildkontext** — den Ausschnitt, in dem
+das Objekt im Spiel wirklich steht — und beide vorhandenen Kontext-Builder greifen auf
+Dinge zu, die ein Shop- oder Kartenschirm nicht besitzt. `buildAnimOverlayContexts` liest
+die Level-Laufzeit (`currentBgData.vram` + `ppu`), `buildAnimTerrainContext` das Map32-Raster
+des Levels.
+
+**Neu: `buildAnimOverworldContexts()`** — der dritte Fall, und der einfachste. Ein
+Overworld-Schirm hat zwar keine Laufzeitdaten, dafür aber etwas Besseres: `buildOverworldCatalog`
+hat jede Ebene bereits aus dem **echten VRAM-Dump des Schirms** gerendert und hält Dump,
+Geometrie und fertige Leinwand fest. Der Kontext ist damit ein reiner Nachschlag auf
+vorhandenen Daten, ohne jede Laufzeitabhängigkeit. Der Zellenlauf spiegelt `renderBgLayer`
+inklusive der 32×32-Screen-Offsets, sonst läsen Hub, K. Rool's Keep (32×64) und Krem Quay
+(64×32) die falschen Zellen.
+
+Verifiziert gegen den echten Dump, bevor eine Zeile Exportcode lief: alle **22** Anim-Adressen
+`$63A0`–`$6540` stehen in Lost Worlds BG1-Tilemap, als **ein** zusammenhängendes Objekt
+(x 18–21, y 0–6). Der Trockenlauf liefert 1 Objekt, Ausschnitt 6×8 Kacheln (48×64 px, nach
+dem Upscale 192×256), **8 Phasen → 8 Sheets, alle 128 aufgezeichneten Hashes abgedeckt**,
+keine Einzelkachel-Fallbacks.
+
+Auf dem Weg dorthin drei Stellen, an denen die Kette für Nicht-Level-Sets gerissen wäre:
+
+- **Der Pack-Export hätte die Anim-Kacheln nie geschrieben.** Der Block lag im Rumpf der
+  Schleife über `setsWithArrangement` — Sets mit Map32-Terrain. Shops und Karten haben per
+  Definition keines, ihre Anim-Kacheln wären also stumm liegengeblieben. Der Block läuft
+  jetzt als eigene Schleife über *alle* Sets mit Anim-Kacheln. Der Dedup-Schlüssel enthält
+  dabei neu das Gfxset: Hashes sind zwar gfxset-unabhängig, Mesens striktes Scoping matcht
+  aber nur innerhalb des erkannten Gfxsets, also braucht jedes Set seine eigene Kopie.
+- **Der HD-Import hätte jede Anim-Zelle auf 8 px verkleinert.** Die Skalierungserkennung
+  hängt an `tiles/`; ein Schirm-ZIP hat keine, also blieb `scaleFactor` auf der 1 aus dem
+  Manifest — und genau diese Zahl ist die *Zielgröße* des Anim-Imports (`dst = 8 × scaleFactor`).
+  Jetzt wird sie ersatzweise aus den Schirm-Ebenen gemessen (deren SD-Breite steht im
+  Manifest), sonst aus dem laufenden `hdPack`; bleibt beides aus, warnt der Import laut.
+- **Der Container-Save wäre sofort ausgestiegen.** `saveCurrentHDToContainer` beginnt mit
+  `if (hdPack.tiles.size === 0) return 0`. Ein Schirm hat nie Map32-Kacheln, ein Nachimport
+  nur der Anim-Frames auch nicht — beide sind hash-/ebenen-adressiert und aus nichts
+  wiederherstellbar. Der Guard lässt jetzt auch Anim-Kacheln und Schirm-Ebenen passieren.
+
+**Datenlage der übrigen gemeldeten Animationen** (aus `snes_hd_bgcap.txt` /
+`snes_hd_spritemiss.txt` ausgezählt) — der Code deckt sie alle ab, aufgezeichnet ist bisher
+nur die erste:
+
+| Animation | Aufzeichnung | Weg |
+|---|---|---|
+| Lost World, Rauchsäule | **128 Frames, 22 Adressen** | dieser Pfad, bereit |
+| Hub, blinkendes Kremland-Schild | **keine bgcap-Zeile für G53** | erst aufzeichnen |
+| Hub, Fackeln | keine bgcap-Zeile; 415 Sprite-Hashes für G53 vorhanden | vermutlich Sprite-Pipeline |
+| Swanky, Lichterleiste | **keine Zeile für G11**, weder BG noch Sprite | erst aufzeichnen |
+
+Dass für den Hub *keine* BG-Misses auflaufen, obwohl er erkannt wird (`gfx=53`, drei
+Kontextwechsel im Log), ist ein Hinweis, aber kein Beweis: entweder blinkt das Schild über
+die **Palette** statt über CHR-DMA — dann erzeugt es prinzipiell keine Misses und gehört in
+keine der beiden Pipelines — oder die Aufzeichnung war schlicht zu kurz.
+
 ## [2026-07-30] — Nachtrag: der Fingerprint-Fix war zunächst wirkungslos
 
 Der Fix unten griff im Test nicht — Lost World stand weiter auf `gfx=-1`. Ursache war die
