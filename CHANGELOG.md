@@ -1,5 +1,169 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-05c] — Der Pack-Export las Tilemaps > 32 Kacheln falsch
+
+Lockjaws Schiffswand kam in Mesen in HD an, aber **falsch angeordnet** — die Kunst war im
+Viewer richtig, im Pack richtig, nur im Spiel saßen die Stücke an den falschen Stellen.
+
+**Ursache:** eine SNES-Tilemap über 32×32 ist kein flaches Gitter, sondern zwei bzw. vier
+**32×32-Screens hintereinander** zu je 1024 Einträgen. Die Tilemaps liegen im Container als
+rohe VRAM-Kopie (`vram[offset + i]`, `index.html:10468`), also genau in diesem Layout — und
+vier Exporter lasen sie mit `tilemapWords[tileY * tilesW + tileX]`. Für jede Kachel mit
+`tileX >= 32` ist das der falsche Eintrag: die Kunst wird unter der Adresse einer **anderen**
+Kachel abgelegt. Zur Laufzeit matcht sie dann sauber (`hashes.bin` leitet den Hash direkt aus
+der VRAM-Adresse ab und war deshalb korrekt) und zeigt trotzdem das falsche Bild — genau das
+beobachtete Symptom.
+
+Sämtliche **Renderer** haben es immer schon richtig gemacht (`:1437`, `:1850`, `:6833`,
+`:7049`), ebenso der BG1-Pack-Export (`:12022`). Deshalb sah die Wand im Viewer gut aus.
+Betroffen waren nur die vier Exporter, die eine gespeicherte `*TilemapData` lesen. Neu:
+`tilemapEntryIndex()` an allen vier Stellen.
+
+Die Wand (64×32) traf es voll. Lockjaws BG3 ist 32×32 und war deshalb nie betroffen — was dazu
+passt, dass BG3 in der Aufzeichnung **null** Misses hat.
+
+**Nachtrag, erster Anlauf war falsch:** nicht jede gespeicherte Tilemap kommt aus VRAM. Pirate
+Panics BG3 hat eine leere VRAM-Tilemap (die Scroll-Engine streamt Metatiles), deshalb setzt
+`:10473` eine **virtuelle** Tilemap ein, aus ROM-Metatiles expandiert — **160×64, flaches
+Array**. Screen-Offsets darauf lesen Müll: `bg3/gfxset_07` fiel von 67 Kacheln auf **2**, weil
+jedes `tileX >= 32` auf einen Null-Eintrag zeigte und als leer übersprungen wurde. Genau die
+Takelage von Pirate Panic. Eine echte SNES-Tilemap ist pro Achse nur 32 oder 64 Kacheln groß —
+das ist jetzt der Test, alles andere gilt als rekonstruiert und wird flach gelesen.
+Gegen die Renderer-Formel (`:1437`) geprüft: für 32×32, 64×32, 32×64 und 64×64 liefert die
+Funktion **identische und bijektive** Indizes, für 160×64 bleibt sie flach.
+
+### Median-Kacheln — versuchsweise, nur für Mainbrace
+
+Mainbrace' Wolkenhimmel wirkt in Mesen „nicht wie aus einem Guss", im Viewer dagegen sauber.
+Der Effekt ist alt, nicht neu. Zwei Verdächtige wurden ausgeschlossen und einer belegt:
+
+**Ausgeschlossen — R3, der Palette-Transform.** `bg2/gfxset_37` verteilt sich auf drei
+Palettenzeilen (P07: 273 Kacheln, P05: 36, P03: 7), und R3 rechnet je Zeile einen eigenen
+Helligkeitsfaktor — verschiedene Faktoren nebeneinander hätten genau solche Blöcke ergeben.
+Nachgerechnet aus `palettes.bin` und den bgcap-CGRAM-Feldern, exakt nach
+`SnesHdVideoFilter.cpp:1288-1302`: **jede beobachtete Zeile ist identisch zur Referenz**
+(G37 Zeile 6, G7 Zeilen 1–7, G3 Zeilen 1/4/5) → `if(!differs) continue` → der Transform läuft
+gar nicht. Entlastet.
+
+**Belegt — Kontextabhängigkeit des Upscalers.** BG2 geht als *ein* Bild durch das Modell,
+wird aber kachelweise geschnitten. Dieselbe 8×8-Kachel steht im Bild oft vielfach, und weil
+die Nachbarschaft jedes Mal anders ist, fällt das hochgerechnete Ergebnis jedes Mal anders aus:
+
+| | Pirate Panic BG2 (Himmel) | Lockjaw BG2 (Decke) |
+|---|---|---|
+| Fläche aus wiederholten Kacheln | **81 %** | 18 % |
+| häufigste Wiederholung | **128×** | 29× |
+| Streuung der HD-Fassungen | Median 3,0/255, max **13,3** | Median 0,3, max **0,9** |
+| Kacheln mit Streuung > 3/255 | **106 von 213** | **0 von 108** |
+
+Der Export nahm bisher das **erste** Vorkommen und verwarf den Rest — im Spiel bekommt die
+Kachel dann überall die Fassung, die für genau eine Position geglättet wurde. Deshalb sitzt der
+Effekt an Kachelgrenzen mitten im Bild und nicht an den Tapetenkanten, und deshalb ist er im
+Viewer unsichtbar (der zeigt das Bild am Stück).
+
+**Versucht und wieder entfernt:** pixelweiser Median über alle Vorkommen einer Kachel, versuchs-
+weise nur für Mainbrace. Hat funktioniert (gegen vier Fälle geprüft: Ausreißer ignoriert,
+gerade Anzahl mittelt die beiden mittleren, identische Fassungen ergeben die Identität, Alpha
+bleibt erhalten) und war **im Spiel trotzdem kaum zu sehen** — vom User getestet. Der Tile-Effekt
+blieb.
+
+**Warum die Obergrenze prinzipiell niedrig ist** — der Grund, es nicht doch stehenzulassen: der
+Median korrigiert den Farb-Bias *innerhalb* einer Kachel. Der sichtbare Effekt sitzt aber auch
+an den **Rändern**, und die sind mit keinem Verfahren zu retten, das eine Kachel genau einmal
+speichert. Kachel A liegt einmal neben B und einmal neben C; die Glättung kann nur zu einer der
+beiden passen. Ein Sonderpfad für ein einzelnes Gfxset war das nicht wert.
+
+Der einzige Weg, der die Ursache trifft, wäre BG2 wie BG1 zu exportieren — gepolsterte
+Einzelkacheln plus Cluster, Auswahl über `tileScore`. Kostet einen eigenen Upscale-Durchlauf je
+Set. Steht als Kommentar im Code, falls der Effekt je stört.
+
+### Ein ungespiegeltes Vorkommen schlägt jetzt ein gespiegeltes
+
+Mainbrace' Wolkenhimmel (BG2) sah in Mesen stellenweise falsch angeordnet bzw. gespiegelt aus,
+im Viewer dagegen richtig. Ausgelöst hat es die Untersuchung, bewiesen ist die Ursache nicht —
+der Pack stammte aus dem oben beschriebenen kaputten Zwischenstand. Was die Untersuchung aber
+zutage gefördert hat, ist eine echte Fragilität:
+
+Die Dedup war **„erste gewinnt" pro `{Adresse}_{Palette}`**. Dieselbe Kachel steht in der
+Tilemap oft vielfach, mal gespiegelt, mal nicht — bei einem Wolkenhimmel ist das die Regel.
+Welches Vorkommen zuerst kommt, hängt an der **Scan-Reihenfolge**, und genau die hat der
+Tilemap-Fix geändert. Traf es ein gespiegeltes Vorkommen, musste die Kunst per
+Canvas-Transformation zurückgedreht werden, bevor sie ins Pack ging (Mesen spiegelt selbst zur
+Laufzeit, `SnesHdVideoFilter.cpp:122-133`, der Pack muss also die kanonische Fassung tragen).
+
+Ein **ungespiegeltes** Vorkommen braucht überhaupt keine Transformation und ist damit immer die
+verlässlichere Quelle. Es darf jetzt ein bereits geschriebenes, gespiegeltes ersetzen. Danach
+hängt das Ergebnis weder an der Scan-Reihenfolge noch daran, dass das Zurückdrehen stimmt.
+Betrifft die vier Exporter BG2, Wand, BG3 und cmFg; BG1 läuft über einen eigenen Pfad und ist
+unverändert.
+
+### Der Color-Math-Vordergrund wurde im Katalog nie in HD gezeigt
+
+`renderBgImageSection(grid, ssb, label, '#ffab40', scale)` — **ohne HD-Argument**, also immer
+die native Quelle, auch wenn der Container die hochskalierte hielt. Wortgleiche Auslassung wie
+bei der Schiffswand einen Eintrag weiter oben.
+
+Wo die HD-Fassung liegt, hängt an der QUELLE, und die beiden Fälle sind nicht austauschbar:
+ein BG1-gespeister Overlay (SSB-Honig) hat sein eigenes Bild in `hdPack.cmFg`, ein
+BG3-gespeister (Lockjaws Wasser) hat gar keine eigene Kunst — die BG3-Kette trägt ihn bereits,
+weshalb der Container für ihn auch keinen `cmFgBlob` speichert. Beide Zweige sind jetzt
+verdrahtet.
+
+Dazu eine Sicherung: `renderBgImageSection` bemisst die Leinwand am HD-Bild, die CSS-Größe aber
+am SD-Bild — ein Paar mit abweichender Geometrie käme verzerrt heraus. Der BG3-Overlay wird
+getrennt von `catalogData.bg3Image` zusammengesetzt und teilt dessen Maße nicht garantiert.
+Passt der Faktor nicht (ganzzahlig, in beiden Achsen gleich), bleibt es bei SD und die Konsole
+sagt warum.
+
+### Keine vollständig transparenten Kacheln mehr im Pack
+
+Mesen überspringt eine vollständig transparente HD-Kachel beim Matchen
+(`SnesHdData.h:475`, `IsFullyTransparent`) und zeichnet die native — die ebenfalls transparent
+ist. **Am Bild ändert sich dadurch nichts**, in beiden Fällen ist dort nichts. Was die Datei
+sehr wohl ändert, ist die Diagnose: jede taucht in `snes_hd_bgcap.txt` als Miss auf. Lockjaws
+BG2 lieferte 74 solcher Dateien, die für **148 von 232** aufgezeichneten Misses verantwortlich
+waren und die echten Fälle zugedeckt haben. Der Export schreibt sie nicht mehr und meldet die
+Zahl in der Konsole.
+
+### Nebenbefund für jede künftige Log-Auswertung
+
+`snes_hd_bgcap.txt` & Co. werden mit `fopen(path, "a")` geöffnet
+(`SnesHdVideoFilter.cpp:1742`) — **die Logs hängen über Sitzungen hinweg an.** Die Datei hatte
+21 828 Zeilen aus vielen Läufen; die aktuelle Sitzung war der letzte zusammenhängende
+G3-Block mit 232 Zeilen. Wer die ganze Datei auswertet, misst Vergangenheit.
+
+## [2026-08-05b] — Die zweite BG2-Ebene konnte nie HD werden
+
+Lockjaw's Locker (`gfxset_03`) hat zwei BG2-Ebenen: Decke und **Schiffswand**. Nach dem
+HD-Import war die Decke hochaufgelöst, die Wand blieb SD.
+
+**Das ZIP war in Ordnung** — `bg2_wall.png` liegt darin, sauber hochgerechnet
+(512×256 → 2048×1024), und das Manifest trägt seinen `bg2_wall`-Eintrag. Der Fehler war,
+dass **niemand ihn gelesen hat**: `bg2_wall` kam im ganzen Viewer genau zweimal vor, beide
+Male auf der Schreibseite des SD-Exports. Kein Import-Zweig, kein Anzeige-Zweig.
+
+Die Speicherseite hat den Rest erledigt: der Wand-Blob wurde bei **jedem** Container-Save aus
+der nativen Quelle neu gebaut, unter dem Kommentar `no HD version yet, always native res` —
+richtig, als er geschrieben wurde, und still falsch geworden, sobald der SD-Export die Wand
+mitschickte. Selbst wenn der Import sie eingelagert hätte, wäre sie beim nächsten Speichern
+wieder überschrieben worden.
+
+Der Rest der Kette war die ganze Zeit fertig: `hdPack.wall`/`wallGfxSet` existieren, der
+Container führt `wallBlob`, und der Pack-Export leitet seine Kachelgröße aus der Bildbreite ab
+(`srcTileSize = wallBitmap.width / tilesW`) — er hätte ein 4×-Bild ohne jede Änderung
+verarbeitet. Es fehlten nur die zwei Enden.
+
+**Behoben:**
+- Import liest `manifest.bg2_wall` nach `hdPack.wall` (+ `wallGfxSet`), wie BG2/BG3.
+- Container-Save nimmt **HD zuerst**, native Quelle nur als Rückfall.
+- **Abwärts-Sperre:** `hdPack.wall` wird nach jedem Save freigegeben, der nächste Save fände
+  also nur die native Quelle und würde die HD-Wand still herunterstufen. Ein gespeicherter
+  Wand-Blob wird deshalb nie durch einen **kleineren** ersetzt. Dieselbe Absicht wie bei
+  BG2/BG3, nur über die Auflösung ausgedrückt, weil es kein HD/SD-Kennzeichen gibt.
+- Katalogansicht zeigt die HD-Wand (`renderBgImageSection` bekommt sie jetzt übergeben) und
+  die Statuszeile nennt sie als `Wand` — sonst wäre es genau der Fall von 08-05a gewesen:
+  korrekt importiert, korrekt gespeichert, auf dem Schirm trotzdem SD.
+
 ## [2026-08-05] — Die importierte Laufzeit-HD-Kunst war da, nur nie auf dem Schirm
 
 Erster echter Rundweg für die Hub-Objekte (Fackeln, Flagge, Luftschiff): SD-Export →

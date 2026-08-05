@@ -6558,9 +6558,13 @@ function renderCatalog() {
     renderBgImageSection(grid, catalogData.bg2Image, 'BG2', '#4fc3f7', scale, hdBg2);
   }
 
-  // Render ship wall (BG2 screens 2+3) as separate section
+  // Render ship wall (BG2 screens 2+3) as separate section.
+  // Takes the HD version exactly like BG2 and BG3 above — without this the wall
+  // would import and store correctly and still look SD on screen, which is the
+  // failure that made the runtime objects look broken on 2026-08-05.
   if (showBg2 && catalogData.wallImage) {
-    renderBgImageSection(grid, catalogData.wallImage, 'BG2 Wall (Schiffswand)', '#e57373', scale);
+    const hdWall = (hdEnabled && hdPack && hdPack.wall && (hdPack.wallGfxSet === undefined || hdPack.wallGfxSet === catalogData?.gfxSetIndex)) ? hdPack.wall : null;
+    renderBgImageSection(grid, catalogData.wallImage, 'BG2 Wall (Schiffswand)', '#e57373', scale, hdWall);
   }
 
   // Render BG3 as composed background image with grid overlay
@@ -6580,7 +6584,32 @@ function renderCatalog() {
       const blendMode = ssb.colorMathSubtract ? 'subtract' : 'add';
       label = `Color Math Foreground - ${srcLayer} (${blendMode}, alpha=${ssb.colorMathAlpha.toFixed(2)})`;
     }
-    renderBgImageSection(grid, ssb, label, '#ffab40', scale);
+    // Where the HD version lives depends on the SOURCE layer, and the two cases
+    // are not interchangeable: a BG1-sourced overlay (SSB honey) has its own
+    // upscaled image in hdPack.cmFg, while a BG3-sourced one (Lockjaw's water)
+    // has no separate art at all — the BG3 pipeline already carries it, which is
+    // exactly why the container stores no cmFgBlob for it.
+    // This section had no HD argument at all, so it drew the native image even
+    // when the container held the upscaled one. Same omission as the ship wall.
+    const cmSrc = ssb.source || 'bg3';
+    let hdCm = !hdEnabled || !hdPack ? null
+      : (cmSrc === 'bg1'
+          ? ((hdPack.cmFg && (hdPack.cmFgGfxSet == null || hdPack.cmFgGfxSet === catalogData?.gfxSetIndex)) ? hdPack.cmFg : null)
+          : ((hdPack.bg3 && (hdPack.bg3GfxSet === undefined || hdPack.bg3GfxSet === catalogData?.gfxSetIndex)) ? hdPack.bg3 : null));
+    // renderBgImageSection sizes the canvas from the HD image but its CSS size from
+    // the SD one, so a mismatched pair would show up stretched. The BG3-sourced
+    // overlay is composed separately from catalogData.bg3Image and is not
+    // guaranteed to share its geometry — check instead of assuming, and fall back
+    // to SD (the previous behaviour) rather than draw something misleading.
+    if (hdCm) {
+      const fx = hdCm.width / ssb.widthPx, fy = hdCm.height / ssb.heightPx;
+      if (fx !== fy || fx < 1 || fx !== Math.round(fx)) {
+        console.warn(`[katalog] HD-Overlay passt nicht zum SD-Bild `
+                   + `(${hdCm.width}x${hdCm.height} gegen ${ssb.widthPx}x${ssb.heightPx}) — zeige SD.`);
+        hdCm = null;
+      }
+    }
+    renderBgImageSection(grid, ssb, label, '#ffab40', scale, hdCm);
   }
   
   // Render Tile Clusters (composites for upscaling) - auto-detected + manual
@@ -9080,7 +9109,7 @@ function updateHDToggleUI() {
   if (hdPack) {
     btn.style.display = '';
     status.style.display = '';
-    const bgParts = [hdPack.bg2 ? 'BG2' : '', hdPack.bg3 ? 'BG3' : ''].filter(Boolean).join('+');
+    const bgParts = [hdPack.bg2 ? 'BG2' : '', hdPack.wall ? 'Wand' : '', hdPack.bg3 ? 'BG3' : ''].filter(Boolean).join('+');
     const spritePart = (hdPack.sprites && hdPack.sprites.size > 0) ? `, ${hdPack.sprites.size} sprites` : '';
     const detail = `${hdPack.scaleFactor}x | ${hdPack.tiles.size} tiles, ${hdPack.clusters.length} clusters${spritePart}${bgParts ? ', ' + bgParts : ''}`;
     if (hdEnabled) {
@@ -9531,13 +9560,20 @@ async function importHDPack(file) {
       console.log(`HD scoring: resolved ${scoringChoices} tiles with multiple candidates`);
     }
     
-    // Load BG2/BG3/overlay HD
-    let hdBg2 = null, hdBg3 = null, hdCmFg = null;
+    // Load BG2/BG3/wall/overlay HD
+    let hdBg2 = null, hdBg3 = null, hdWall = null, hdCmFg = null;
     if (manifest.bg2 && manifest.bg2.file) {
       hdBg2 = await loadImage(manifest.bg2.file);
     }
     if (manifest.bg3 && manifest.bg3.file) {
       hdBg3 = await loadImage(manifest.bg3.file);
+    }
+    // The second BG2 layer (Schiffswand — Lockjaw's Locker has a ceiling AND a
+    // wall). The SD export has written bg2_wall.png plus its manifest entry all
+    // along, but nothing ever read it back, so this was the one layer that could
+    // never go HD: the container save built it from the native source every time.
+    if (manifest.bg2_wall && manifest.bg2_wall.file) {
+      hdWall = await loadImage(manifest.bg2_wall.file);
     }
     if (manifest.cmFg && manifest.cmFg.file) {
       hdCmFg = await loadImage(manifest.cmFg.file);
@@ -9705,9 +9741,10 @@ async function importHDPack(file) {
       }
     }
 
-    // BG2/BG3: overwrite if present in this pack
-    if (hdBg2) { hdPack.bg2 = hdBg2; hdPack.bg2GfxSet = manifest.gfxSetIndex; }
-    if (hdBg3) { hdPack.bg3 = hdBg3; hdPack.bg3GfxSet = manifest.gfxSetIndex; }
+    // BG2/BG3/wall: overwrite if present in this pack
+    if (hdBg2)  { hdPack.bg2 = hdBg2;   hdPack.bg2GfxSet = manifest.gfxSetIndex; }
+    if (hdBg3)  { hdPack.bg3 = hdBg3;   hdPack.bg3GfxSet = manifest.gfxSetIndex; }
+    if (hdWall) { hdPack.wall = hdWall; hdPack.wallGfxSet = manifest.gfxSetIndex; }
     if (Object.keys(hdOwLayers).length > 0) {
       // Keyed by gfxset AND layer. Keying by layer alone made each import
       // overwrite the previous screen's BG1, so only the most recent one still
@@ -10231,14 +10268,38 @@ async function saveCurrentHDToContainer(containerName) {
     owBlobs = existingSet.owBlobs;
     console.log(`[save] "${setId}": gespeicherte Overworld-Ebenen übernommen (keine im Speicher).`);
   }
-  // Wall blob: convert wallData ImageData to PNG blob (no HD version yet, always native res)
-  if (currentMatchesActive && currentBgData && currentBgData.wallData) {
+  // Wall (Schiffswand): HD from an import first, native only as a fallback.
+  // Until 2026-08-05 this branch ALWAYS rebuilt the wall from the native source,
+  // with the comment "no HD version yet" — which had stopped being true once the
+  // SD export started shipping bg2_wall.png. The import now fills hdPack.wall,
+  // so the HD version has to win here or it would be thrown away on every save.
+  let wallIsHd = false;
+  if (hdPack.wall && (hdPack.wallGfxSet === undefined || hdPack.wallGfxSet === activeGfxIdx)) {
+    wallBlob = await bitmapToBlob(hdPack.wall);
+    wallIsHd = true;
+  } else if (currentMatchesActive && currentBgData && currentBgData.wallData) {
     const wd = currentBgData.wallData;
     const c = new OffscreenCanvas(wd.widthPx, wd.heightPx);
     c.getContext('2d').putImageData(wd.imgData, 0, 0);
     wallBlob = await c.convertToBlob({ type: 'image/png' });
   } else if (catalogData && catalogData.wallImage && catalogData.wallImage.canvas) {
     wallBlob = await catalogData.wallImage.canvas.convertToBlob({ type: 'image/png' });
+  }
+  // hdPack.wall is freed after every save (like bg2/bg3), so the NEXT save of this
+  // set finds only the native source and would quietly downgrade the stored art.
+  // Never replace a stored wall with a smaller one — the same rule that keeps
+  // bg2/bg3 alive, just expressed by resolution because there is no HD/SD flag.
+  if (!wallIsHd && wallBlob && existingSet?.wallBlob) {
+    try {
+      const [neu, alt] = await Promise.all([
+        createImageBitmap(wallBlob), createImageBitmap(existingSet.wallBlob)]);
+      if (alt.width > neu.width) {
+        wallBlob = existingSet.wallBlob;
+        console.log(`[save] "${setId}": gespeicherte HD-Wand behalten `
+                    + `(${alt.width}px statt ${neu.width}px aus der Live-Ansicht).`);
+      }
+      neu.close(); alt.close();
+    } catch (e) { console.warn('[save] Wand-Auflösung nicht vergleichbar:', e); }
   }
 
   // Foreground overlay blob: SSB (source='bg1', color math), BG1 overlay (source='bg1', opaque),
@@ -11263,8 +11324,79 @@ function hideMesenExportProgress() {
 }
 const _yieldToBrowser = () => new Promise(r => setTimeout(r, 0));
 
+// Index into a tilemap that was copied RAW out of VRAM.
+//
+// A SNES tilemap larger than 32x32 is not one flat grid: it is two or four
+// 32x32 SCREENS laid end to end, 1024 entries each. `tileY * tilesW + tileX`
+// therefore reads the wrong entry for every tile with tileX >= 32 — the art
+// ends up filed under another tile's address, which in the game looks like a
+// correctly drawn background whose pieces sit in the wrong places.
+//
+// Every RENDERER here already did this right (`index.html:1437`, `:1850`,
+// `:6833`, `:7049`) and so does the BG1 pack export (`:12022`) — which is why
+// the viewer showed the ship wall correctly while the exported pack scrambled
+// it. Only the four exporters reading a stored *TilemapData array were flat.
+//
+// BUT NOT EVERY STORED TILEMAP CAME OUT OF VRAM. Pirate Panic's BG3 has an empty
+// VRAM tilemap (the scroll engine streams metatiles), so `:10473` substitutes a
+// VIRTUAL tilemap expanded from ROM — 160x64, a plain flat array. Applying screen
+// offsets to that reads garbage: the first attempt at this fix cut bg3/gfxset_07
+// from 67 tiles to 2, because every tileX >= 32 landed on a zero entry and was
+// skipped as empty. A real SNES tilemap is only ever 32 or 64 tiles per axis, so
+// that is the test — anything else is reconstructed and is stored flat.
+function tilemapEntryIndex(tileX, tileY, tilesW, tilesH) {
+  const isSnesLayout = (tilesW === 32 || tilesW === 64) && (tilesH === 32 || tilesH === 64);
+  if (!isSnesLayout) return tileY * tilesW + tileX;
+  let screen = 0;
+  if (tileX >= 32) screen += 1;
+  if (tileY >= 32) screen += (tilesW > 32) ? 2 : 1;
+  return screen * 1024 + (tileY & 31) * 32 + (tileX & 31);
+}
+
+// A tile whose HD art is completely transparent is worse than no file at all:
+// Mesen skips it at match time (`SnesHdData.h:475`, IsFullyTransparent) and draws
+// the native tile instead — which is transparent too, so the picture on screen is
+// IDENTICAL either way. What the file does change is the diagnosis: each one shows
+// up in snes_hd_bgcap.txt as a miss. Lockjaw's BG2 shipped 74 of them, and they
+// accounted for 148 of its 232 recorded misses — burying the real ones.
+// ===========================================================================
+// VERWORFEN 2026-08-05: Median-Kacheln fuer BG2
+//
+// Mainbrace' Wolkenhimmel wirkt in Mesen "nicht wie aus einem Guss". Ursache
+// gemessen: der Upscaler verarbeitet BG2 als EIN Bild, geschnitten wird
+// kachelweise, und dieselbe 8x8-Kachel steht im Bild oft vielfach (Pirate
+// Panics Himmel: 81 % der Flaeche aus wiederholten Kacheln, eine davon 128x).
+// Je nach Nachbarschaft faellt das hochgerechnete Ergebnis anders aus — im
+// Mittel 3/255, max 13/255. Der Export nimmt das erste Vorkommen.
+//
+// Versucht: alle Vorkommen einsammeln, pixelweise Median. Hat funktioniert und
+// war im Spiel trotzdem kaum zu sehen — deshalb wieder entfernt.
+//
+// WARUM DIE OBERGRENZE PRINZIPIELL NIEDRIG IST: der Median korrigiert den
+// Farb-Bias INNERHALB einer Kachel. Der sichtbare Effekt sitzt aber auch an den
+// RAENDERN, und die sind mit keinem Verfahren zu retten, das eine Kachel genau
+// einmal speichert — Kachel A liegt einmal neben B und einmal neben C, die
+// Glaettung kann nur zu einer der beiden passen.
+//
+// Der einzige Weg, der die URSACHE trifft, waere BG2 wie BG1 zu exportieren:
+// gepolsterte Einzelkacheln plus Cluster, Auswahl ueber tileScore. Kostet einen
+// eigenen Upscale-Durchlauf je Set. Erst anfassen, wenn der Effekt wirklich
+// stoert.
+// ===========================================================================
+
+let _emptyTilesSkipped = 0;
+function canvasIsFullyTransparent(ctx, w, h) {
+  const d = ctx.getImageData(0, 0, w, h).data;
+  for (let i = 3; i < d.length; i += 4) if (d[i] !== 0) return false;
+  return true;
+}
+
+
+
 async function exportAsTexturePack(containerName) {
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
+
+  _emptyTilesSkipped = 0;
 
   // Warn about a missing spritecap BEFORE the long run, not after it — finding
   // out at the end that the sprites were skipped wastes the whole export.
@@ -11818,6 +11950,7 @@ async function exportAsTexturePack(containerName) {
         }
 
         // Convert to PNG blob once (reused across all chrBases)
+        if (canvasIsFullyTransparent(ctx, outCanvas.width, outCanvas.height)) { _emptyTilesSkipped++; continue; }
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
         const rawPng = atob(b64);
@@ -12012,6 +12145,7 @@ async function exportAsTexturePack(containerName) {
           ctx.drawImage(bitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
           if (flipH || flipV) ctx.restore();
 
+          if (canvasIsFullyTransparent(ctx, outCanvas.width, outCanvas.height)) { _emptyTilesSkipped++; continue; }
           const dataUrl = outCanvas.toDataURL('image/png');
           const raw = atob(dataUrl.slice(dataUrl.indexOf(',') + 1));
           const arr = new Uint8Array(raw.length);
@@ -12050,7 +12184,7 @@ async function exportAsTexturePack(containerName) {
     const bg2GfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const bg2GfxIdStr = String(bg2GfxIdx).padStart(2, '0');
     const bg2Folder = root.folder(`bg/bg2/gfxset_${bg2GfxIdStr}`);
-    const bg2ExportedKeys = new Set();  // per-set dedup
+    const bg2ExportedKeys = new Map();   // fileKey -> wurde aus einem GESPIEGELTEN Vorkommen geschrieben
 
     const chrBase  = ppuCfg.bg2ChrBase || 0;
     const is4bpp   = (ppuCfg.bgMode === 1);   // Mode 1: BG1+BG2 are both 4bpp
@@ -12071,7 +12205,7 @@ async function exportAsTexturePack(containerName) {
     for (let tileY = 0; tileY < tilesH; tileY++) {
       if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
-        const entry = tilemapWords[tileY * tilesW + tileX];
+        const entry = tilemapWords[tilemapEntryIndex(tileX, tileY, tilesW, tilesH)];
         if (entry === undefined) continue;
         const tileNum = entry & 0x3FF;
         const palRow  = (entry >> 10) & 7;
@@ -12083,8 +12217,18 @@ async function exportAsTexturePack(containerName) {
         const palStr  = 'P' + String(palRow).padStart(2, '0');
         const fileKey = `${addrHex}_${palStr}`;
 
-        if (bg2ExportedKeys.has(fileKey)) continue;
-        bg2ExportedKeys.add(fileKey);
+        // "Erste gewinnt" allein reicht nicht: dieselbe Kachel steht in der Tilemap
+        // oft mehrfach, mal gespiegelt, mal nicht — bei einem Wolkenhimmel ist das
+        // die Regel. Welches Vorkommen zuerst kommt, haengt an der Scan-Reihenfolge,
+        // und die Kunst muesste dann per Transformation zurueckgedreht werden. Ein
+        // UNGESPIEGELTES Vorkommen braucht gar keine Transformation, ist also immer
+        // die verlaesslichere Quelle — deshalb darf es ein bereits geschriebenes,
+        // gespiegeltes ersetzen. Danach haengt das Ergebnis weder an der Reihenfolge
+        // noch daran, dass das Zurueckdrehen stimmt.
+        const _prevFlipped = bg2ExportedKeys.get(fileKey);
+        const _thisFlipped = flipH || flipV;
+        if (_prevFlipped !== undefined && !(_prevFlipped && !_thisFlipped)) continue;
+        bg2ExportedKeys.set(fileKey, _thisFlipped);
 
         // Extract tile region from bg2.png and scale to 32×32 output.
         // Works for both native (8px/tile) and HD-upscaled (32px/tile) sources.
@@ -12103,13 +12247,14 @@ async function exportAsTexturePack(containerName) {
         ctx.drawImage(bg2Bitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
         if (flipH || flipV) ctx.restore();
 
+        if (canvasIsFullyTransparent(ctx, outCanvas.width, outCanvas.height)) { _emptyTilesSkipped++; continue; }
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
         const raw = atob(b64);
         const arr = new Uint8Array(raw.length);
         for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
         bg2Folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
-        bg2ExportedTiles++;
+        if (_prevFlipped === undefined) bg2ExportedTiles++;   // Ueberschreiben ist kein neues Tile
       }
     }
   }
@@ -12142,7 +12287,7 @@ async function exportAsTexturePack(containerName) {
     const wallGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const wallGfxIdStr = String(wallGfxIdx).padStart(2, '0');
     const wallFolder = root.folder(`bg/bg2/gfxset_${wallGfxIdStr}`);
-    const wallExportedKeys = new Set();
+    const wallExportedKeys = new Map();   // fileKey -> wurde aus einem GESPIEGELTEN Vorkommen geschrieben
 
     const chrBase  = ppuCfg.bg2ChrBase || 0;
     const is4bpp   = (ppuCfg.bgMode === 1);
@@ -12162,7 +12307,7 @@ async function exportAsTexturePack(containerName) {
     for (let tileY = 0; tileY < tilesH; tileY++) {
       if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
-        const entry = tilemapWords[tileY * tilesW + tileX];
+        const entry = tilemapWords[tilemapEntryIndex(tileX, tileY, tilesW, tilesH)];
         if (entry === undefined) continue;
         const tileNum = entry & 0x3FF;
         if (tileNum === 0) continue;  // skip empty tilemap entries
@@ -12175,8 +12320,18 @@ async function exportAsTexturePack(containerName) {
         const palStr  = 'P' + String(palRow).padStart(2, '0');
         const fileKey = `${addrHex}_${palStr}`;
 
-        if (wallExportedKeys.has(fileKey)) continue;
-        wallExportedKeys.add(fileKey);
+        // "Erste gewinnt" allein reicht nicht: dieselbe Kachel steht in der Tilemap
+        // oft mehrfach, mal gespiegelt, mal nicht — bei einem Wolkenhimmel ist das
+        // die Regel. Welches Vorkommen zuerst kommt, haengt an der Scan-Reihenfolge,
+        // und die Kunst muesste dann per Transformation zurueckgedreht werden. Ein
+        // UNGESPIEGELTES Vorkommen braucht gar keine Transformation, ist also immer
+        // die verlaesslichere Quelle — deshalb darf es ein bereits geschriebenes,
+        // gespiegeltes ersetzen. Danach haengt das Ergebnis weder an der Reihenfolge
+        // noch daran, dass das Zurueckdrehen stimmt.
+        const _prevFlipped = wallExportedKeys.get(fileKey);
+        const _thisFlipped = flipH || flipV;
+        if (_prevFlipped !== undefined && !(_prevFlipped && !_thisFlipped)) continue;
+        wallExportedKeys.set(fileKey, _thisFlipped);
 
         // Extract tile region from wall.png and scale to 32×32 output.
         // Un-flip to store the canonical un-flipped version.
@@ -12194,13 +12349,14 @@ async function exportAsTexturePack(containerName) {
         ctx.drawImage(wallBitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
         if (flipH || flipV) ctx.restore();
 
+        if (canvasIsFullyTransparent(ctx, outCanvas.width, outCanvas.height)) { _emptyTilesSkipped++; continue; }
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
         const raw = atob(b64);
         const arr = new Uint8Array(raw.length);
         for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
         wallFolder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
-        wallExportedTiles++;
+        if (_prevFlipped === undefined) wallExportedTiles++;   // Ueberschreiben ist kein neues Tile
       }
     }
   }
@@ -12232,7 +12388,7 @@ async function exportAsTexturePack(containerName) {
     const bg3GfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const bg3GfxIdStr = String(bg3GfxIdx).padStart(2, '0');
     const bg3Folder = root.folder(`bg/bg3/gfxset_${bg3GfxIdStr}`);
-    const bg3ExportedKeys = new Set();
+    const bg3ExportedKeys = new Map();   // fileKey -> wurde aus einem GESPIEGELTEN Vorkommen geschrieben
 
     const chrBase = ppuCfg.bg3ChrBase || 0;
     // BG3 in Mode 1 is 2bpp; in other modes it may be 4bpp
@@ -12253,7 +12409,7 @@ async function exportAsTexturePack(containerName) {
     for (let tileY = 0; tileY < tilesH; tileY++) {
       if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
-        const entry = tilemapWords[tileY * tilesW + tileX];
+        const entry = tilemapWords[tilemapEntryIndex(tileX, tileY, tilesW, tilesH)];
         if (entry === undefined) continue;
         const tileNum = entry & 0x3FF;
         const palRow  = (entry >> 10) & 7;
@@ -12265,8 +12421,18 @@ async function exportAsTexturePack(containerName) {
         const palStr  = 'P' + String(palRow).padStart(2, '0');
         const fileKey = `${addrHex}_${palStr}`;
 
-        if (bg3ExportedKeys.has(fileKey)) continue;
-        bg3ExportedKeys.add(fileKey);
+        // "Erste gewinnt" allein reicht nicht: dieselbe Kachel steht in der Tilemap
+        // oft mehrfach, mal gespiegelt, mal nicht — bei einem Wolkenhimmel ist das
+        // die Regel. Welches Vorkommen zuerst kommt, haengt an der Scan-Reihenfolge,
+        // und die Kunst muesste dann per Transformation zurueckgedreht werden. Ein
+        // UNGESPIEGELTES Vorkommen braucht gar keine Transformation, ist also immer
+        // die verlaesslichere Quelle — deshalb darf es ein bereits geschriebenes,
+        // gespiegeltes ersetzen. Danach haengt das Ergebnis weder an der Reihenfolge
+        // noch daran, dass das Zurueckdrehen stimmt.
+        const _prevFlipped = bg3ExportedKeys.get(fileKey);
+        const _thisFlipped = flipH || flipV;
+        if (_prevFlipped !== undefined && !(_prevFlipped && !_thisFlipped)) continue;
+        bg3ExportedKeys.set(fileKey, _thisFlipped);
 
         // Extract tile, scale to 32x32, un-flip
         const srcX = tileX * srcTileSize, srcY = tileY * srcTileSize;
@@ -12283,13 +12449,14 @@ async function exportAsTexturePack(containerName) {
         ctx.drawImage(bg3Bitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
         if (flipH || flipV) ctx.restore();
 
+        if (canvasIsFullyTransparent(ctx, outCanvas.width, outCanvas.height)) { _emptyTilesSkipped++; continue; }
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
         const raw = atob(b64);
         const arr = new Uint8Array(raw.length);
         for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
         bg3Folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
-        bg3ExportedTiles++;
+        if (_prevFlipped === undefined) bg3ExportedTiles++;   // Ueberschreiben ist kein neues Tile
       }
     }
   }
@@ -12327,7 +12494,7 @@ async function exportAsTexturePack(containerName) {
     const cmFgGfxIdx = set.gfxSetIndex != null ? set.gfxSetIndex : 0;
     const cmFgGfxIdStr = String(cmFgGfxIdx).padStart(2, '0');
     const cmFgFolder = root.folder(`cmFg/gfxset_${cmFgGfxIdStr}`);
-    const cmFgExportedKeys = new Set();
+    const cmFgExportedKeys = new Map();   // fileKey -> wurde aus einem GESPIEGELTEN Vorkommen geschrieben
 
     const chrBase  = ppuCfg.bg1ChrBase || 0;
     const is4bpp   = (ppuCfg.bgMode === 1);
@@ -12373,7 +12540,7 @@ async function exportAsTexturePack(containerName) {
     for (let tileY = 0; tileY < tilesH; tileY++) {
       if (tileY % 8 === 0) await _yieldToBrowser();
       for (let tileX = 0; tileX < tilesW; tileX++) {
-        const entry = tilemapWords[tileY * tilesW + tileX];
+        const entry = tilemapWords[tilemapEntryIndex(tileX, tileY, tilesW, tilesH)];
         if (entry === undefined) continue;
         const tileNum = entry & 0x3FF;
         if (tileNum === 0) continue;  // skip empty tilemap entries
@@ -12398,8 +12565,18 @@ async function exportAsTexturePack(containerName) {
         const palStr  = 'P' + String(palRow).padStart(2, '0');
         const fileKey = `${addrHex}_${palStr}`;
 
-        if (cmFgExportedKeys.has(fileKey)) continue;
-        cmFgExportedKeys.add(fileKey);
+        // "Erste gewinnt" allein reicht nicht: dieselbe Kachel steht in der Tilemap
+        // oft mehrfach, mal gespiegelt, mal nicht — bei einem Wolkenhimmel ist das
+        // die Regel. Welches Vorkommen zuerst kommt, haengt an der Scan-Reihenfolge,
+        // und die Kunst muesste dann per Transformation zurueckgedreht werden. Ein
+        // UNGESPIEGELTES Vorkommen braucht gar keine Transformation, ist also immer
+        // die verlaesslichere Quelle — deshalb darf es ein bereits geschriebenes,
+        // gespiegeltes ersetzen. Danach haengt das Ergebnis weder an der Reihenfolge
+        // noch daran, dass das Zurueckdrehen stimmt.
+        const _prevFlipped = cmFgExportedKeys.get(fileKey);
+        const _thisFlipped = flipH || flipV;
+        if (_prevFlipped !== undefined && !(_prevFlipped && !_thisFlipped)) continue;
+        cmFgExportedKeys.set(fileKey, _thisFlipped);
 
         // Extract tile, scale to 32x32, un-flip
         const srcX = tileX * srcTileSize, srcY = tileY * srcTileSize;
@@ -12416,13 +12593,14 @@ async function exportAsTexturePack(containerName) {
         ctx.drawImage(cmFgBitmap, srcX, srcY, srcTileSize, srcTileSize, 0, 0, 32, 32);
         if (flipH || flipV) ctx.restore();
 
+        if (canvasIsFullyTransparent(ctx, outCanvas.width, outCanvas.height)) { _emptyTilesSkipped++; continue; }
         const dataUrl = outCanvas.toDataURL('image/png');
         const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
         const raw = atob(b64);
         const arr = new Uint8Array(raw.length);
         for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
         cmFgFolder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
-        cmFgExportedTiles++;
+        if (_prevFlipped === undefined) cmFgExportedTiles++;   // Ueberschreiben ist kein neues Tile
       }
     }
   }
@@ -13282,6 +13460,11 @@ async function exportAsTexturePack(containerName) {
     : `\n\nZIP direkt nach Mesen2-Ordner entpacken:\nHdPacks\\Donkey Kong Country 2\\ wird automatisch erstellt.`;
   alert(`Mesen2 HD Pack exportiert!\n\n${exportedTiles} unique BG1-Tiles (32×32px HD)${palMsg}${owMsg}${bg2Msg}${wallMsg}${bg3Msg}${cmFgMsg}${sprMsg}${animMsg}${fpMsg}\naus ${setsWithArrangement.length} Level-Sets.${deliveryMsg}`);
   if (animExportedTiles > 0) console.log(`[animtiles] ${animExportedTiles} Anim-Tile-PNGs als h{hash}_P{pal}.png exportiert`);
+  if (_emptyTilesSkipped > 0) {
+    console.log(`[export] ${_emptyTilesSkipped} vollständig transparente Kacheln NICHT geschrieben. `
+              + `Am Bild ändert das nichts (Mesen überspringt sie ohnehin und zeichnet die native, `
+              + `ebenfalls transparente Kachel) — es hält nur snes_hd_bgcap.txt frei von Schein-Misses.`);
+  }
   return { exportedTiles, owExportedTiles, bg2ExportedTiles, wallExportedTiles, bg3ExportedTiles, cmFgExportedTiles, animExportedTiles, sets: setsWithArrangement.length };
 
   } catch(err) {
