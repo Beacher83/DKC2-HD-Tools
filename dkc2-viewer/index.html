@@ -117,6 +117,7 @@
 <title>DKC2 Level Viewer</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="vram_groundtruth.js"></script>
+<script src="font_groundtruth.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -345,6 +346,8 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <input type="file" id="spriteCapInput" accept=".txt" style="display:none">
       <button id="bgCapBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_bgcap.txt laden (Mesen-Recording der BG-Miss-Tiles — Quelle für animierte BG-Kacheln, CHR-DMA-Frames wie Gusty-Blätter)">BG-Anim</button>
       <input type="file" id="bgCapInput" accept=".txt" style="display:none">
+      <button id="runtimeSprBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_spritemiss.txt + snes_hd_sprpos.txt laden (Mesen-Recording S8/S15) — Laufzeit-Sprites ohne ROM-Anim-Eintrag: Weltkarten-Schrift, Schädelwagen, Fackeln. Beide Dateien auf einmal auswählbar.">Laufzeit</button>
+      <input type="file" id="runtimeSprInput" accept=".txt" multiple style="display:none">
       <button id="containerMgrBtn" style="padding:3px 10px;background:#9c27b0;color:#fff;border:1px solid #9c27b0;font-weight:bold;" title="HD Container verwalten — Speichern, Laden, Exportieren">Container</button>
       <input type="file" id="hdZipInput" accept=".zip" style="display:none;">
     </div>
@@ -365,6 +368,8 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <button class="cat-btn" data-cat="items">Items</button>
       <button class="cat-btn" data-cat="effects">Effekte</button>
       <button class="cat-btn" data-cat="other">Sonstiges</button>
+      <button class="cat-btn" data-cat="runtime" title="Laufzeit-Sprites aus den Mesen-Aufzeichnungen — Kacheln OHNE Eintrag in der ROM-Animationsbibliothek (Schädelwagen, Fackeln, Steine). Braucht den Knopf „Laufzeit“ in der Katalog-Toolbar.">⧉ Laufzeit</button>
+      <button class="cat-btn" data-cat="font" title="Weltkarten-Schrift: welche Zeichen erfasst sind und welche Wörter für den Upscale exportiert werden.">🔤 Schrift</button>
       <span style="border-left:1px solid #555;margin:0 4px;height:18px;display:inline-block;"></span>
       <label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" id="spriteShowGrey" checked> Grau zeigen</label>
       <button id="spritePipetteBtn" title="Palette von ausgewähltem Sprite kopieren und auf andere anwenden">Pipette</button>
@@ -381,9 +386,45 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <span id="spriteCount" style="font-size:11px;color:#888;margin-left:8px;"></span>
       <span id="pipetteStatus" style="font-size:11px;color:#ff9800;margin-left:4px;display:none;"></span>
     </div>
+    <div class="sprite-gallery-toolbar" id="runtimeToolbar" style="display:none;">
+      <span style="font-size:11px;color:#888;">Laufzeit:</span>
+      <label style="display:flex;align-items:center;gap:4px;">Gfxset
+        <select id="rtGfxFilter" style="background:#222;color:#e0e0e0;border:1px solid #555;"></select>
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;">Palette
+        <select id="rtPalSel" style="background:#222;color:#e0e0e0;border:1px solid #555;"></select>
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;" title="ID oder Kachel-Hash suchen">🔎
+        <input type="text" id="rtSearch" placeholder="ID / Hash" style="width:120px;background:#222;color:#e0e0e0;border:1px solid #555;">
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Bilder, deren Kacheln alle Pixel in snes_hd_spritemiss.txt haben — nur die lassen sich exportieren"><input type="checkbox" id="rtOnlyDrawable" checked> nur zeichenbare</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Objekte aus einer einzelnen 8x8-Kachel — meist Bruchstücke."><input type="checkbox" id="rtHideTiny" checked> 8x8 ausblenden</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Nur Objekte mit mehr als einem Animationsbild — Fackeln, Flagge, Wespen, Rauch."><input type="checkbox" id="rtOnlyAnimated"> nur animierte</label>
+      <label style="display:flex;align-items:center;gap:4px;color:#ffc107;" title="Nur die per Stern gemerkten Objekte. Die Merkliste bleibt über Reloads erhalten."><input type="checkbox" id="rtOnlyKeep"> ★ nur Merkliste</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Zeigt die HD-Kunst aus dem Container statt der aufgezeichneten SD-Kacheln. Wo noch keine HD-Kachel existiert, bleibt die SD-Version stehen — so sieht man je Objekt sofort, was fertig ist (Karten mit Lücken bekommen einen orangen Rand)."><input type="checkbox" id="rtShowHd" checked> HD zeigen</label>
+      <button id="rtKeepExportBtn" class="cat-btn" title="Alle gemerkten Objekte als SD-ZIP exportieren, unabhängig von den Filtern — jedes Animationsbild als eigene Datei.">★ Merkliste exportieren</button>
+      <span style="border-left:1px solid #555;margin:0 4px;height:18px;display:inline-block;"></span>
+      <button id="rtSuggestBtn" class="cat-btn" title="Schlägt die kleinste Objektmenge vor, die jede noch NICHT in HD vorliegende Kachel der sichtbaren Auswahl abdeckt. Bereits vorhandene HD-Kacheln werden übersprungen. Wirkt nur auf das, was der Filter gerade zeigt — vorher filtern!">✨ Offenes vorschlagen</button>
+      <button id="rtPruneBtn" class="cat-btn" title="Wirft aus der gespeicherten Aufzeichnung alles heraus, was dieser Workstream nicht braucht: Level-Spielszenen. Behalten werden Karten- und Shop-Schirme sowie jeder Schirm, auf dem Kartenschrift steht. Macht Laden und Gruppieren deutlich schneller.">🧹 Aufräumen</button>
+      <button id="rtSelectVisibleBtn" class="cat-btn">☑ Sichtbare</button>
+      <button id="rtSelectClearBtn" class="cat-btn">✕ Leeren</button>
+      <span id="rtSelCount" style="font-size:11px;color:#4caf50;"></span>
+      <button id="rtExportBtn" style="margin-left:6px;padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;font-weight:bold;" title="Ausgewählte Objekte als SD-ZIP für den Upscaler exportieren — ein Bild je Objekt (ganzes Wort statt 8x8-Schnipsel)">Export Laufzeit ZIP</button>
+      <span id="rtCoverage" style="font-size:11px;color:#888;margin-left:8px;"></span>
+    </div>
     <div class="sprite-gallery-grid" id="spriteGalleryGrid">
       <p style="color:#666;padding:20px;">ROM laden, dann "Build Gallery" klicken.</p>
     </div>
+    <div class="sprite-gallery-toolbar" id="fontToolbar" style="display:none;">
+      <span style="font-size:11px;color:#888;">Weltkarten-Schrift:</span>
+      <span id="fontSummary" style="font-size:12px;color:#ddd;"></span>
+      <span style="border-left:1px solid #555;margin:0 4px;height:18px;display:inline-block;"></span>
+      <label style="display:flex;align-items:center;gap:4px;" title="Zeigt die HD-Kunst aus dem Container statt der aufgezeichneten SD-Kacheln. Wo noch keine HD-Kachel existiert, bleibt die SD-Version stehen — so sieht man sofort, was fertig ist."><input type="checkbox" id="fontShowHd" checked> HD zeigen</label>
+      <button id="fontExportBtn" style="padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;font-weight:bold;" title="Genau die unten gezeigten Wörter als SD-ZIP für den Upscaler exportieren">Wörter exportieren</button>
+    </div>
+    <div id="fontPage" style="display:none;overflow-y:auto;padding:12px;color:#ddd;"></div>
+    <div id="rtReportPanel" style="display:none;background:#1a1a1a;border:1px solid #555;border-radius:4px;margin:6px;padding:10px 14px;max-height:340px;overflow-y:auto;font-size:12px;color:#ddd;"></div>
+    <div class="sprite-gallery-grid" id="runtimeGalleryGrid" style="display:none;"></div>
   </div>
 </div>
 <div id="status">
@@ -8064,6 +8105,975 @@ function parseBgCap(text) {
   return { entries, byHash, lines, bad, perGfxLayer, animFrames, animAddrs, gapAddrs };
 }
 
+// ============================================================
+// S8/S15: runtime sprite capture — pixels (spritemiss) + layout (sprpos)
+// ============================================================
+// Some art has NO entry in the ROM animation library and therefore cannot come
+// from the sprite gallery at all: the world map level names are drawn straight
+// into OAM by code (p4plus2's sprites.txt has no entry for them, and no VRAM
+// still dump contains them), and the same holds for the Skull Cart and the
+// torches. Those tiles exist only as runtime captures.
+//
+// Two files, deliberately separate in Mesen:
+//   snes_hd_spritemiss.txt  the PIXELS — one line per distinct (hash,pal,slot)
+//                           that missed the pack, with its 32 VRAM bytes and the
+//                           OBJ palette's 16 CGRAM colors. Deduped: first sighting.
+//   snes_hd_sprpos.txt      the LAYOUT — where each tile sat on screen. Deduped
+//                           over (hash,x,y), so the SAME letter at several
+//                           positions is kept, which is the whole point.
+//
+// Together they are enough to reassemble whole words/objects, which is what an
+// upscaler needs — a lone 8x8 fragment upscales badly (the lesson from S6b).
+
+let spriteMissEntries = null;  // Array<{slot, pal, overlap, gfx, hash, bytes:Uint8Array, cgram:Uint16Array}>
+let spriteMissByHash = null;   // Map<hash16 → entry>
+let sprPosEntries = null;      // Array<{gfx, sig, frame, x, y, pal, slot, hash}>
+
+// SPRMISS <M|S> P<pal> O<overlap> G<gfx> H<hash16> T<64 hex> C<64 hex>
+function parseSpriteMiss(text) {
+  const entries = [];
+  const byHash = new Map();
+  let lines = 0, bad = 0, dupes = 0;
+  const perGfx = new Map();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim().toUpperCase();
+    if (!line) continue;
+    const m = line.match(/^SPRMISS ([MS]) P(\d+) O(\d+) G(-?\d+) H([0-9A-F]{16}) T([0-9A-F]{64}) C([0-9A-F]{64})$/);
+    if (!m) { bad++; continue; }
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) bytes[i] = parseInt(m[6].substr(i * 2, 2), 16);
+    // Same defense as spritecap/bgcap: verify the recorded hash against the
+    // bytes, so a truncated or hand-edited file cannot poison the pack.
+    const h = fnv1a_64(bytes, 0, 32).toString(16).padStart(16, '0').toUpperCase();
+    if (h !== m[5]) { bad++; continue; }
+    lines++;
+    // Key on (hash,pal): the SAME tile bytes under a different OBJ palette are a
+    // different pack file (sprites/{hash}_P{pal}.png), so both must survive.
+    const key = `${m[5]}_P${parseInt(m[2])}`;
+    if (byHash.has(key)) { dupes++; continue; }
+    const cgram = new Uint16Array(16);
+    for (let i = 0; i < 16; i++) cgram[i] = parseInt(m[7].substr(i * 4, 4), 16);
+    const entry = { slot: m[1], pal: parseInt(m[2]), overlap: m[3] === '1',
+                    gfx: parseInt(m[4]), hash: m[5], key, bytes, cgram };
+    entries.push(entry);
+    byHash.set(key, entry);
+    perGfx.set(entry.gfx, (perGfx.get(entry.gfx) || 0) + 1);
+  }
+  console.log(`[spritemiss] ${lines} Zeilen gelesen, ${entries.length} distinkte (hash,pal), ${dupes} Dubletten, ${bad} verworfen`);
+  for (const [g, n] of [...perGfx.entries()].sort((a, b) => b[1] - a[1])) console.log(`  G${g}: ${n}`);
+  return { entries, byHash, lines, bad, perGfx };
+}
+
+// SPRPOS G<gfx> S<sig16> F<frame> X<xxx> Y<yyy> P<pal> <M|S> H<hash16>
+function parseSprPos(text) {
+  const entries = [];
+  let lines = 0, bad = 0;
+  const perGfx = new Map();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim().toUpperCase();
+    if (!line) continue;
+    const m = line.match(/^SPRPOS G(-?\d+) S([0-9A-F]{16}) F(\d+) X(\d+) Y(\d+) P(\d+) ([MS]) H([0-9A-F]{16})$/);
+    if (!m) { bad++; continue; }
+    lines++;
+    const e = { gfx: parseInt(m[1]), sig: m[2], frame: parseInt(m[3]),
+                x: parseInt(m[4]), y: parseInt(m[5]), pal: parseInt(m[6]),
+                slot: m[7], hash: m[8] };
+    entries.push(e);
+    perGfx.set(e.gfx, (perGfx.get(e.gfx) || 0) + 1);
+  }
+  console.log(`[sprpos] ${lines} Positionszeilen gelesen, ${bad} verworfen`);
+  for (const [g, n] of [...perGfx.entries()].sort((a, b) => b[1] - a[1])) console.log(`  G${g}: ${n}`);
+
+  // Detect a pre-S16 recording. S15 sampled an 8-pixel grid and logged the SAMPLE
+  // POINT, so every x was a multiple of 8 and every y shared one residue mod 8.
+  // Those files are missing every tile whose opaque pixels dodged the grid — the
+  // cause of half-letters and gap-cornered symbols — and their coordinates are
+  // offset from the true origins, so appending S16 lines to the same file gives
+  // each tile two slightly different positions. Worth naming loudly.
+  let gridLike = 0;
+  const yRes = new Map();
+  for (const e of entries) {
+    if (e.x % 8 === 0) gridLike++;
+    yRes.set(e.y % 8, (yRes.get(e.y % 8) || 0) + 1);
+  }
+  const topRes = Math.max(0, ...yRes.values());
+  if (entries.length > 200 && gridLike / entries.length > 0.95 && topRes / entries.length > 0.95) {
+    console.warn('[sprpos] Diese Datei sieht nach dem ALTEN Raster-Format aus (Mesen vor S16): ' +
+                 'alle x auf Vielfachen von 8, alle y auf demselben Rest. Darin fehlen die Kacheln, ' +
+                 'deren deckende Pixel das Raster verfehlt haben — genau die halben Buchstaben und ' +
+                 'die angeknabberten Symbolecken. Mit dem S16-Build neu aufzeichnen und die ALTE ' +
+                 'snes_hd_sprpos.txt vorher löschen (Mesen hängt an die Datei an).');
+    return { entries, lines, bad, perGfx, legacyGrid: true };
+  }
+  return { entries, lines, bad, perGfx, legacyGrid: false };
+}
+
+// Render one captured tile (32 VRAM bytes + its 16 OBJ colors) to a canvas.
+// Colour index 0 stays transparent, exactly as the OBJ layer treats it.
+function renderSpriteMissTile(entry, scale = 1) {
+  const c = document.createElement('canvas');
+  c.width = 8 * scale; c.height = 8 * scale;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(8, 8);
+  drawTile8x8(img, entry.cgram, 0, 0, 0, entry.bytes, false, false);
+  if (scale === 1) { ctx.putImageData(img, 0, 0); return c; }
+  const tmp = document.createElement('canvas');
+  tmp.width = 8; tmp.height = 8;
+  tmp.getContext('2d').putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, 0, 0, 8 * scale, 8 * scale);
+  return c;
+}
+
+// ============================================================
+// S17: OAM — sprite objects as the GAME defines them
+// ============================================================
+// Everything below the next divider (the sprpos grouping) infers objects from
+// adjacency and a window of frames, because sprpos logs each tile once per
+// session and no single frame is complete. That inference is why the pirate flag
+// appeared at one window size and vanished at another.
+//
+// OAM removes the inference. One entry is one object (8x8 to 64x64) with its own
+// position, size, palette and mirror flags, every frame is complete, and the OAM
+// index is a stable identity — so an animation is "same slot, different tile
+// number", not something to reconstruct.
+//
+//   OAMF G<gfx> S<sig16> F<frame> M<mode> N<count>
+//   OAM I<idx> X<+xxx> Y<yyy> W<ww> H<hh> T<tile> P<pal> R<prio> <H|-><V|-> <hash…>
+//
+// The hashes are the entry's sub-tiles in reading order; their PIXELS still come
+// from spritemiss, which is why this file carries no tile data.
+let oamFrames = null;    // Array<{gfx, sig, frame, ents:[…]}>
+
+function parseOam(text) {
+  const frames = [];
+  let cur = null, bad = 0, entries = 0;
+  const perGfx = new Map();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('OAMF ')) {
+      const m = line.match(/^OAMF G(-?\d+) S([0-9A-F]{16}) F(\d+) M(\d+) N(\d+)$/);
+      if (!m) { bad++; cur = null; continue; }
+      cur = { gfx: parseInt(m[1]), sig: m[2], frame: parseInt(m[3]), mode: parseInt(m[4]), ents: [] };
+      frames.push(cur);
+      perGfx.set(cur.gfx, (perGfx.get(cur.gfx) || 0) + 1);
+      continue;
+    }
+    const m = line.match(/^OAM I(\d+) X([+-]\d+) Y(\d+) W(\d+) H(\d+) T([0-9A-F]+) P(\d) R(\d) (.)(.) (.+)$/);
+    if (!m || !cur) { bad++; continue; }
+    const w = parseInt(m[4]), h = parseInt(m[5]);
+    const hashes = m[11].split(/\s+/);
+    // The tile count is (W/8)*(H/8); a mismatch means the file and this parser
+    // disagree about the layout, which would silently misplace every pixel.
+    if (hashes.length !== (w / 8) * (h / 8)) { bad++; continue; }
+    cur.ents.push({
+      idx: parseInt(m[1]), x: parseInt(m[2], 10), y: parseInt(m[3]),
+      w, h, tile: parseInt(m[6], 16), pal: parseInt(m[7]), prio: parseInt(m[8]),
+      hm: m[9] === 'H', vm: m[10] === 'V', hashes,
+    });
+    entries++;
+  }
+  console.log(`[oam] ${frames.length} Frames, ${entries} Einträge, ${bad} verworfen`);
+  for (const [g, n] of [...perGfx.entries()].sort((a, b) => b[1] - a[1])) console.log(`  G${g}: ${n} Frames`);
+  return { frames, entries, bad, perGfx };
+}
+
+// Group a frame's entries into objects by CONTIGUOUS OAM INDEX RUN.
+//
+// Spatial overlap is the obvious rule and it is wrong: on the world map the
+// flag, the Kongs and the level name all touch, and overlap-grouping fuses them
+// into one block (measured — it reproduced exactly the blobs the old approach
+// produced). A game allocates the sprites of one object in a contiguous block of
+// OAM entries, so the index separates what space cannot. The distance check only
+// guards against two unrelated objects that happen to sit next to each other in
+// the table.
+const OAM_MAX_GAP = 1;      // allow one skipped index inside an object
+const OAM_MAX_DIST = 48;    // px; beyond this a neighbouring index is a different thing
+
+function oamGroupByRun(ents) {
+  const sorted = [...ents].sort((a, b) => a.idx - b.idx);
+  const out = [];
+  let cur = [];
+  for (const e of sorted) {
+    if (cur.length) {
+      const p = cur[cur.length - 1];
+      const near = Math.abs(e.x - p.x) <= OAM_MAX_DIST && Math.abs(e.y - p.y) <= OAM_MAX_DIST;
+      if (e.idx - p.idx > OAM_MAX_GAP || !near) { out.push(cur); cur = []; }
+    }
+    cur.push(e);
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+// ============================================================
+// Objects with their animation phases — one card per thing
+// ============================================================
+// Grouping OAM entries by index run gives clean SNAPSHOTS: a torch with flame and
+// pole, the flag with its mast. Identity is then the object's STRUCTURE — which
+// cells, where, what size and palette — and the differing CONTENTS are its
+// animation phases. That is what shows a torch as one card with nine phases.
+//
+// One correction on top: a waving flag uses a DIFFERENT number of OAM entries per
+// phase, so its phases land in different structures and it arrived as several
+// half-objects. What still connects them is shared art — the mast. So structures
+// that share at least two tiles are merged, but only among SMALL ones: on a big
+// composition a shared tile just means "both contain a bit of the same scenery",
+// and merging on that fuses the screen into one blob (measured).
+let oamObjects = null;
+
+function buildOamObjects() {
+  if (!oamFrames || !oamFrames.length) { oamObjects = null; return null; }
+  const t0 = performance.now();
+
+  const structs = new Map();
+  for (const f of oamFrames) {
+    for (const grp of oamGroupByRun(f.ents)) {
+      const minx = Math.min(...grp.map(e => e.x)), miny = Math.min(...grp.map(e => e.y));
+      const cells = grp.map(e => ({ x: e.x - minx, y: e.y - miny, w: e.w, h: e.h,
+                                    pal: e.pal, hashes: e.hashes }))
+                       .sort((a, b) => a.y - b.y || a.x - b.x);
+      const sKey = f.gfx + '|' + cells.map(c => `${c.x},${c.y},${c.w},${c.h},${c.pal}`).join(';');
+      const cKey = cells.map(c => c.hashes.join(',')).join(';');
+      let s = structs.get(sKey);
+      if (!s) {
+        s = { gfx: f.gfx, seen: 0, contents: new Map(),
+              w: Math.max(...cells.map(c => c.x + c.w)),
+              h: Math.max(...cells.map(c => c.y + c.h)),
+              cellCount: cells.length,
+              pals: [...new Set(cells.map(c => c.pal))].sort() };
+        structs.set(sKey, s);
+      }
+      s.seen++;
+      if (s.contents.has(cKey)) continue;
+      const tiles = [];
+      for (const c of cells) {
+        const cols = c.w / 8;
+        c.hashes.forEach((h, n) => tiles.push({
+          x: c.x + (n % cols) * 8, y: c.y + Math.floor(n / cols) * 8, pal: c.pal, hash: h }));
+      }
+      s.contents.set(cKey, tiles);
+    }
+  }
+  const list = [...structs.values()];
+  for (const s of list) { s.phases = [...s.contents.values()]; delete s.contents; s.tiles = s.phases[0]; }
+
+  // NO merging. Two attempts at it are recorded in the changelog: linking
+  // structures through shared art fixes the flag but chains across the screen
+  // (a 219x184 blob with 868 phases that had eaten both torch pairs), and a
+  // growth guard on top still leaked. Both times it broke objects that already
+  // worked, and it changed the ids the user had written down. The flag stays as
+  // two cards — one with the mast, one with the full wave — and that is the
+  // honest state until there is a rule that does not cost more than it fixes.
+  const find = (i) => i;
+
+  const groups = new Map();
+  list.forEach((s, i) => { groups.set(i, [{ s, i }]); });
+  oamObjects = [];
+  for (const entries of groups.values()) {
+    entries.sort((p, q) => q.s.seen - p.s.seen);
+    // Walk the group from its most-seen member, carrying the offsets along, so
+    // every phase ends up in one coordinate frame.
+    const shift = new Map([[entries[0].i, { dx: 0, dy: 0 }]]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const { i } of entries) {
+        if (!shift.has(i)) continue;
+        const base = shift.get(i);
+        for (const { i: j } of entries) {
+          if (shift.has(j)) continue;
+          const fwd = offsets.get(i + '|' + j), rev = offsets.get(j + '|' + i);
+          if (fwd) { shift.set(j, { dx: base.dx - fwd.dx, dy: base.dy - fwd.dy }); changed = true; }
+          else if (rev) { shift.set(j, { dx: base.dx + rev.dx, dy: base.dy + rev.dy }); changed = true; }
+        }
+      }
+    }
+    const g = [];
+    for (const { s, i } of entries) {
+      const off = shift.get(i) || { dx: 0, dy: 0 };
+      g.push(off.dx || off.dy
+        ? { ...s, phases: s.phases.map(ph => ph.map(t => ({ ...t, x: t.x - off.dx, y: t.y - off.dy }))) }
+        : s);
+    }
+    // Re-normalise so nothing sits at a negative coordinate after shifting.
+    const minX = Math.min(0, ...g.flatMap(s => s.phases.flatMap(ph => ph.map(t => t.x))));
+    const minY = Math.min(0, ...g.flatMap(s => s.phases.flatMap(ph => ph.map(t => t.y))));
+    if (minX < 0 || minY < 0) {
+      for (const s of g) s.phases = s.phases.map(ph => ph.map(t => ({ ...t, x: t.x - minX, y: t.y - minY })));
+    }
+    for (const s of g) s.tiles = s.phases[0];
+    const w = Math.max(...g.flatMap(s => s.phases.flatMap(ph => ph.map(t => t.x + 8))));
+    const h = Math.max(...g.flatMap(s => s.phases.flatMap(ph => ph.map(t => t.y + 8))));
+    const first = g[0];
+    const obj = {
+      // Stable handle derived from the art, so it survives re-recording.
+      id: `G${first.gfx}-${w}x${h}-P${first.pals.join('')}-${first.tiles[0].hash.slice(0, 4)}`,
+      gfx: first.gfx, w, h,
+      pals: [...new Set(g.flatMap(s => s.pals))].sort(),
+      phases: g.flatMap(s => s.phases),
+      cellCount: Math.max(...g.map(s => s.cellCount)),
+      seen: g.reduce((n, s) => n + s.seen, 0),
+      tiles: first.tiles,
+    };
+    obj.phaseCount = obj.phases.length;
+    obj.allTiles = [...new Set(obj.phases.flatMap(ph => ph.map(t => `${t.hash}_P${t.pal}`)))];
+    obj.missing = spriteMissByHash
+      ? obj.allTiles.filter(k => !spriteMissByHash.has(k)).length : obj.allTiles.length;
+    oamObjects.push(obj);
+  }
+  const byId = new Map();
+  for (const o of oamObjects) {
+    if (!byId.has(o.id)) { byId.set(o.id, [o]); continue; }
+    byId.get(o.id).push(o);
+  }
+  for (const l of byId.values()) if (l.length > 1) l.forEach((o, n) => { o.id += `-${n + 1}`; });
+
+  oamObjects.sort((a, b) => b.seen - a.seen);
+  const animated = oamObjects.filter(o => o.phaseCount > 1).length;
+  console.log(`[oam] ${list.length} Momentaufnahmen -> ${oamObjects.length} Objekte ` +
+              `(${animated} animiert) — ${Math.round(performance.now() - t0)} ms`);
+  return oamObjects;
+}
+
+// ============================================================
+// Grouping runtime tiles into OBJECTS (words, carts, torches)
+// ============================================================
+// An isolated 8x8 fragment upscales badly; a whole word upscales well. So the
+// captured tiles have to be reassembled into the things they belong to before
+// anything is handed to the upscaler.
+//
+// Three steps, each of them answering a defect found in the real recordings
+// (verified against snes_hd_sprpos.txt, 79 290 lines, in scratchpad/final_algo.py):
+//
+//  1. MERGE A FRAME WINDOW per (gfxset, VRAM signature). sprpos dedups over
+//     (hash,x,y) and skips tiles whose live VRAM no longer matches mid-frame
+//     (SnesHdVideoFilter.cpp:1978), so NO single frame holds a whole word —
+//     "GLOOMY GULCH" arrives spread over a handful of consecutive frames.
+//     Grouping per frame produced fragments like "GU CH".
+//  2. CLUSTER SPATIALLY: 8x8 boxes that touch or overlap belong together. This
+//     also handles the 8x16 letters (two tiles above each other) without the
+//     y/y+8 pairing rule that used to drop single-row punctuation like the
+//     apostrophe.
+//  3. SPLIT STACKS. Two different level names shown at the SAME spot inside one
+//     window overlay each other into garble. A clean object never has two tiles
+//     at one (x,y) — where it does, split the cluster along gaps in frame
+//     numbers and re-cluster the parts.
+//
+// Time is deliberately NOT used as a clustering dimension: the splitting happens
+// WITHIN a word, so a time constraint fragments words instead of separating them
+// (measured: 29 objects averaging 3.9 tiles, against 15 averaging 6.2).
+
+// 120 is what measured best on the real recordings (scratchpad/window_test.py):
+// per-frame grouping gave fragments like "GU CH", 600 started merging different
+// names. Adjustable in the toolbar because it depends on how the session was
+// played — a slow pass over the map wants a wider window than a quick one.
+let RT_FRAME_WINDOW = 120;    // frames merged to reassemble one word
+const RT_FRAME_GAP = 30;      // frame gap that separates two different names
+let runtimeObjects = null;    // Array<{id, gfx, tiles:[{x,y,pal,hash}], w, h, stacked, missing, seen}>
+
+// Union tiles whose 8x8 boxes touch or overlap. tiles: [{x,y,pal,hash,frame}]
+function rtClusterSpatial(tiles) {
+  const n = tiles.length;
+  const parent = new Int32Array(n);
+  for (let i = 0; i < n; i++) parent[i] = i;
+  const find = (a) => { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+  const buckets = new Map();
+  for (let i = 0; i < n; i++) {
+    const k = `${tiles[i].x >> 3},${tiles[i].y >> 3}`;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(i);
+  }
+  for (const [k, idxs] of buckets) {
+    const [bx, by] = k.split(',').map(Number);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const other = buckets.get(`${bx + dx},${by + dy}`);
+        if (!other) continue;
+        for (const i of idxs) for (const j of other) {
+          if (i === j) continue;
+          if (Math.abs(tiles[i].x - tiles[j].x) <= 8 && Math.abs(tiles[i].y - tiles[j].y) <= 8) union(i, j);
+        }
+      }
+    }
+  }
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(tiles[i]);
+  }
+  return [...groups.values()];
+}
+
+// Two tiles of ONE object never cover the same pixels — sprite tiles tile the
+// object, they do not sit on each other. Overlap therefore means two different
+// things got superimposed. Testing OVERLAP rather than an identical position
+// matters because since S16 the coordinates are true tile origins: two level
+// names at nearly the same spot are a few pixels apart, so they overlap
+// visually while occupying no single identical position.
+function rtOverlaps(a, b) { return Math.abs(a.x - b.x) < 8 && Math.abs(a.y - b.y) < 8; }
+
+function rtHasStack(grp) {
+  for (let i = 0; i < grp.length; i++) {
+    for (let j = i + 1; j < grp.length; j++) if (rtOverlaps(grp[i], grp[j])) return true;
+  }
+  return false;
+}
+
+// An ANIMATED sprite (torch, bee, crocodile mouth, smoke) redraws the same
+// positions with different content every few frames. Inside one window that
+// stacks every phase on top of every other, which is what made the torches show
+// up as a pile of overlaid images.
+//
+// Time cannot separate them — the phases are only a few frames apart, closer
+// than the spread of a single word. But POSITION can: sort each position's
+// candidates by frame and take the k-th of each, and phase k falls out whole.
+// Phase 0 (the earliest sighting per position) is the object as it first
+// appeared, so it is coherent and complete — which is all the pipeline needs.
+function rtSplitPhases(grp) {
+  // Walk the tiles in the order they were first seen and drop each into the
+  // first layer where it neither overlaps anything nor arrives long after that
+  // layer was last written to. Layer 0 is therefore the object as it FIRST
+  // appeared: coherent, overlap-free, complete — which is all the pipeline
+  // needs. Later layers are the remaining animation phases.
+  const sorted = [...grp].sort((a, b) => a.frame - b.frame);
+  const layers = [];
+  for (const t of sorted) {
+    let placed = false;
+    for (const L of layers) {
+      if (t.frame - L.lastFrame > RT_FRAME_GAP) continue;
+      if (L.tiles.some(u => rtOverlaps(u, t))) continue;
+      L.tiles.push(t); L.lastFrame = t.frame; placed = true; break;
+    }
+    if (!placed) layers.push({ tiles: [t], lastFrame: t.frame });
+  }
+  return layers.map((L, k) => ({ tiles: L.tiles, phase: k, phaseCount: layers.length }));
+}
+
+// Separate a stacked cluster. Two causes, two remedies, in this order:
+//   1. Two different things shown at the same spot far apart in time (two level
+//      names at one map position) — split along gaps in frame numbers.
+//   2. Otherwise it is an animation cycling in place — split by phase.
+// Returns [{tiles, phase, phaseCount}]; phase is null when no phase split ran.
+function rtSplitStacks(grp, depth) {
+  depth = depth || 0;
+  if (!rtHasStack(grp)) return [{ tiles: grp, phase: null, phaseCount: 1 }];
+  if (depth > 4) return rtSplitPhases(grp);
+  const frames = [...new Set(grp.map(t => t.frame))].sort((a, b) => a - b);
+  const runs = [];
+  let cur = [frames[0]];
+  for (let i = 1; i < frames.length; i++) {
+    if (frames[i] - cur[cur.length - 1] > RT_FRAME_GAP) { runs.push(cur); cur = []; }
+    cur.push(frames[i]);
+  }
+  runs.push(cur);
+  if (runs.length === 1) return rtSplitPhases(grp);
+  const out = [];
+  for (const run of runs) {
+    const lo = run[0], hi = run[run.length - 1];
+    const part = grp.filter(t => t.frame >= lo && t.frame <= hi);
+    for (const sub of rtClusterSpatial(part)) out.push(...rtSplitStacks(sub, depth + 1));
+  }
+  return out;
+}
+
+// opts lets a caller pin the two knobs instead of reading the toolbar. The font
+// page uses that: it ALWAYS needs the palette split (otherwise the map's path
+// sprites chain into the level name) and must not change behaviour because
+// someone unticked a box for the torches.
+function rebuildRuntimeObjects(opts) {
+  if (!(opts && opts.pinned)) fontObjectsCache = null;   // new settings/recording
+  if (!sprPosEntries || sprPosEntries.length === 0) { runtimeObjects = null; return null; }
+  const t0 = performance.now();
+  // The only caller left is the font page, which pins both knobs; the toolbar
+  // controls that used to feed them are gone with the OAM rewrite.
+  const pinned = !!(opts && opts.pinned);
+  RT_FRAME_WINDOW = (opts && opts.window) || 120;
+  const splitByPal = (opts && 'splitByPal' in opts) ? opts.splitByPal : true;
+
+  // Bucket positions per screen, then into runs of frames within the window.
+  const bySig = new Map();
+  for (const e of sprPosEntries) {
+    const k = `${e.gfx}|${e.sig}`;
+    if (!bySig.has(k)) bySig.set(k, []);
+    bySig.get(k).push(e);
+  }
+
+  const objects = new Map();   // signature -> object
+  let stacksSplit = 0, stacksLeft = 0;
+  for (const [k, list] of bySig) {
+    const gfx = list[0].gfx;
+    list.sort((a, b) => a.frame - b.frame);
+    const runs = [];
+    let cur = [], last = null;
+    for (const e of list) {
+      if (last !== null && e.frame - last > RT_FRAME_WINDOW) { runs.push(cur); cur = []; }
+      cur.push({ x: e.x, y: e.y, pal: e.pal, hash: e.hash, frame: e.frame });
+      last = e.frame;
+    }
+    if (cur.length) runs.push(cur);
+
+    for (const run of runs) {
+      // Exact duplicates inside one window carry no information.
+      const uniq = new Map();
+      for (const t of run) uniq.set(`${t.x},${t.y},${t.pal},${t.hash}`, t);
+      // Cluster WITHIN a palette. On the world maps the path and trail sprites lie
+      // edge to edge right across the screen, so pure adjacency chains half the
+      // map into one blob — and swallows the level name sitting on top of it.
+      // An OBJ tile has exactly one palette, and the things this view exists for
+      // (text on P6, the cart, the torches) each keep to their own, so the palette
+      // is the natural cut. A sprite that genuinely mixes two palettes is split in
+      // two here; those are gallery sprites, which this path is not for.
+      // ...but OFF by default, because it cuts the other way too: a torch made of
+      // a stem and a flame uses two OBJ palettes and comes out as two objects.
+      // Text needs the cut, multi-coloured objects must not have it, so it is a
+      // switch rather than a rule. The font page does not depend on it at all —
+      // it selects by "can the glyph table read this", not by palette.
+      const clusters = [];
+      if (splitByPal) {
+        const byPal = new Map();
+        for (const t of uniq.values()) {
+          if (!byPal.has(t.pal)) byPal.set(t.pal, []);
+          byPal.get(t.pal).push(t);
+        }
+        for (const tilesOfPal of byPal.values()) clusters.push(...rtClusterSpatial(tilesOfPal));
+      } else {
+        clusters.push(...rtClusterSpatial([...uniq.values()]));
+      }
+      for (const grp of clusters) {
+        const wasStacked = rtHasStack(grp);
+        const parts = rtSplitStacks(grp);
+        if (wasStacked) { if (parts.length > 1) stacksSplit++; else stacksLeft++; }
+        for (const p of parts) {
+          const minx = Math.min(...p.tiles.map(t => t.x));
+          const miny = Math.min(...p.tiles.map(t => t.y));
+          const tiles = p.tiles.map(t => ({ x: t.x - minx, y: t.y - miny, pal: t.pal, hash: t.hash }))
+                               .sort((a, b) => a.y - b.y || a.x - b.x);
+          const sig = gfx + '|' + tiles.map(t => `${t.x},${t.y},${t.pal},${t.hash}`).join(';');
+          const existing = objects.get(sig);
+          if (existing) { existing.seen++; continue; }
+          const w = Math.max(...tiles.map(t => t.x)) + 8;
+          const h = Math.max(...tiles.map(t => t.y)) + 8;
+          const missing = spriteMissByHash
+            ? tiles.filter(t => !spriteMissByHash.has(`${t.hash}_P${t.pal}`)).length
+            : tiles.length;
+          objects.set(sig, {
+            id: `G${gfx}_${objects.size}`, gfx, tiles, w, h,
+            pals: [...new Set(tiles.map(t => t.pal))].sort(),
+            stacked: rtHasStack(tiles), missing, seen: 1,
+            phase: p.phase, phaseCount: p.phaseCount,
+          });
+        }
+      }
+    }
+  }
+
+  const built = [...objects.values()].sort((a, b) => b.tiles.length - a.tiles.length);
+  const ms = Math.round(performance.now() - t0);
+  const drawable = built.filter(o => o.missing === 0).length;
+  console.log(`[laufzeit] ${built.length} Objekte aus ${sprPosEntries.length} Positionen ` +
+              `(Fenster ${RT_FRAME_WINDOW}, Palettentrennung ${splitByPal ? 'an' : 'aus'}; ` +
+              `${drawable} vollständig zeichenbar, ${stacksSplit} Stapel getrennt, ` +
+              `${stacksLeft} nicht trennbar) — ${ms} ms`);
+  if (pinned) return built;     // a caller's private build, not the shared view
+  runtimeObjects = built;
+  const perGfx = new Map();
+  for (const o of runtimeObjects) perGfx.set(o.gfx, (perGfx.get(o.gfx) || 0) + 1);
+  for (const [g, n] of [...perGfx.entries()].sort((a, b) => b[1] - a[1])) console.log(`  G${g}: ${n} Objekte`);
+  if (typeof renderRuntimeGallery === 'function') renderRuntimeGallery();
+  return runtimeObjects;
+}
+
+// ============================================================
+// Pruning the recordings down to what this workstream needs
+// ============================================================
+// Both recorders are appended to across every session, so they accumulate whole
+// levels of gameplay that this view has no use for — 190 000 of 260 000
+// positions came from in-level play. That cost is paid twice on every load
+// (parse, then group) and it is pure waste: what is wanted is the world map and
+// shop screens — the letters, the torches, the Lost World stones.
+//
+// A screen is kept when it is a known map/shop gfxset, OR when it contains at
+// least one tile from the font table. The second rule is what saves the maps
+// with no HD art: they report gfxset -1 and would otherwise look like gameplay —
+// and the V came from exactly such a screen (K. Rool's Keep).
+function pruneRuntimeRecordings() {
+  if (!spriteMissEntries) { alert('Keine Aufzeichnung geladen.'); return null; }
+  if (oamFrames && oamFrames.length) return pruneByOam();
+  if (!sprPosEntries) { alert('Keine OAM- oder Positions-Aufzeichnung geladen.'); return null; }
+  const fontHashes = new Set();
+  if (typeof DKC2_MAP_FONT !== 'undefined') {
+    for (const g of DKC2_MAP_FONT) { fontHashes.add(g.top); if (g.bottom) fontHashes.add(g.bottom); }
+  }
+  const isMapSet = (gfx) => typeof OVERWORLD_SETS !== 'undefined' && OVERWORLD_SETS[gfx] !== undefined;
+
+  const groups = new Map();
+  for (const e of sprPosEntries) {
+    const k = `${e.gfx}|${e.sig}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(e);
+  }
+  const keptGroups = [];
+  for (const [k, list] of groups) {
+    const gfx = list[0].gfx;
+    const keep = isMapSet(gfx) || list.some(e => fontHashes.has(e.hash));
+    if (keep) keptGroups.push(k);
+  }
+  const keepSet = new Set(keptGroups);
+  const newPos = sprPosEntries.filter(e => keepSet.has(`${e.gfx}|${e.sig}`));
+  // Keep only the pixels the surviving positions actually refer to.
+  const needed = new Set(newPos.map(e => `${e.hash}_P${e.pal}`));
+  const newMiss = spriteMissEntries.filter(e => needed.has(e.key));
+
+  return {
+    pos: newPos, miss: newMiss,
+    before: { pos: sprPosEntries.length, miss: spriteMissEntries.length, screens: groups.size },
+    after: { pos: newPos.length, miss: newMiss.length, screens: keptGroups.length },
+  };
+}
+
+// Same rule on the OAM recording: keep a screen when it is a known map/shop
+// gfxset, or when it shows map text (which is how the maps without HD art —
+// they report gfx -1 — are told apart from gameplay).
+function pruneByOam() {
+  const fontHashes = new Set();
+  if (typeof DKC2_MAP_FONT !== 'undefined') {
+    for (const g of DKC2_MAP_FONT) { fontHashes.add(g.top); if (g.bottom) fontHashes.add(g.bottom); }
+  }
+  const isMapSet = (gfx) => typeof OVERWORLD_SETS !== 'undefined' && OVERWORLD_SETS[gfx] !== undefined;
+  const screens = new Map();
+  for (const f of oamFrames) {
+    const k = `${f.gfx}|${f.sig}`;
+    if (!screens.has(k)) screens.set(k, false);
+    if (screens.get(k)) continue;
+    if (isMapSet(f.gfx) || f.ents.some(e => e.hashes.some(h => fontHashes.has(h)))) screens.set(k, true);
+  }
+  const newFrames = oamFrames.filter(f => screens.get(`${f.gfx}|${f.sig}`));
+  const needed = new Set();
+  for (const f of newFrames) for (const e of f.ents) for (const h of e.hashes) needed.add(`${h}_P${e.pal}`);
+  const newMiss = spriteMissEntries.filter(e => needed.has(e.key));
+  return {
+    oam: newFrames, miss: newMiss, pos: sprPosEntries,
+    before: { pos: oamFrames.length, miss: spriteMissEntries.length, screens: screens.size },
+    after: { pos: newFrames.length, miss: newMiss.length,
+             screens: [...screens.values()].filter(Boolean).length },
+    unit: 'OAM-Frames',
+  };
+}
+
+async function applyRuntimePrune() {
+  const r = pruneRuntimeRecordings();
+  if (!r) return;
+  const unit = r.unit || 'Positionen';
+  const msg = `Aufräumen der Laufzeit-Aufzeichnung:\n\n` +
+    `Schirme:     ${r.before.screens} → ${r.after.screens}\n` +
+    `${unit}: ${r.before.pos} → ${r.after.pos}\n` +
+    `Kacheln:     ${r.before.miss} → ${r.after.miss}\n\n` +
+    `Behalten werden Karten- und Shop-Schirme sowie jeder Schirm, auf dem ` +
+    `Kartenschrift steht. Alles andere (Level-Spielszenen) fliegt raus.\n\n` +
+    `Das überschreibt die gespeicherte Aufzeichnung. Die Dateien in Downloads ` +
+    `bleiben unangetastet — von dort ist alles jederzeit neu ladbar.`;
+  if (!confirm(msg)) return;
+  if (r.oam) oamFrames = r.oam; else sprPosEntries = r.pos;
+  spriteMissEntries = r.miss;
+  spriteMissByHash = new Map(r.miss.map(e => [e.key, e]));
+  runtimeObjects = null;
+  fontObjectsCache = null;
+  oamObjects = null;
+  try {
+    if (r.oam) await saveRecording('oam', { frames: oamFrames });
+    else await saveRecording('sprpos', { entries: sprPosEntries });
+    await saveRecording('spritemiss', {
+      entries: spriteMissEntries.map(x => ({ ...x, bytes: [...x.bytes], cgram: [...x.cgram] })),
+    });
+  } catch (e) { console.warn('[laufzeit] Aufräumen konnte nicht gespeichert werden:', e); }
+  updateRuntimeSprButton();
+  console.log(`[laufzeit] aufgeräumt: ${r.before.pos} → ${r.after.pos} ${unit}, ` +
+              `${r.before.miss} → ${r.after.miss} Kacheln, ${r.before.screens} → ${r.after.screens} Schirme`);
+  buildOamObjects();
+  renderRuntimeGallery();
+}
+
+// The font page's own build: palette split forced on, window pinned. Cached,
+// because it is the same answer every time until a new recording is loaded.
+let fontObjectsCache = null;
+function fontObjects() {
+  if (fontObjectsCache) return fontObjectsCache;
+  fontObjectsCache = rebuildRuntimeObjects({ pinned: true, splitByPal: true, window: 120 }) || [];
+  return fontObjectsCache;
+}
+
+// ============================================================
+// Reading a runtime object back as TEXT
+// ============================================================
+// The map font is a closed set — 28 glyphs plus punctuation, the same tiles on
+// every map — and the level names are readable, which is what made the mapping
+// verifiable in the first place. Keeping that table (font_groundtruth.js) turns
+// the whole workstream from "replay everything and eyeball it" into "match
+// against what we already know": objects get NAMES instead of tile counts, and
+// a character that is genuinely new announces itself as '?' with its context
+// rather than being noticed by accident.
+let _fontByPair = null, _fontBySingle = null;
+function rtFontTables() {
+  if (_fontByPair) return { byPair: _fontByPair, bySingle: _fontBySingle };
+  _fontByPair = new Map(); _fontBySingle = new Map();
+  if (typeof DKC2_MAP_FONT !== 'undefined') {
+    for (const g of DKC2_MAP_FONT) {
+      if (g.bottom) _fontByPair.set(`${g.top}|${g.bottom}`, g.char);
+      else _fontBySingle.set(g.top, g.char);   // punctuation is single-row
+    }
+  }
+  return { byPair: _fontByPair, bySingle: _fontBySingle };
+}
+
+// Returns { text, unknown: [{hashes, rows}] } or null when the object is not
+// text at all. An object may carry SEVERAL lines ("MONKEY MUSEUM"), so split by
+// y first: a glyph occupies y and y+8, the next line starts at least 16 lower.
+function rtReadObjectText(obj) {
+  const { byPair, bySingle } = rtFontTables();
+  if (byPair.size === 0) return null;
+  const ys = [...new Set(obj.tiles.map(t => t.y))].sort((a, b) => a - b);
+  const bands = [];
+  let cur = [ys[0]];
+  for (let i = 1; i < ys.length; i++) {
+    if (ys[i] - cur[cur.length - 1] > 8) { bands.push(cur); cur = []; }
+    cur.push(ys[i]);
+  }
+  bands.push(cur);
+
+  const lines = [], unknown = [];
+  let known = 0, total = 0;
+  for (const band of bands) {
+    const lo = band[0], hi = band[band.length - 1];
+    const cols = new Map();
+    for (const t of obj.tiles) {
+      if (t.y < lo || t.y > hi) continue;
+      if (!cols.has(t.x)) cols.set(t.x, []);
+      cols.get(t.x).push(t);
+    }
+    let text = '', prevX = null;
+    for (const x of [...cols.keys()].sort((a, b) => a - b)) {
+      if (prevX !== null && x - prevX > 8) text += ' ';
+      prevX = x;
+      const col = cols.get(x).sort((a, b) => a.y - b.y);
+      let ch = null;
+      if (col.length >= 2) ch = byPair.get(`${col[0].hash}|${col[1].hash}`);
+      if (!ch && col.length === 1) ch = bySingle.get(col[0].hash);
+      total++;
+      if (ch) { text += ch; known++; }
+      else { text += '?'; unknown.push({ hashes: col.map(t => t.hash), rows: col.length }); }
+    }
+    if (text.trim()) lines.push(text.trim());
+  }
+  // Below half recognised this is not a word but something else sharing palette 6
+  // (the kong heads do) — better to say nothing than to print a row of '?'.
+  if (!total || known / total < 0.5) return null;
+  return { text: lines.join(' / '), unknown };
+}
+
+// Draw a whole object (word / cart / torch) at 1x. Tiles without captured
+// pixels stay transparent — the object is still shown, with the gap visible.
+// ONE canvas per object, pixels written directly. The previous version called
+// renderSpriteMissTile per tile, and that allocates a canvas element each time
+// (two above 1x) — a gallery of 2000 cards then created tens of thousands of
+// canvases and locked the browser up hard. Zooming is the caller's job, via CSS
+// width plus image-rendering:pixelated, which costs nothing.
+// HD versions of the runtime tiles, decoded once. The container stores them as
+// blobs; decoding per draw would make every gallery repaint asynchronous.
+let hdRuntimeBitmaps = null;
+async function ensureRuntimeHdBitmaps() {
+  if (hdRuntimeBitmaps) return hdRuntimeBitmaps;
+  hdRuntimeBitmaps = new Map();
+  if (!hdPack || !hdPack.runtimeTiles) return hdRuntimeBitmaps;
+  for (const [key, v] of hdPack.runtimeTiles) {
+    try { hdRuntimeBitmaps.set(key, { img: await createImageBitmap(v.blob), scale: v.scaleFactor || 4 }); }
+    catch (e) { console.warn(`[laufzeit] HD-Kachel ${key} nicht dekodierbar:`, e); }
+  }
+  console.log(`[laufzeit] ${hdRuntimeBitmaps.size} HD-Kacheln für die Anzeige dekodiert.`);
+  return hdRuntimeBitmaps;
+}
+
+// Draw an object from the HD art in the container, falling back to the captured
+// SD tile where no HD version exists — so a partly upscaled object still shows
+// what is done and what is not, instead of showing nothing.
+function renderRuntimeObjectHd(obj, scale) {
+  scale = scale || 4;
+  const c = document.createElement('canvas');
+  c.width = obj.w * scale; c.height = obj.h * scale;
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  const sd = renderRuntimeObject(obj);       // one canvas, used for the gaps
+  let hdCount = 0;
+  for (const t of obj.tiles) {
+    const key = `${t.hash}_P${t.pal}`;
+    const hd = hdRuntimeBitmaps && hdRuntimeBitmaps.get(key);
+    if (hd) {
+      ctx.drawImage(hd.img, t.x * scale, t.y * scale, 8 * scale, 8 * scale);
+      hdCount++;
+    } else {
+      ctx.drawImage(sd, t.x, t.y, 8, 8, t.x * scale, t.y * scale, 8 * scale, 8 * scale);
+    }
+  }
+  return { canvas: c, hdCount, total: obj.tiles.length };
+}
+
+function renderRuntimeObject(obj) {
+  const c = document.createElement('canvas');
+  c.width = obj.w; c.height = obj.h;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(obj.w, obj.h);
+  for (const t of obj.tiles) {
+    const e = spriteMissByHash && spriteMissByHash.get(`${t.hash}_P${t.pal}`);
+    if (!e) continue;
+    drawTile8x8(img, e.cgram, 0, t.x, t.y, e.bytes, false, false);
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+// Greedy set cover over what is STILL MISSING: the fewest objects that between
+// them touch every tile of `pool` that does not already have HD art in the
+// container. Covering tiles that are already done would pad an upscale run with
+// work that changes nothing — the question is always "what is still open".
+// A SUGGESTION, not a decision: the pictures are on screen and the selection
+// stays editable. `pool` is whatever the current filter shows, so filtering
+// first is what makes the answer meaningful.
+function rtSuggestCover(pool) {
+  const keyOf = (o) => new Set(o.tiles.map(t => `${t.hash}_P${t.pal}`));
+  const done = rtCoveredKeys();
+  const candidates = pool.filter(o => o.missing === 0 && !o.stacked);
+  const need = new Set();
+  for (const o of candidates) for (const k of keyOf(o)) if (!done.has(k)) need.add(k);
+  const openTotal = need.size;
+  const chosen = [];
+  const rest = [...candidates];
+  while (need.size) {
+    let best = null, gain = 0;
+    for (const o of rest) {
+      let g = 0;
+      for (const k of keyOf(o)) if (need.has(k)) g++;
+      if (g > gain) { best = o; gain = g; }
+    }
+    if (!best) break;
+    chosen.push(best);
+    for (const k of keyOf(best)) need.delete(k);
+    rest.splice(rest.indexOf(best), 1);
+  }
+  chosen.openTotal = openTotal;
+  chosen.openLeft = need.size;
+  chosen.alreadyHd = done.size;
+  return chosen;
+}
+
+// ============================================================
+// SD export of runtime objects — the upscaler's input
+// ============================================================
+// One PNG per object, padded, plus a manifest carrying the frame->tile mapping.
+// The manifest is shaped like the sprite export's (tiles[] with hash/x/y, an
+// offset into the padded canvas) so the HD import and the pack export can treat
+// both the same way — the only difference is where the palette comes from.
+const RT_PAD = 8;   // SD pixels of transparent margin, so the upscaler has edges
+
+async function exportRuntimeObjectsAsZip(explicitList, btnId, zipName) {
+  if (!explicitList && (!oamObjects || oamObjects.length === 0)) {
+    alert('Keine Objekte. Zuerst die Mesen-Aufzeichnungen laden (Knopf „Laufzeit" in der Katalog-Toolbar).');
+    return;
+  }
+  if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
+
+  // An explicit list (the font page hands one over) wins; then the selection;
+  // then everything the filter currently shows.
+  let list = explicitList || (runtimeSelection.size > 0
+    ? (oamObjects || []).filter(o => runtimeSelection.has(o.id))
+    : rtFilteredObjects());
+  const withGaps = list.filter(o => o.missing > 0);
+  if (withGaps.length) {
+    // A gap means the pixels were never captured, so that cell would be exported
+    // blank and come back blank. Better to say so than to ship holes.
+    const go = confirm(`${withGaps.length} von ${list.length} Objekten haben Kacheln ohne Pixel ` +
+                       `in snes_hd_spritemiss.txt — die bleiben im Export leer.\n\n` +
+                       `Trotzdem exportieren? (Abbrechen = nur die vollständigen ${list.length - withGaps.length})`);
+    if (!go) list = list.filter(o => o.missing === 0);
+  }
+  if (list.length === 0) { alert('Nichts zu exportieren.'); return; }
+
+  const btn = document.getElementById(btnId || 'rtExportBtn');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Exportiere…';
+  try {
+    const zip = new JSZip();
+    const folder = zip.folder('runtime');
+    const manifest = {
+      exportDate: new Date().toISOString(),
+      exportVersion: 1,
+      exportType: 'runtime',
+      scaleFactor: 1,
+      pad: RT_PAD,
+      objects: [],
+      stats: { objects: 0, tiles: 0, distinctTiles: 0 },
+    };
+    const distinct = new Set();
+
+    for (const obj of list) {
+      // Every phase is its own artwork and needs its own upscale — the same way
+      // the sprite gallery ships every frame of a character. Phases share the
+      // object's geometry, so they leave as a numbered series the upscaler can
+      // treat as one batch.
+      const phases = obj.phases || [obj.tiles];
+      for (let p = 0; p < phases.length; p++) {
+        const tiles = phases[p];
+        const cv = document.createElement('canvas');
+        cv.width = obj.w + RT_PAD * 2;
+        cv.height = obj.h + RT_PAD * 2;
+        const ctx = cv.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        let drew = 0;
+        for (const t of tiles) {
+          const e = spriteMissByHash && spriteMissByHash.get(`${t.hash}_P${t.pal}`);
+          if (!e) continue;
+          ctx.drawImage(renderSpriteMissTile(e, 1), t.x + RT_PAD, t.y + RT_PAD);
+          distinct.add(`${t.hash}_P${t.pal}`);
+          drew++;
+        }
+        if (!drew) continue;
+        const name = phases.length > 1
+          ? `${obj.id}_f${String(p).padStart(2, '0')}.png` : `${obj.id}.png`;
+        folder.file(name, await new Promise(res => cv.toBlob(res, 'image/png')));
+        manifest.objects.push({
+          id: name.replace(/\.png$/, ''), file: `runtime/${name}`, gfx: obj.gfx,
+          width: cv.width, height: cv.height,
+          offsetX: RT_PAD, offsetY: RT_PAD,
+          object: obj.id, frame: p, frameCount: phases.length,
+          tiles: tiles.map(t => ({ hash: t.hash, x: t.x, y: t.y, pal: t.pal })),
+        });
+        manifest.stats.objects++;
+        manifest.stats.tiles += tiles.length;
+      }
+    }
+    manifest.stats.distinctTiles = distinct.size;
+    zip.file('manifest.json', JSON.stringify(manifest, null, 2));
+
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = zipName || 'dkc2_runtime_sd.zip'; a.click();
+    URL.revokeObjectURL(url);
+    console.log(`[laufzeit] exportiert: ${manifest.stats.objects} Objekte, ` +
+                `${manifest.stats.distinctTiles} distinkte Kacheln`);
+    btn.textContent = `${manifest.stats.objects} exportiert`;
+  } catch (err) {
+    console.error('[laufzeit] Export fehlgeschlagen:', err);
+    alert('Export fehlgeschlagen: ' + err.message);
+    btn.textContent = 'Export fehlgeschlagen';
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = orig; updateRuntimeSelectionUI(); }, 2500);
+  }
+}
+
 function updateHDToggleUI() {
   const btn = document.getElementById('hdToggleBtn');
   const status = document.getElementById('hdStatus');
@@ -8196,7 +9206,100 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
   }
 }
 
-// Returns what was actually imported: { kind: 'level'|'sprites'|'none', gfxSetIndex, tileCount }.
+// --- Import HD Runtime Pack ---
+// Handles ZIPs with exportType: 'runtime'. Unlike the sprite import this slices
+// STRAIGHT AWAY into per-tile art keyed by {hash}_P{pal}, because that — not the
+// object — is the unit the pack and the emulator work in: one glyph appears in
+// many words, and keeping whole objects would store the same letter repeatedly
+// and leave it ambiguous which copy wins.
+async function importHDRuntimePack(zip, manifest, rootPrefix, btn, origText, file) {
+  try {
+    btn.textContent = 'Loading runtime tiles...';
+    await new Promise(r => setTimeout(r, 0));
+    if (!hdPack) {
+      hdPack = { scaleFactor: 1, gfxSetIndex: null, tiles: new Map(), clusters: [], bg2: null, bg3: null, sprites: new Map(), animTiles: new Map() };
+    }
+    if (!hdPack.runtimeTiles) hdPack.runtimeTiles = new Map();
+
+    const objects = manifest.objects || [];
+    let scale = 0, written = 0, blank = 0, oob = 0, objDone = 0;
+
+    for (const obj of objects) {
+      const entry = zip.file(rootPrefix + obj.file) || zip.file(obj.file);
+      if (!entry) { console.warn(`[laufzeit] fehlt im ZIP: ${obj.file}`); continue; }
+      const img = await createImageBitmap(await entry.async('blob'));
+
+      // Measure the scale off the image instead of trusting the manifest: the
+      // upscaler decides the factor, and a wrong assumption here would slice at
+      // the wrong stride and produce garbage without any error.
+      const objScale = Math.round(img.width / obj.width);
+      if (objScale < 1) { console.warn(`[laufzeit] ${obj.id}: unbrauchbare Größe ${img.width}x${img.height} für ${obj.width}x${obj.height}`); continue; }
+      if (!scale) {
+        scale = objScale;
+        console.log(`[laufzeit] Skalierung gemessen: ${scale}x (${obj.width}px → ${img.width}px)`);
+      } else if (objScale !== scale) {
+        console.warn(`[laufzeit] ${obj.id}: Skalierung ${objScale}x weicht von ${scale}x ab — übersprungen`);
+        continue;
+      }
+
+      const cell = 8 * scale;
+      for (const t of obj.tiles) {
+        const key = `${String(t.hash).toUpperCase()}_P${t.pal}`;
+        if (hdPack.runtimeTiles.has(key)) continue;   // first one wins, like the pack
+        const sx = (t.x + (obj.offsetX || 0)) * scale;
+        const sy = (t.y + (obj.offsetY || 0)) * scale;
+        if (sx < 0 || sy < 0 || sx + cell > img.width || sy + cell > img.height) { oob++; continue; }
+        const cv = document.createElement('canvas');
+        cv.width = cell; cv.height = cell;
+        const ctx = cv.getContext('2d');
+        ctx.drawImage(img, sx, sy, cell, cell, 0, 0, cell, cell);
+        // A fully transparent cell means the upscaler dropped it or the object
+        // had a gap — storing it would mask the real tile with nothing.
+        const data = ctx.getImageData(0, 0, cell, cell).data;
+        let opaque = false;
+        for (let a = 3; a < data.length; a += 4) { if (data[a] > 8) { opaque = true; break; } }
+        if (!opaque) { blank++; continue; }
+        const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
+        hdPack.runtimeTiles.set(key, { blob, scaleFactor: scale, gfx: obj.gfx });
+        written++;
+      }
+      objDone++;
+      if (objDone % 8 === 0) {
+        btn.textContent = `Loading runtime tiles... ${Math.round(objDone / objects.length * 100)}%`;
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+
+    hdEnabled = true;
+    hdRuntimeBitmaps = null;   // new art — drop the decoded cache
+    updateHDToggleUI();
+    // oamObjects, not runtimeObjects: the gallery has been driven by the OAM
+    // recording since S17, and a session that loads only snes_hd_oam.txt leaves
+    // the old sprpos model null — the re-render never fired, so freshly imported
+    // art stayed invisible until a filter was touched.
+    if (oamObjects || runtimeObjects) renderRuntimeGallery();
+    console.log(`[laufzeit] HD-Import: ${written} Kacheln aus ${objDone} Objekten bei ${scale}x` +
+                (blank ? `, ${blank} leer übersprungen` : '') +
+                (oob ? `, ${oob} außerhalb des Bildes` : ''));
+    if (written === 0) {
+      alert('Es wurde keine einzige Kachel übernommen.\n\n' +
+            'Häufigste Ursache: die HD-Bilder haben andere Maße als das SD-Original ' +
+            '(der Upscaler muss ein ganzzahliges Vielfaches liefern). Details in der Konsole.');
+    }
+    btn.textContent = `${written} Laufzeit-Kacheln geladen!`;
+    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+    return written;
+  } catch (err) {
+    console.error('[laufzeit] HD-Import fehlgeschlagen:', err);
+    btn.textContent = 'Import failed!';
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = origText; }, 2000);
+    alert('HD Runtime Import failed: ' + err.message);
+    return 0;
+  }
+}
+
+// Returns what was actually imported: { kind: 'level'|'sprites'|'runtime'|'none', gfxSetIndex, tileCount }.
 // importHDPackToContainer() MUST branch on this rather than inspecting hdPack afterwards:
 // hdPack is a session-wide accumulator, so after a sprite import it still holds whatever
 // level tiles were resident, and the container save would then aim at a gfxset this ZIP
@@ -8232,10 +9335,14 @@ async function importHDPack(file) {
       return { kind: 'none' };
     }
 
-    // Branch: sprite ZIP vs level ZIP
+    // Branch: sprite ZIP vs runtime ZIP vs level ZIP
     if (manifest.exportType === 'sprites') {
       await importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file);
       return { kind: 'sprites' };
+    }
+    if (manifest.exportType === 'runtime') {
+      const n = await importHDRuntimePack(zip, manifest, rootPrefix, btn, origText, file);
+      return { kind: 'runtime', tileCount: n };
     }
 
     if (manifest.exportVersion < 2) {
@@ -8748,6 +9855,62 @@ async function restoreSpriteCapFromDb() {
                 `(gespeichert am ${rec.savedAt}) — kein erneutes Hochladen nötig`);
   } catch (e) {
     console.warn('[spritecap] restore failed:', e);
+  }
+}
+
+// Runtime sprite recordings (spritemiss + sprpos). Same deal as the spritecap:
+// re-uploading them every session is pure friction, and forgetting one is only
+// noticed at the end of a long export.
+function updateRuntimeSprButton() {
+  const btn = document.getElementById('runtimeSprBtn');
+  if (!btn) return;
+  const nMiss = spriteMissEntries ? spriteMissEntries.length : 0;
+  const nOam = oamFrames ? oamFrames.length : 0;
+  const nPos = sprPosEntries ? sprPosEntries.length : 0;
+  if (!nMiss && !nOam && !nPos) {
+    btn.textContent = 'Laufzeit';
+    btn.style.background = '#0f3460';
+    return;
+  }
+  // Amber while only half the pair is there — pixels without objects cannot be
+  // grouped, objects without pixels cannot be drawn.
+  const complete = nMiss > 0 && nOam > 0;
+  btn.textContent = `Laufzeit ${complete ? '✓' : '⚠'} ${nOam}`;
+  btn.style.background = complete ? '#2e7d32' : '#8d6e00';
+  btn.title = `${nOam} OAM-Frames aus snes_hd_oam.txt (die Objekte),\n` +
+              `${nMiss} distinkte (hash,pal) aus snes_hd_spritemiss.txt (die Pixel)` +
+              (nPos ? `,\n${nPos} Positionen aus snes_hd_sprpos.txt (nur noch für die Schrift-Seite)` : '') +
+              (complete ? '\nBleibt über Reloads erhalten.'
+                        : `\n⚠ ${nMiss ? 'snes_hd_oam.txt fehlt' : 'snes_hd_spritemiss.txt fehlt'} — ` +
+                          `ohne beide gibt es keine Objekte.`);
+}
+
+async function restoreRuntimeSprFromDb() {
+  try {
+    const miss = await loadRecording('spritemiss');
+    if (miss && miss.entries && miss.entries.length) {
+      // Typed arrays do not survive structuredClone as such here — they were
+      // stored as plain arrays, so rebuild them on the way back in.
+      spriteMissEntries = miss.entries.map(e => ({
+        ...e,
+        bytes: new Uint8Array(e.bytes),
+        cgram: new Uint16Array(e.cgram),
+      }));
+      spriteMissByHash = new Map(spriteMissEntries.map(e => [e.key, e]));
+    }
+    const pos = await loadRecording('sprpos');
+    if (pos && pos.entries && pos.entries.length) sprPosEntries = pos.entries;
+    const oam = await loadRecording('oam');
+    if (oam && oam.frames && oam.frames.length) oamFrames = oam.frames;
+    if (spriteMissEntries || sprPosEntries || oamFrames) {
+      updateRuntimeSprButton();
+      console.log(`[laufzeit] aus der Datenbank wiederhergestellt: ` +
+                  `${spriteMissEntries ? spriteMissEntries.length : 0} Kacheln, ` +
+                  `${oamFrames ? oamFrames.length : 0} OAM-Frames, ` +
+                  `${sprPosEntries ? sprPosEntries.length : 0} Positionen`);
+    }
+  } catch (e) {
+    console.warn('[laufzeit] restore failed:', e);
   }
 }
 
@@ -9641,13 +10804,27 @@ async function loadContainerToHDPack(containerName) {
                  `überspringt sie — diese Sets einmal neu per "Import HD" einspielen.`);
   }
 
+  // Runtime tiles (world map font, Skull Cart, torches) — one set, hash-keyed.
+  const rtSet = sets.find(s => s.type === 'spritemiss' && s.setId === 'runtime');
+  if (rtSet && rtSet.tiles) {
+    hdPack.runtimeTiles = new Map();
+    for (const t of rtSet.tiles) {
+      hdPack.runtimeTiles.set(t.key, { blob: t.blob, scaleFactor: t.scaleFactor || 4, gfx: t.gfx });
+    }
+    hdRuntimeBitmaps = null;   // decoded cache belongs to the previous container
+    console.log(`[laufzeit] ${hdPack.runtimeTiles.size} Kacheln aus dem Container geladen.`);
+  }
+
   activeContainerName = containerName;
   hdEnabled = true;
   updateHDToggleUI();
   redraw();
   if (catalogView) renderCatalog();
   if (spriteGalleryData) renderSpriteGallery();
-  console.log(`Container "${containerName}" loaded: ${totalTiles} tiles, ${levelSets.length} level sets, ${hdPack.sprites.size} sprites (${totalSpriteFrames} frames)`);
+  if (oamObjects || runtimeObjects) renderRuntimeGallery();
+  console.log(`Container "${containerName}" loaded: ${totalTiles} tiles, ${levelSets.length} level sets, ` +
+              `${hdPack.sprites.size} sprites (${totalSpriteFrames} frames)` +
+              (hdPack.runtimeTiles ? `, ${hdPack.runtimeTiles.size} Laufzeit-Kacheln` : ''));
 
   // The loop above overwrites hdPack.bg2/bg3/clusters/gfxSetIndex once per level set —
   // after it finishes, those single-slot fields hold whichever set was iterated LAST,
@@ -9752,7 +10929,7 @@ async function exportContainerAsZip(containerName) {
   const zip = new JSZip();
   const root = zip.folder(containerName);
 
-  const summary = { levels: 0, sprites: 0, mapicons: 0, totalFiles: 0 };
+  const summary = { levels: 0, sprites: 0, mapicons: 0, runtimeTiles: 0, totalFiles: 0 };
 
   for (const set of sets) {
     const folder = root.folder(`${set.type}/${set.setId}`);
@@ -9810,13 +10987,37 @@ async function exportContainerAsZip(containerName) {
       }
     } else if (set.type === 'sprite' || set.type === 'mapicon') {
       summary.sprites++;
+      // meta[] and scaleFactor MUST travel with the frames. Without the
+      // frame->OBJ-tile mapping the pack export cannot slice a frame into
+      // hash-keyed cells and drops every frame as "no tiles[]" — the images
+      // survive the round-trip but become permanently un-exportable. The
+      // IndexedDB save path has persisted meta for a while (see the comment at
+      // hdSaveSet below); this ZIP path was still dropping it, so a container
+      // backed up as ZIP and restored came back crippled.
       const manifest = {
         type: set.type, setId: set.setId, animId: set.animId, name: set.name,
-        frameCount: (set.frames || []).length
+        scaleFactor: set.scaleFactor || 4,
+        paddedWidth: set.paddedWidth || 0, paddedHeight: set.paddedHeight || 0,
+        frameCount: (set.frames || []).length,
+        meta: set.meta || []
       };
       folder.file('manifest.json', JSON.stringify(manifest, null, 2));
       for (const f of (set.frames || [])) {
         folder.file(`${f.key}.png`, f.blob);
+        summary.totalFiles++;
+      }
+    } else if (set.type === 'spritemiss') {
+      // Runtime tiles are already hash-keyed art, so the filename IS the key —
+      // no separate mapping to lose.
+      summary.runtimeTiles += (set.tiles || []).length;
+      folder.file('manifest.json', JSON.stringify({
+        type: 'spritemiss', setId: set.setId,
+        scaleFactor: set.scaleFactor || 4,
+        tileCount: (set.tiles || []).length,
+        gfx: Object.fromEntries((set.tiles || []).filter(t => t.gfx != null).map(t => [t.key, t.gfx])),
+      }, null, 2));
+      for (const t of (set.tiles || [])) {
+        folder.file(`${t.key}.png`, t.blob);
         summary.totalFiles++;
       }
     }
@@ -10068,10 +11269,16 @@ async function exportAsTexturePack(containerName) {
   // Warn about a missing spritecap BEFORE the long run, not after it — finding
   // out at the end that the sprites were skipped wastes the whole export.
   if (!spriteCapPairs || spriteCapPairs.size === 0) {
+    // Runtime tiles are unaffected — their palette comes from the capture itself,
+    // so say which half is at risk rather than implying sprites/ stays empty.
+    const rtHint = (hdPack?.runtimeTiles?.size)
+      ? `\n\nLaufzeit-Kacheln (${hdPack.runtimeTiles.size}) sind NICHT betroffen — ` +
+        `deren Palette steht in der Aufzeichnung selbst.`
+      : '';
     const goOn = confirm(
       'Kein Spritecap geladen.\n\n' +
       'Ohne snes_hd_spritecap.txt (Mesen-Recording) sind die Runtime-Palette-Slots ' +
-      'unbekannt, und das Pack wird OHNE Sprite-Tiles exportiert.\n\n' +
+      'unbekannt, und das Pack wird OHNE die Sprite-Tiles aus der Galerie exportiert.' + rtHint + '\n\n' +
       'OK = trotzdem exportieren\nAbbrechen = erst Spritecap laden ' +
       '(Button in der Katalog-Toolbar)');
     if (!goOn) return;
@@ -11263,6 +12470,7 @@ async function exportAsTexturePack(containerName) {
   // without a recorded (hash,pal) pair are skipped; playing more levels
   // with the S5a build grows the recording.
   let spriteExportedTiles = 0;
+  let writtenSpriteKeys = new Set();   // "{hash}_P{pal}" — read again by the runtime block below
   {
     // Sprites are read from the CONTAINER, like every other part of this export.
     // They used to be taken only from the in-memory hdPack, so an export that did not
@@ -11308,7 +12516,7 @@ async function exportAsTexturePack(containerName) {
         alert('Hinweis: HD-Sprites sind importiert, aber kein Spritecap geladen.\n\nOhne snes_hd_spritecap.txt (Mesen-Recording, Build S5a+) sind die Runtime-Palette-Slots unbekannt — der Export läuft ohne Sprite-Tiles weiter.\n\nSpritecap-Button in der Katalog-Toolbar nutzen und erneut exportieren.');
       } else {
         const spritesFolder = root.folder('sprites');
-        const writtenKeys = new Set();       // "{hash}_P{pal}"
+        const writtenKeys = writtenSpriteKeys;   // "{hash}_P{pal}"
         const noPalHashes = new Set();       // seen but never recorded at runtime
         let noMetaFrames = 0, sprFrameCount = 0;
 
@@ -11400,6 +12608,48 @@ async function exportAsTexturePack(containerName) {
             'einspielen; (b) das Manifest der importierten ZIP ist älter als v2 (dann Sprites neu exportieren).');
         }
       }
+    }
+  }
+
+  // ---- Runtime tiles (world map font, Skull Cart, torches) ----
+  // These are captured tiles with NO entry in the ROM animation library, so they
+  // can never come from the sprite gallery. They are already sliced and keyed by
+  // {hash}_P{pal} at import time, so writing them is a straight copy.
+  //
+  // The palette comes from the CAPTURE (the SPRMISS line carries it), not from
+  // the spritecap — which is why this block, unlike the one above, has no
+  // spritecap dependency and cannot be silently skipped for want of a recording.
+  let runtimeExportedTiles = 0;
+  {
+    const rtSet = await hdGetSet(containerName, 'spritemiss', 'runtime');
+    const rtTiles = rtSet?.tiles || [];
+    if (rtTiles.length === 0 && hdPack?.runtimeTiles?.size) {
+      // Same fallback the sprite block has: art imported this session but not yet
+      // written to the container would otherwise ship as an empty folder.
+      for (const [key, v] of hdPack.runtimeTiles) rtTiles.push({ key, blob: v.blob, scaleFactor: v.scaleFactor });
+      console.log(`[laufzeit] ${rtTiles.length} Kacheln aus dem Speicher (im Container liegen keine).`);
+    }
+    if (rtTiles.length > 0) {
+      showMesenExportProgress('Laufzeit-Kacheln exportieren…', 0.85);
+      await _yieldToBrowser();
+      const spritesFolder = root.folder('sprites');
+      let skippedScale = 0, overwritten = 0;
+      for (const t of rtTiles) {
+        if ((t.scaleFactor || 4) !== 4) { skippedScale++; continue; }
+        if (!/^[0-9A-F]{16}_P\d$/.test(t.key)) {
+          console.warn(`[laufzeit] Schlüssel "${t.key}" passt nicht auf {hash16}_P{pal} — übersprungen`);
+          continue;
+        }
+        // Runtime art WINS over a gallery sprite of the same hash: it was captured
+        // from the exact tile the game drew, while a gallery frame is a ROM
+        // reconstruction that may differ in palette handling.
+        if (writtenSpriteKeys.has(t.key)) overwritten++;
+        spritesFolder.file(`${t.key}.png`, t.blob);
+        runtimeExportedTiles++;
+      }
+      console.log(`[laufzeit] ${runtimeExportedTiles} Laufzeit-Kachel-PNGs exportiert` +
+                  (overwritten ? `, davon ${overwritten} über gleichnamige Sprite-Kacheln` : '') +
+                  (skippedScale ? `; ${skippedScale} mit Skalierung != 4x übersprungen` : ''));
     }
   }
 
@@ -12168,10 +13418,46 @@ async function importContainerFromZip(file) {
       for (const f of frames) {
         frameData.push({ key: f.key, blob: await f.entry.async('blob'), w: 0, h: 0 });
       }
+      // Restore meta/scaleFactor when the ZIP carries them. ZIPs written before
+      // the export started including meta have none — those sets come back as
+      // images only and stay un-sliceable, which is not something the import can
+      // repair, so say it out loud instead of failing silently at export time.
+      const sprMeta = Array.isArray(setManifest.meta) ? setManifest.meta : [];
+      if (sprMeta.length === 0 && frameData.length > 0) {
+        console.warn(`[container] Sprite-Set "${setInfo.setId}": kein meta[] im ZIP ` +
+                     `(alter Export) — Frames sind da, lassen sich aber NICHT ins Pack schneiden. ` +
+                     `Sprite-ZIP neu per "Import HD" einspielen.`);
+      }
       await hdSaveSet(containerName, setInfo.type, setInfo.setId, {
         animId: setManifest.animId, name: setManifest.name,
-        frameCount: frameData.length, frames: frameData,
+        scaleFactor: setManifest.scaleFactor || 4,
+        paddedWidth: setManifest.paddedWidth || 0,
+        paddedHeight: setManifest.paddedHeight || 0,
+        frameCount: frameData.length, frames: frameData, meta: sprMeta,
         savedAt: Date.now()
+      });
+      imported++;
+    } else if (setInfo.type === 'spritemiss') {
+      const gfxMap = setManifest.gfx || {};
+      const tiles = [];
+      const files = [];
+      zip.forEach((path, entry) => {
+        if (path.startsWith(setPath) && path.endsWith('.png')) files.push({ path, entry });
+      });
+      for (const f of files) {
+        const key = f.path.slice(setPath.length).replace(/\.png$/, '');
+        tiles.push({ key, blob: await f.entry.async('blob'),
+                     scaleFactor: setManifest.scaleFactor || 4, gfx: gfxMap[key] });
+      }
+      // Merge rather than replace, same reason as on HD import: two ZIPs may each
+      // hold part of the runtime art.
+      const existing = await hdGetSet(containerName, 'spritemiss', setInfo.setId);
+      const merged = new Map();
+      for (const t of (existing?.tiles || [])) merged.set(t.key, t);
+      for (const t of tiles) merged.set(t.key, t);
+      await hdSaveSet(containerName, 'spritemiss', setInfo.setId, {
+        tileCount: merged.size, tiles: [...merged.values()],
+        scaleFactor: setManifest.scaleFactor || 4, savedAt: Date.now()
       });
       imported++;
     }
@@ -12205,6 +13491,8 @@ async function refreshContainerList() {
     const sets = await hdGetContainerSets(c.name);
     const levelSets = sets.filter(s => s.type === 'level');
     const spriteSets = sets.filter(s => s.type === 'sprite' || s.type === 'mapicon');
+    const rtTiles = sets.filter(s => s.type === 'spritemiss')
+                        .reduce((sum, s) => sum + (s.tileCount || (s.tiles || []).length), 0);
     const totalTiles = levelSets.reduce((sum, s) => sum + (s.tileCount || (s.tiles || []).length), 0);
     const isActive = c.name === activeContainerName;
     const updated = new Date(c.updatedAt).toLocaleString('de-DE');
@@ -12217,7 +13505,7 @@ async function refreshContainerList() {
         <div>
           <strong style="color:#fff;font-size:14px;">${esc}</strong>${badge}
           <div style="color:#888;font-size:11px;margin-top:2px;">
-            ${levelSets.length} Level-Sets (${totalTiles} Tiles) | ${spriteSets.length} Sprite-Sets | Aktualisiert: ${updated}
+            ${levelSets.length} Level-Sets (${totalTiles} Tiles) | ${spriteSets.length} Sprite-Sets${rtTiles ? ` | ${rtTiles} Laufzeit-Kacheln` : ''} | Aktualisiert: ${updated}
           </div>
         </div>
         <div style="display:flex;gap:4px;">
@@ -12691,6 +13979,34 @@ async function importHDPackToContainer(file, containerName) {
         savedInfo += `${tileCount} tiles`;
       } else if (imported?.kind === 'sprites') {
         console.log('[import] Sprite-ZIP — Level-Sets im Container bleiben unangetastet.');
+      } else if (imported?.kind === 'runtime') {
+        console.log('[import] Laufzeit-ZIP — Level-Sets im Container bleiben unangetastet.');
+      }
+      // Runtime tiles: one set, keyed by {hash}_P{pal}, MERGED with whatever is
+      // already stored. Merging (not replacing) is what makes it safe to upscale
+      // the world map font today and the Skull Cart next month without the second
+      // import wiping the first.
+      if (hdPack.runtimeTiles && hdPack.runtimeTiles.size > 0) {
+        const existing = await hdGetSet(containerName, 'spritemiss', 'runtime');
+        const merged = new Map();
+        for (const t of (existing?.tiles || [])) merged.set(t.key, t);
+        for (const [key, v] of hdPack.runtimeTiles) {
+          merged.set(key, { key, blob: v.blob, scaleFactor: v.scaleFactor, gfx: v.gfx });
+        }
+        const scales = [...new Set([...merged.values()].map(t => t.scaleFactor))];
+        if (scales.length > 1) {
+          console.warn(`[laufzeit] Container enthält gemischte Skalierungen: ${scales.join(', ')}x — ` +
+                       `der Pack-Export schreibt nur 4x-Kacheln.`);
+        }
+        await hdSaveSet(containerName, 'spritemiss', 'runtime', {
+          tileCount: merged.size,
+          tiles: [...merged.values()],
+          scaleFactor: scales[0] || 4,
+          savedAt: Date.now(),
+        });
+        const added = merged.size - (existing?.tiles || []).length;
+        savedInfo += (savedInfo ? ', ' : '') + `${merged.size} Laufzeit-Kacheln (+${added})`;
+        console.log(`[laufzeit] im Container: ${merged.size} Kacheln (${added} neu).`);
       }
       // Save sprite HD data
       if (hdPack.sprites && hdPack.sprites.size > 0) {
@@ -14328,6 +15644,520 @@ function renderSpriteGallery() {
   }
 }
 
+// ============================================================
+// Runtime gallery — the grouped objects from spritemiss + sprpos
+// ============================================================
+const runtimeSelection = new Set();   // object ids
+
+// The keep list: objects judged good BY EYE, remembered across sessions.
+// Curating by hand is the only reliable step in this workstream — none of the
+// rules tried so far tells a usable object from a fragment — so that judgement
+// has to survive a reload. Keyed by the object id, which is derived from the
+// artwork and therefore stable across re-recordings.
+let oamKeepList = new Set();
+
+async function saveKeepList() {
+  try { await saveRecording('keeplist', { ids: [...oamKeepList] }); }
+  catch (e) { console.warn('[merkliste] konnte nicht gespeichert werden:', e); }
+}
+
+async function restoreKeepList() {
+  try {
+    const rec = await loadRecording('keeplist');
+    if (rec && rec.ids && rec.ids.length) {
+      oamKeepList = new Set(rec.ids);
+      console.log(`[merkliste] ${oamKeepList.size} gemerkte Objekte wiederhergestellt.`);
+    }
+  } catch (e) { console.warn('[merkliste] restore failed:', e); }
+}
+
+// Which (hash,pal) tiles already have HD art in the loaded container? Those are
+// done and do not need upscaling again.
+function rtCoveredKeys() {
+  const covered = new Set();
+  if (hdPack && hdPack.runtimeTiles) for (const k of hdPack.runtimeTiles.keys()) covered.add(k);
+  return covered;
+}
+
+// The runtime tiles are imported at whatever factor the upscaler used, but the
+// gallery draws every object at one fixed factor so cards of mixed provenance
+// stay the same size. renderRuntimeObjectHd scales the SD fallback to match.
+const RT_HD_SCALE = 4;
+
+// Show HD only when there is something to show. The checkbox alone is not
+// enough: before the container's tiles are decoded, hdRuntimeBitmaps is empty
+// and every card would silently draw its SD fallback at 4x — blurry pixels that
+// look like a broken import rather than a missing one.
+function rtWantHd() {
+  return document.getElementById('rtShowHd')?.checked !== false
+         && hdRuntimeBitmaps && hdRuntimeBitmaps.size > 0;
+}
+
+function rtFilteredObjects() {
+  if (!oamObjects) return [];
+  const gfxSel = document.getElementById('rtGfxFilter')?.value ?? 'all';
+  const palSel = document.getElementById('rtPalSel')?.value ?? 'all';
+  const onlyDrawable = document.getElementById('rtOnlyDrawable')?.checked !== false;
+  const hideTiny = document.getElementById('rtHideTiny')?.checked === true;
+  const searchRaw = (document.getElementById('rtSearch')?.value || '').trim().toUpperCase();
+  const onlyAnimated = document.getElementById('rtOnlyAnimated')?.checked === true;
+  return oamObjects.filter(o => {
+    if (gfxSel !== 'all' && String(o.gfx) !== gfxSel) return false;
+    if (palSel !== 'all' && !o.pals.includes(Number(palSel))) return false;
+    if (onlyDrawable && o.missing > 0) return false;
+    if (hideTiny && o.w <= 8 && o.h <= 8) return false;
+    if (onlyAnimated && o.phaseCount < 2) return false;
+    if (document.getElementById('rtOnlyKeep')?.checked === true && !oamKeepList.has(o.id)) return false;
+    if (searchRaw && !o.id.toUpperCase().includes(searchRaw)
+        && !o.allTiles.some(k => k.startsWith(searchRaw))) return false;
+    return true;
+  });
+}
+
+function updateRuntimeSelectionUI() {
+  const cnt = document.getElementById('rtSelCount');
+  if (cnt) cnt.textContent = runtimeSelection.size ? `${runtimeSelection.size} gewählt` : '';
+  const btn = document.getElementById('rtExportBtn');
+  if (btn) btn.textContent = runtimeSelection.size ? `Export Auswahl (${runtimeSelection.size})` : 'Export Laufzeit ZIP';
+  // Coverage: how many distinct tiles the SELECTION reaches, against everything
+  // the current filter can see. This is the number that decides whether an
+  // upscale run is worth starting.
+  const cov = document.getElementById('rtCoverage');
+  if (!cov) return;
+  const visible = rtFilteredObjects();
+  const done = rtCoveredKeys();
+  const isHd = (o) => o.allTiles.every(k => done.has(k));
+  const hd = visible.filter(isHd).length;
+  const open = visible.length - hd;
+  cov.textContent = `${visible.length} Objekte · ${hd} schon HD · ${open} offen` +
+                    (oamKeepList.size ? ` · ★ ${oamKeepList.size}` : '') +
+                    (runtimeSelection.size ? ` · ${runtimeSelection.size} gewählt` : '');
+  cov.style.color = open === 0 && visible.length ? '#4caf50' : '#888';
+}
+
+function buildRuntimeCard(obj, doneKeys) {
+  const card = document.createElement('div');
+  card.className = 'sprite-card';
+  const done = doneKeys || rtCoveredKeys();   // hoisted by the caller in bulk
+  const coveredTiles = obj.allTiles.filter(k => done.has(k)).length;
+  const allHd = coveredTiles === obj.allTiles.length;
+  card.title = `${obj.id}\nGfxset ${obj.gfx} | ${obj.w}x${obj.h}px, ${obj.cellCount} OAM-Eintrag/-Einträge | ` +
+               `Palette ${obj.pals.join(',')} | ${obj.seen}x gezeichnet` +
+               (obj.phaseCount > 1 ? `\n${obj.phaseCount} Animationsbilder — alle werden exportiert` : '') +
+               (obj.missing ? `\n⚠ ${obj.missing} Kacheln ohne Pixel in spritemiss` : '') +
+               (allHd ? `\n✓ liegt vollständig als HD im Container` : '') +
+               `\nKlick: alle Hashes in die Konsole`;
+  card._runtimeObj = obj;
+
+  const selBox = document.createElement('input');
+  selBox.type = 'checkbox';
+  selBox.className = 'selbox';
+  selBox.title = 'Für Export auswählen';
+  selBox.checked = runtimeSelection.has(obj.id);
+  if (selBox.checked) card.classList.add('sel-marked');
+  selBox.addEventListener('click', (ev) => ev.stopPropagation());
+  selBox.addEventListener('change', () => {
+    if (selBox.checked) { runtimeSelection.add(obj.id); card.classList.add('sel-marked'); }
+    else { runtimeSelection.delete(obj.id); card.classList.remove('sel-marked'); }
+    updateRuntimeSelectionUI();
+  });
+  card.appendChild(selBox);
+
+  // Scale small objects up so a two-tile word is not a speck, but never past the
+  // card width — a full level name is 184px wide. Zoom is pure CSS.
+  //
+  // The canvas holds real pixels (SD 1x, HD 4x) while the CSS size stays the same
+  // either way, so toggling "HD zeigen" never moves the grid. Every phase goes
+  // through the same renderer, otherwise the hover animation would flip back to
+  // SD the moment it advanced past frame 0.
+  const useHd = rtWantHd();
+  const renderPhase = (tiles) => useHd
+    ? renderRuntimeObjectHd({ w: obj.w, h: obj.h, tiles }, RT_HD_SCALE)
+    : { canvas: renderRuntimeObject({ w: obj.w, h: obj.h, tiles }), hdCount: 0, total: tiles.length };
+
+  const zoom = Math.max(1, Math.min(3, Math.floor(112 / Math.max(obj.w, 1))));
+  const first = renderPhase(obj.tiles);
+  const cv = first.canvas;
+  cv.style.cssText = (useHd ? '' : 'image-rendering:pixelated;') +
+                     `max-width:112px;max-height:80px;` +
+                     `width:${obj.w * zoom}px;height:${obj.h * zoom}px;` +
+                     // A partly upscaled object is the one case worth spotting at a
+                     // glance: it means the run missed something.
+                     (useHd && first.hdCount && first.hdCount < first.total
+                        ? 'outline:1px solid #ff9800;' : '');
+  card.appendChild(cv);
+
+  // Play the phases on hover, like the sprite gallery does for its frames —
+  // the quickest way to see whether an animation was captured whole.
+  if (obj.phaseCount > 1) {
+    let timer = null, phase = 0;
+    const draw = (p) => {
+      const tmp = renderPhase(obj.phases[p]).canvas;
+      const ctx = cv.getContext('2d');
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(tmp, 0, 0);
+    };
+    card.addEventListener('mouseenter', () => {
+      timer = setInterval(() => { phase = (phase + 1) % obj.phaseCount; draw(phase); }, 140);
+    });
+    card.addEventListener('mouseleave', () => {
+      if (timer) { clearInterval(timer); timer = null; }
+      phase = 0; draw(0);
+    });
+  }
+
+  // Keep-list star. Sits opposite the export checkbox so the two roles stay
+  // apart: the checkbox is "export this now", the star is "this one is good".
+  const star = document.createElement('div');
+  const paintStar = () => {
+    const on = oamKeepList.has(obj.id);
+    star.textContent = on ? '★' : '☆';
+    star.style.color = on ? '#ffc107' : '#666';
+    card.style.outline = on ? '2px solid #ffc107' : '';
+  };
+  star.style.cssText = 'position:absolute;top:2px;right:4px;cursor:pointer;font-size:15px;' +
+                       'line-height:1;user-select:none;';
+  star.title = 'Zur Merkliste — bleibt über Reloads erhalten';
+  paintStar();
+  star.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (oamKeepList.has(obj.id)) oamKeepList.delete(obj.id); else oamKeepList.add(obj.id);
+    paintStar();
+    saveKeepList();
+    updateRuntimeSelectionUI();
+  });
+  card.style.position = 'relative';
+  card.appendChild(star);
+
+  // The ID is the handle for manual sorting, so it goes on the card, selectable.
+  const idEl = document.createElement('div');
+  idEl.style.cssText = 'font-size:9px;color:#90caf9;text-align:center;line-height:1.2;' +
+                       'user-select:all;word-break:break-all;';
+  idEl.textContent = obj.id;
+  card.appendChild(idEl);
+
+  const label = document.createElement('div');
+  label.style.cssText = 'font-size:9px;color:#aaa;text-align:center;line-height:1.2;';
+  label.textContent = `${obj.w}x${obj.h}` +
+                      (obj.phaseCount > 1 ? ` · ▶${obj.phaseCount}` : '') +
+                      ` · ${obj.seen}x` + (obj.missing ? ' ⚠' : '') + (allHd ? ' ✓HD' : '');
+  if (allHd) label.style.color = '#4caf50';
+  card.appendChild(label);
+
+  card.addEventListener('click', () => {
+    document.querySelectorAll('.sprite-card.selected-card').forEach(c => c.classList.remove('selected-card'));
+    card.classList.add('selected-card');
+    // Console detail: the hashes are what the pack files are named after, so
+    // being able to read them off is what makes a mismatch debuggable.
+    console.log(`[oam] ${obj.id}  G${obj.gfx}  ${obj.w}x${obj.h}  P${obj.pals.join(',')}  ` +
+                `${obj.phaseCount} Bild(er)  ${obj.seen}x gezeichnet`);
+    obj.phases.forEach((ph, i) => {
+      console.log(`   Bild ${i + 1}: ` + ph.map(t => t.hash.slice(0, 8)).join(' '));
+    });
+    for (const k of obj.allTiles) console.log(`   ${k}` + (done.has(k) ? '  [HD im Container]' : ''));
+  });
+  return card;
+}
+
+// ============================================================
+// The font page — the whole workstream on one screen
+// ============================================================
+// Everything else in this view is a general tool with knobs. The font is a
+// closed, finished thing, so it gets a page that answers only two questions:
+// which characters do we have, and which words go to the upscaler.
+//
+// Note what does NOT filter text: the palette. The kong heads on the world maps
+// sit on palette 6 too. What separates text from everything else is whether the
+// glyph table can READ it — so that is the filter.
+
+function rtTextObjects() {
+  const out = [];
+  for (const o of fontObjects()) {
+    if (o.missing > 0 || o.stacked) continue;
+    if (o.phase != null && o.phase > 0) continue;
+    if (o.pals.length !== 1 || o.pals[0] !== 6) continue;
+    const r = rtReadObjectText(o);
+    if (!r || r.unknown.length) continue;       // fully readable only
+    if (!/[A-Z]/.test(r.text)) continue;        // at least one letter
+    out.push({ obj: o, text: r.text });
+  }
+  return out;
+}
+
+// Fewest words that show every captured character at least once. Cover over
+// CHARACTERS, not tiles: the upscaler needs to have seen each glyph in context,
+// and a second sighting of the same letter adds nothing.
+function fontPickWords(texts) {
+  // Tokenise, do not iterate characters: the two DK symbols are written "[DK1]"
+  // and "[DK2]", so a plain character walk would count them as '[', 'D', 'K',
+  // '1', ']' and never treat them as the single glyphs they are.
+  const charsOf = (t) => new Set((t.text.match(/\[[^\]]+\]|[^\s/]/g) || []));
+  const need = new Set();
+  for (const t of texts) for (const c of charsOf(t)) need.add(c);
+  const all = new Set(need);
+  const chosen = [];
+  // Longest first among equal gains: more context per word is better art.
+  const rest = [...texts].sort((a, b) => b.text.length - a.text.length);
+  while (need.size) {
+    let best = null, gain = 0;
+    for (const t of rest) {
+      let g = 0;
+      for (const c of charsOf(t)) if (need.has(c)) g++;
+      if (g > gain) { best = t; gain = g; }
+    }
+    if (!best) break;
+    chosen.push(best);
+    for (const c of charsOf(best)) need.delete(c);
+    rest.splice(rest.indexOf(best), 1);
+  }
+
+  // A character with no usable word left over still has to reach the upscaler.
+  // V is the live case: it occurs once, in CLAPPER'S CAVERN, on a screen busy
+  // enough that the grouping tore the line apart. A lone 8x16 glyph upscales
+  // worse than a word — but far better than not shipping the letter at all.
+  const covered = new Set();
+  for (const t of chosen) for (const c of charsOf(t)) covered.add(c);
+  const solo = [];
+  if (typeof DKC2_MAP_FONT !== 'undefined' && spriteMissByHash) {
+    for (const g of DKC2_MAP_FONT) {
+      if (covered.has(g.char)) continue;
+      const halves = [g.top, g.bottom].filter(Boolean);
+      if (!halves.every(h => spriteMissByHash.has(`${h}_P6`))) continue;
+      solo.push({
+        text: g.char,
+        soloGlyph: true,
+        obj: {
+          id: `glyph_${g.char.replace(/[^A-Za-z0-9]/g, '_')}`,
+          gfx: 6, w: 8, h: halves.length * 8, pals: [6], missing: 0, stacked: false,
+          phase: null, phaseCount: 1, seen: 1,
+          tiles: halves.map((h, i) => ({ x: 0, y: i * 8, pal: 6, hash: h })),
+        },
+      });
+      all.add(g.char);
+    }
+  }
+  return { chosen: [...chosen, ...solo], allChars: all, uncovered: need, soloCount: solo.length };
+}
+
+let fontPageWords = [];   // what "Wörter exportieren" will ship
+
+function renderFontPage() {
+  const page = document.getElementById('fontPage');
+  const toolbar = document.getElementById('fontSummary');
+  if (!page) return;
+  if (typeof DKC2_MAP_FONT === 'undefined') {
+    page.innerHTML = '<p style="color:#f44336;">font_groundtruth.js nicht geladen.</p>';
+    return;
+  }
+  // Ask for the RECORDINGS, not for the runtime view's grouping: this page
+  // builds its own (palette split pinned on) and must work without anyone having
+  // opened the Laufzeit tab first.
+  if (!sprPosEntries || !spriteMissByHash) {
+    page.innerHTML = '<p style="color:#666;">Keine Laufzeit-Aufzeichnung geladen. Knopf <b>Laufzeit</b> ' +
+      'in der Katalog-Toolbar: <code>snes_hd_spritemiss.txt</code> und <code>snes_hd_sprpos.txt</code> wählen.</p>';
+    toolbar.textContent = '';
+    return;
+  }
+
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const done = rtCoveredKeys();
+  const seen = new Set();
+  if (spriteMissByHash) for (const k of spriteMissByHash.keys()) seen.add(k.split('_')[0]);
+
+  // --- 1. the alphabet, in order ---
+  const glyphs = [...DKC2_MAP_FONT].sort((a, b) => {
+    const rank = (c) => (/[A-Z]/.test(c) ? 0 : 1);
+    return rank(a.char) - rank(b.char) || a.char.localeCompare(b.char);
+  });
+  // Characters we know exist but have never been able to map. Shown as empty
+  // slots so the alphabet does not silently look complete.
+  const unmapped = (typeof DKC2_MAP_FONT_MISSING !== 'undefined' ? DKC2_MAP_FONT_MISSING : [])
+    .map(c => ({ char: c, top: null, bottom: null, unmapped: true }));
+  let haveN = 0, hdN = 0;
+  let cells = '';
+  for (const g of [...glyphs, ...unmapped].sort((a, b) => {
+        const rank = (c) => (/[A-Z]/.test(c) ? 0 : 1);
+        return rank(a.char) - rank(b.char) || a.char.localeCompare(b.char);
+      })) {
+    if (g.unmapped) {
+      cells += `<div style="border:1px dashed #f44336;border-radius:3px;padding:4px;text-align:center;background:#222;"
+                     title="Dieses Zeichen gibt es, aber in keinem bisher aufgezeichneten Namen — die Zuordnung Hash→Zeichen fehlt noch. Taucht es auf, meldet die Laufzeit-Ansicht es als unlesbare Glyphe mit Kontext.">
+          <div style="height:48px;line-height:48px;color:#555;font-size:20px;">?</div>
+          <div style="font-size:11px;color:#fff;margin-top:2px;">${esc(g.char)}</div>
+          <div style="font-size:9px;color:#f44336;">nicht zugeordnet</div></div>`;
+      continue;
+    }
+    const halves = [g.top, g.bottom].filter(Boolean);
+    const isSeen = halves.every(h => seen.has(h));
+    const isHd = halves.every(h => done.has(`${h}_P6`));
+    if (isSeen) haveN++;
+    if (isHd) hdN++;
+    const border = !isSeen ? '#f44336' : isHd ? '#4caf50' : '#ff9800';
+    const note = !isSeen ? 'nicht aufgezeichnet' : isHd ? 'HD' : 'noch SD';
+    cells += `<div style="border:1px solid ${border};border-radius:3px;padding:4px;text-align:center;background:#222;">
+        <div class="fontGlyphSlot" data-top="${g.top}" data-bottom="${g.bottom || ''}"></div>
+        <div style="font-size:11px;color:#fff;margin-top:2px;">${esc(g.char)}</div>
+        <div style="font-size:9px;color:${border};">${note}</div></div>`;
+  }
+
+  // --- 2. the words that will be exported ---
+  const texts = rtTextObjects();
+  const { chosen, allChars, uncovered, soloCount } = fontPickWords(texts);
+  fontPageWords = chosen;
+
+  let wordRows = '';
+  for (const t of chosen) {
+    wordRows += `<div style="display:flex;align-items:center;gap:12px;border-bottom:1px solid #333;padding:5px 0;">
+        <div class="fontWordSlot" data-id="${t.obj.id}" style="min-width:200px;"></div>
+        <div style="font-family:monospace;color:${t.soloGlyph ? '#ff9800' : '#ffd54f'};">${esc(t.text)}</div>
+        <div style="font-size:11px;color:#888;">${t.soloGlyph
+          ? 'Einzelzeichen — in keinem lesbaren Wort vorhanden'
+          : `G${t.obj.gfx} · ${t.obj.tiles.length} Kacheln`}</div></div>`;
+  }
+
+  page.innerHTML =
+    `<h3 style="color:#fff;margin:0 0 4px;font-size:15px;">Zeichen (${haveN} von ${DKC2_MAP_FONT.length} erfasst, ${hdN} in HD)</h3>
+     <div style="color:#888;font-size:11px;margin-bottom:8px;">
+       <span style="color:#4caf50;">grün</span> = HD-Kunst im Container &nbsp;·&nbsp;
+       <span style="color:#ff9800;">orange</span> = aufgezeichnet, noch SD &nbsp;·&nbsp;
+       <span style="color:#f44336;">rot</span> = in der Aufzeichnung nicht enthalten</div>
+     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(58px,1fr));gap:5px;margin-bottom:18px;">${cells}</div>
+     <h3 style="color:#fff;margin:0 0 4px;font-size:15px;">Beispielwörter für den Upscale (${chosen.length})</h3>
+     <div style="color:#888;font-size:11px;margin-bottom:8px;">
+       Die kleinste Auswahl aus ${texts.length} gelesenen Wörtern, die jedes erfasste Zeichen
+       mindestens einmal zeigt${uncovered.size ? ` — <span style="color:#f44336;">${esc([...uncovered].join(', '))} in keinem Wort</span>` : ''}.
+       Genau diese Wörter exportiert der Knopf oben.</div>
+     ${wordRows || '<p style="color:#666;">Keine lesbaren Wörter in der Aufzeichnung.</p>'}
+     ${(() => {
+        // Only worth showing while something is still missing: then it says where
+        // to go looking. Once every character is in, walking more maps is pointless.
+        if (haveN === DKC2_MAP_FONT.length && !uncovered.size) return '';
+        const seenGfx = new Set((sprPosEntries || []).map(e => e.gfx));
+        const todo = [];
+        if (typeof OVERWORLD_SETS !== 'undefined') {
+          for (const [id, cfg] of Object.entries(OVERWORLD_SETS)) {
+            if (!seenGfx.has(Number(id))) todo.push(esc(cfg.name || `Set ${id}`));
+          }
+        }
+        return todo.length
+          ? `<div style="margin-top:14px;color:#2196f3;font-size:11px;">Noch nie aufgezeichnet — ` +
+            `dort suchen, falls oben ein Zeichen rot ist: ${todo.join(' · ')}</div>` : '';
+     })()}`;
+
+  // Draw the glyphs and words into their slots (canvas, not markup).
+  const wantHd = document.getElementById('fontShowHd')?.checked !== false
+                 && hdRuntimeBitmaps && hdRuntimeBitmaps.size > 0;
+  for (const slot of page.querySelectorAll('.fontGlyphSlot')) {
+    const halves = [slot.dataset.top, slot.dataset.bottom].filter(Boolean);
+    const cv = document.createElement('canvas');
+    cv.width = 8; cv.height = halves.length * 8;
+    const ctx = cv.getContext('2d');
+    const imgData = ctx.createImageData(cv.width, cv.height);
+    let drew = false;
+    halves.forEach((h, i) => {
+      const e = spriteMissByHash && spriteMissByHash.get(`${h}_P6`);
+      if (e) { drawTile8x8(imgData, e.cgram, 0, 0, i * 8, e.bytes, false, false); drew = true; }
+    });
+    if (drew) ctx.putImageData(imgData, 0, 0);
+    // Overdraw with HD where the container has it — same slot, so the grid stays put.
+    if (wantHd) {
+      const hdCv = document.createElement('canvas');
+      hdCv.width = 8 * 4; hdCv.height = halves.length * 8 * 4;
+      const hctx = hdCv.getContext('2d');
+      hctx.imageSmoothingEnabled = false;
+      let any = false;
+      halves.forEach((h, i) => {
+        const hd = hdRuntimeBitmaps.get(`${h}_P6`);
+        if (hd) { hctx.drawImage(hd.img, 0, i * 32, 32, 32); any = true; }
+        else hctx.drawImage(cv, 0, i * 8, 8, 8, 0, i * 32, 32, 32);
+      });
+      if (any) { hdCv.style.cssText = 'width:24px;height:' + (halves.length * 24) + 'px;';
+                 slot.appendChild(hdCv); continue; }
+    }
+    cv.style.cssText = `image-rendering:pixelated;width:24px;height:${halves.length * 24}px;`;
+    slot.appendChild(cv);
+  }
+  const byId = new Map(chosen.map(t => [t.obj.id, t.obj]));
+  for (const slot of page.querySelectorAll('.fontWordSlot')) {
+    const o = byId.get(slot.dataset.id);
+    if (!o) continue;
+    let cv;
+    if (wantHd) {
+      const r = renderRuntimeObjectHd(o, 4);
+      cv = r.canvas;
+      cv.style.cssText = `max-width:100%;width:${o.w * 2}px;height:${o.h * 2}px;` +
+                         (r.hdCount < r.total ? 'outline:1px solid #ff9800;' : '');
+    } else {
+      cv = renderRuntimeObject(o);
+      cv.style.cssText = `image-rendering:pixelated;max-width:100%;` +
+                         `width:${o.w * 2}px;height:${o.h * 2}px;`;
+    }
+    slot.appendChild(cv);
+  }
+
+  toolbar.textContent = `${haveN}/${DKC2_MAP_FONT.length} Zeichen erfasst · ${hdN} in HD · ` +
+                        `${chosen.length} Wörter decken alle ab`;
+}
+
+function renderRuntimeGallery() {
+  const grid = document.getElementById('runtimeGalleryGrid');
+  if (!grid) return;
+  if (!oamObjects) {
+    grid.innerHTML = '<p style="color:#666;padding:20px;">Keine OAM-Aufzeichnung geladen. ' +
+      'Knopf <b>Laufzeit</b> in der Katalog-Toolbar: <code>snes_hd_oam.txt</code> (die Objekte) ' +
+      'und <code>snes_hd_spritemiss.txt</code> (die Pixel) aus Mesen wählen — beide auf einmal.</p>';
+    return;
+  }
+  // Decode the container's HD tiles before the first card is built. Without this
+  // the gallery painted SD forever: the decode was wired only into the Schrift
+  // page, so an imported runtime ZIP was in hdPack but never on screen. Runs once
+  // — hdRuntimeBitmaps stays until an import or a container swap drops it.
+  if (hdRuntimeBitmaps === null && hdPack && hdPack.runtimeTiles && hdPack.runtimeTiles.size) {
+    ensureRuntimeHdBitmaps().then(() => renderRuntimeGallery());
+    return;
+  }
+  // Fill the dropdowns once, keeping the current choice.
+  const gfxSel = document.getElementById('rtGfxFilter');
+  if (gfxSel && !gfxSel.dataset.filled) {
+    const counts = new Map();
+    for (const p of oamObjects) counts.set(p.gfx, (counts.get(p.gfx) || 0) + 1);
+    gfxSel.innerHTML = '<option value="all">alle</option>' +
+      [...counts.entries()].sort((a, b) => b[1] - a[1])
+        .map(([g, n]) => `<option value="${g}">G${g} (${n})</option>`).join('');
+    gfxSel.dataset.filled = '1';
+  }
+  const palSel = document.getElementById('rtPalSel');
+  if (palSel && !palSel.dataset.filled) {
+    const pals = [...new Set(oamObjects.flatMap(o => o.pals))].sort((a, b) => a - b);
+    palSel.innerHTML = '<option value="all">alle</option>' +
+      pals.map(p => `<option value="${p}">P${p}</option>`).join('');
+    palSel.dataset.filled = '1';
+  }
+
+  const list = rtFilteredObjects();
+  grid.innerHTML = '';
+  if (list.length === 0) {
+    grid.innerHTML = '<p style="color:#666;padding:20px;">Kein Objekt passt zu den Filtern.</p>';
+    updateRuntimeSelectionUI();
+    return;
+  }
+  // 400, not 2000: every card is a canvas plus a text read, and turning off
+  // "nur 1. Phase" multiplies the object count by the animation length.
+  const CAP = 400;
+  const doneKeys = rtCoveredKeys();
+  const frag = document.createDocumentFragment();
+  for (const o of list.slice(0, CAP)) frag.appendChild(buildRuntimeCard(o, doneKeys));
+  grid.appendChild(frag);
+  if (list.length > CAP) {
+    const more = document.createElement('p');
+    more.style.cssText = 'color:#ff9800;padding:12px;grid-column:1/-1;';
+    more.textContent = `… ${list.length - CAP} weitere ausgeblendet (${list.length} passen zum Filter). ` +
+                       `Gfxset oder Palette einschränken.`;
+    grid.appendChild(more);
+  }
+  updateRuntimeSelectionUI();
+}
+
 function buildSpriteCard(e) {
   const hasOverride = spriteOverrides.has(e.animId);
   const isUnused = UNUSED_ANIM_IDS.has(e.animId);
@@ -14585,13 +16415,117 @@ document.getElementById('sprSelectClearBtn').addEventListener('click', () => {
 document.getElementById('spriteFilter').addEventListener('input', renderSpriteGallery);
 document.getElementById('spriteShowGrey').addEventListener('change', renderSpriteGallery);
 
-// Category filter buttons
-document.querySelectorAll('.cat-btn').forEach(btn => {
+// --- Runtime gallery toolbar ---
+// All of these are pure DISPLAY filters now. The grouping itself has no knobs
+// left — OAM says what an object is, so there is nothing to tune.
+for (const id of ['rtGfxFilter', 'rtPalSel', 'rtOnlyDrawable', 'rtHideTiny',
+                  'rtOnlyAnimated', 'rtOnlyKeep', 'rtShowHd']) {
+  document.getElementById(id).addEventListener('change', renderRuntimeGallery);
+}
+document.getElementById('rtSuggestBtn').addEventListener('click', () => {
+  // With pictures there is nothing to solve: everything that is not already HD
+  // has to be produced. Select exactly that.
+  const visible = rtFilteredObjects();
+  const done = rtCoveredKeys();
+  const chosen = visible.filter(o => !o.allTiles.every(k => done.has(k)));
+  chosen.openTotal = new Set(chosen.flatMap(o => o.allTiles)).size;
+  chosen.openLeft = 0;
+  runtimeSelection.clear();
+  for (const o of chosen) runtimeSelection.add(o.id);
+  renderRuntimeGallery();
+
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const named = chosen.map(o => o.id);
+  const panel = document.getElementById('rtReportPanel');
+  panel.innerHTML =
+    `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+       <b style="color:#fff;font-size:13px;">${chosen.length} Objekte ohne HD-Kunst ausgewählt</b>
+       <button onclick="document.getElementById('rtReportPanel').style.display='none'"
+               style="background:none;border:none;color:#888;font-size:16px;cursor:pointer;">&times;</button></div>` +
+    `<div>Von <b>${visible.length}</b> sichtbaren Objekten brauchen <b>${chosen.length}</b> noch ` +
+    `HD-Kunst — zusammen <b>${chosen.openTotal}</b> Kacheln.</div>` +
+    (chosen.length === 0
+      ? `<div style="color:#4caf50;margin-top:6px;">Nichts offen — alle sichtbaren Objekte liegen schon als HD im Container.</div>`
+      : `<div style="color:#aaa;font-size:11px;margin-top:6px;">Wirkt nur auf das, was der Filter zeigt. ` +
+        `Die IDs sind stabil — zum manuellen Aussortieren kopierbar.</div>` +
+        `<div style="margin-top:6px;font-family:monospace;font-size:11px;column-count:3;">` +
+        named.map(n => `<div>${esc(n)}</div>`).join('') + `</div>`);
+  panel.style.display = '';
+  console.log(`[laufzeit] Vorschlag: ${chosen.length} Objekte für ${chosen.openTotal} offene Kacheln ` +
+              `(aus ${visible.length} sichtbaren).`);
+});
+document.getElementById('rtPruneBtn').addEventListener('click', () => applyRuntimePrune());
+document.getElementById('rtKeepExportBtn').addEventListener('click', () => {
+  if (!oamKeepList.size) { alert('Merkliste ist leer — Objekte mit dem Stern markieren.'); return; }
+  const list = (oamObjects || []).filter(o => oamKeepList.has(o.id));
+  const gone = oamKeepList.size - list.length;
+  if (gone) {
+    console.warn(`[merkliste] ${gone} gemerkte IDs kommen in dieser Aufzeichnung nicht vor.`);
+  }
+  if (!list.length) { alert('Kein gemerktes Objekt ist in dieser Aufzeichnung enthalten.'); return; }
+  exportRuntimeObjectsAsZip(list, 'rtKeepExportBtn', 'dkc2_merkliste_sd.zip');
+});
+document.getElementById('rtSelectVisibleBtn').addEventListener('click', () => {
+  for (const o of rtFilteredObjects()) runtimeSelection.add(o.id);
+  renderRuntimeGallery();
+});
+document.getElementById('rtSelectClearBtn').addEventListener('click', () => {
+  runtimeSelection.clear();
+  renderRuntimeGallery();
+});
+document.getElementById('rtExportBtn').addEventListener('click', () => exportRuntimeObjectsAsZip());
+document.getElementById('fontShowHd').addEventListener('change', () => {
+  ensureRuntimeHdBitmaps().then(() => renderFontPage());
+});
+document.getElementById('fontExportBtn').addEventListener('click', () => {
+  if (!fontPageWords.length) { alert('Keine Wörter zu exportieren.'); return; }
+  exportRuntimeObjectsAsZip(fontPageWords.map(t => t.obj), 'fontExportBtn', 'dkc2_worldmap_font_sd.zip');
+});
+
+// Category filter buttons.
+// The class is also used for plain toolbar buttons ("Sichtbare wählen", "Leeren",
+// the runtime controls) purely for their look. Those carry no data-cat, and
+// without this guard a click on them set activeCatFilter = undefined, which made
+// every category test fail and emptied the gallery.
+document.querySelectorAll('.cat-btn[data-cat]').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.cat-btn[data-cat]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     activeCatFilter = btn.dataset.cat;
-    renderSpriteGallery();
+    // The runtime objects have their own grid and toolbar — they do not come from
+    // the ROM animation library and share none of its filters.
+    const isRuntime = activeCatFilter === 'runtime';
+    const isFont = activeCatFilter === 'font';
+    document.getElementById('runtimeToolbar').style.display = isRuntime ? '' : 'none';
+    document.getElementById('runtimeGalleryGrid').style.display = isRuntime ? '' : 'none';
+    document.getElementById('fontToolbar').style.display = isFont ? '' : 'none';
+    document.getElementById('fontPage').style.display = isFont ? '' : 'none';
+    document.getElementById('rtReportPanel').style.display = 'none';
+    document.getElementById('spriteGalleryGrid').style.display = (isRuntime || isFont) ? 'none' : '';
+    if (isFont) {
+      // The font page still runs on sprpos: its art is finished and in the
+      // container, and re-deriving it on OAM would risk a working result for
+      // nothing. Migrating it is a separate step.
+      const target = document.getElementById('fontPage');
+      if (!fontObjectsCache && sprPosEntries && sprPosEntries.length > 20000) {
+        target.innerHTML = `<p style="color:#ff9800;padding:20px;">Gruppiere ${sprPosEntries.length} ` +
+                           `Positionen … (einige Sekunden, passiert nur einmal je Aufzeichnung)</p>`;
+        setTimeout(() => ensureRuntimeHdBitmaps().then(() => renderFontPage()), 30);
+      } else {
+        ensureRuntimeHdBitmaps().then(() => renderFontPage());
+      }
+    } else if (isRuntime) {
+      const target = document.getElementById('runtimeGalleryGrid');
+      if (!oamObjects && oamFrames && oamFrames.length > 500) {
+        target.innerHTML = `<p style="color:#ff9800;padding:20px;">Baue Objekte aus ` +
+                           `${oamFrames.length} OAM-Frames …</p>`;
+        setTimeout(() => { buildOamObjects(); renderRuntimeGallery(); }, 30);
+      } else {
+        if (!oamObjects) buildOamObjects();
+        renderRuntimeGallery();
+      }
+    }
+    else renderSpriteGallery();
   });
 });
 
@@ -14724,6 +16658,74 @@ document.getElementById('bgCapInput').addEventListener('change', async (e) => {
   btn.style.background = '#2e7d32';
   const gfxCount = new Set(res.entries.map(e => e.gfx)).size;
   btn.title = `${res.animFrames} Anim-Frames auf ${res.animAddrs} Adressen (${gfxCount} Gfxsets) + ${res.gapAddrs} statische Coverage-Lücken-Adressen. ${res.bad} verworfen. Die Anim-Frames werden beim Export als hash-adressierte Kacheln aufgelöst.`;
+});
+document.getElementById('runtimeSprBtn').addEventListener('click', () => {
+  document.getElementById('runtimeSprInput').click();
+});
+document.getElementById('runtimeSprInput').addEventListener('change', async (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (!files.length) return;
+  // Both recordings can be picked at once. Which is which is decided by the
+  // CONTENT, not the filename — the files are appended to across sessions and
+  // get renamed/copied around, and a wrong guess here is silent.
+  let gotMiss = 0, gotPos = 0, gotOam = 0, unknown = [];
+  for (const file of files) {
+    const text = await file.text();
+    if (/^SPRMISS /m.test(text)) {
+      const res = parseSpriteMiss(text);
+      if (res.entries.length === 0) { unknown.push(file.name + ' (SPRMISS, aber 0 gültige Zeilen)'); continue; }
+      spriteMissEntries = res.entries;
+      spriteMissByHash = res.byHash;
+      gotMiss = res.entries.length;
+      try {
+        await saveRecording('spritemiss', {
+          entries: res.entries.map(x => ({ ...x, bytes: [...x.bytes], cgram: [...x.cgram] })),
+        });
+      } catch (err) { console.warn('[laufzeit] spritemiss konnte nicht gespeichert werden:', err); }
+    } else if (/^OAMF /m.test(text)) {
+      const res = parseOam(text);
+      if (res.frames.length === 0) { unknown.push(file.name + ' (OAMF, aber 0 gültige Frames)'); continue; }
+      oamFrames = res.frames;
+      oamObjects = null;
+      gotOam = res.frames.length;
+      try { await saveRecording('oam', { frames: res.frames }); }
+      catch (err) { console.warn('[oam] konnte nicht gespeichert werden:', err); }
+    } else if (/^SPRPOS /m.test(text)) {
+      const res = parseSprPos(text);
+      if (res.entries.length === 0) { unknown.push(file.name + ' (SPRPOS, aber 0 gültige Zeilen)'); continue; }
+      if (res.legacyGrid) {
+        alert('Diese snes_hd_sprpos.txt stammt aus einem Mesen-Build VOR S16.\n\n' +
+              'Darin fehlen systematisch die Kacheln, deren deckende Pixel das 8-Pixel-Raster ' +
+              'verfehlt haben — daher halbe Buchstaben und Symbole mit fehlenden Ecken.\n\n' +
+              'Mit dem S16-Build neu aufzeichnen und die alte Datei VORHER löschen ' +
+              '(Mesen hängt an eine bestehende Datei an).');
+      }
+      sprPosEntries = res.entries;
+      gotPos = res.entries.length;
+      try {
+        await saveRecording('sprpos', { entries: res.entries });
+      } catch (err) { console.warn('[laufzeit] sprpos konnte nicht gespeichert werden:', err); }
+    } else {
+      unknown.push(file.name);
+    }
+  }
+  updateRuntimeSprButton();
+  if (unknown.length) {
+    alert('Nicht erkannt: ' + unknown.join(', ') +
+          '\n\nErwartet werden snes_hd_spritemiss.txt (SPRMISS, die Pixel), ' +
+          'snes_hd_oam.txt (OAMF/OAM, die Objekte, Mesen S17+) und — nur noch für die ' +
+          'Schrift-Seite — snes_hd_sprpos.txt (SPRPOS).');
+  }
+  if (gotMiss || gotPos || gotOam) {
+    console.log(`[laufzeit] geladen: ${gotMiss} Kacheln, ${gotOam} OAM-Frames, ${gotPos} Positionen ` +
+                `— bleibt über Reloads erhalten`);
+    // Drop any grouping built from the previous files; the new one is computed
+    // when a tab that needs it is opened, not here (it takes seconds).
+    runtimeObjects = null;
+    fontObjectsCache = null;
+    oamObjects = null;
+  }
 });
 document.getElementById('hdZipInput').addEventListener('change', (e) => {
   if (e.target.files.length > 0) {
@@ -15212,6 +17214,13 @@ if (window.showDirectoryPicker) {
 
 // Bring the stored spritecap back, so it no longer has to be re-uploaded.
 restoreSpriteCapFromDb();
+// Same for the runtime sprite recordings. Deliberately WITHOUT grouping them:
+// that is a multi-second single-threaded pass (260 000 positions ≈ 5 s) and
+// running it here froze the page right after load, before the user had even
+// picked a ROM. The grouping happens when the Laufzeit or Schrift tab is opened,
+// which is the first moment anyone needs it.
+restoreRuntimeSprFromDb();
+restoreKeepList();
 
 console.log('DKC2 Viewer: All scripts loaded and event listeners registered.');
 </script>

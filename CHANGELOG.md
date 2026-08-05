@@ -1,5 +1,435 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-05] — Die importierte Laufzeit-HD-Kunst war da, nur nie auf dem Schirm
+
+Erster echter Rundweg für die Hub-Objekte (Fackeln, Flagge, Luftschiff): SD-Export →
+Upscale → HD-Import. Der Import lief durch, die Galerie zeigte trotzdem weiter SD.
+
+**Das ZIP war in Ordnung** — gegengeprüft: 49 PNGs plus `manifest.json` auf beiden Seiten,
+identische Objektliste, HD exakt 4× (56×36 → 224×144), `scaleFactor` sauber auf 4
+umgeschrieben. Die Schnittrechnung des Importers geht auf. Der Fehler lag ausschließlich
+im Viewer, an **zwei** Stellen:
+
+1. **Die Laufzeit-Galerie hatte überhaupt keinen HD-Pfad.** `buildRuntimeCard` rief immer
+   `renderRuntimeObject` — den reinen SD-Renderer. `renderRuntimeObjectHd` existierte
+   längst, war aber nur an die Schrift-Seite angeschlossen, und `ensureRuntimeHdBitmaps()`
+   wurde von der Galerie nie aufgerufen: `hdRuntimeBitmaps` blieb `null`, also lief jede
+   Karte in den SD-Zweig. Die HD-Kunst lag die ganze Zeit korrekt in `hdPack.runtimeTiles`.
+2. **Der Re-Render nach dem Import feuerte nicht.** Import und Container-Laden prüften
+   `if (runtimeObjects)` — das **alte sprpos-Modell**. Die Galerie läuft seit S17 über
+   `oamObjects`; wer nur `snes_hd_oam.txt` lädt, hat `runtimeObjects === null`. Selbst der
+   Abdeckungszähler („X schon HD") blieb deshalb stehen, bis man einen Filter anfasste.
+
+**Behoben:** Checkbox **„HD zeigen"** in der Laufzeit-Toolbar (Gegenstück zur Schrift-Seite),
+Dekodieren der Container-Kacheln beim ersten Aufbau der Galerie, und beide Wächter auf
+`oamObjects || runtimeObjects`.
+
+Damit gilt in der Galerie dieselbe Regel wie bei der Schrift: **wo HD fehlt, bleibt SD
+stehen** — ein nur teilweise hochskaliertes Objekt bekommt einen orangen Rand, statt still
+ganz oder gar nicht zu erscheinen. Die Animationsbilder laufen über denselben Renderer,
+sonst wäre der Hover ab Bild 1 auf SD zurückgefallen. Die Leinwand trägt echte Pixel
+(SD 1×, HD 4×), die CSS-Größe bleibt gleich — das Umschalten verschiebt das Raster nicht.
+
+## [2026-08-04c] — Objekte mit Animationsbildern, Merkliste, und drei verworfene Versuche
+
+Der Bilder-Umbau von 08-04b war ein **Rückschritt** und ist zurückgenommen. Er lieferte
+Einzelbilder statt Objekten; die Fackeln, die vorher sauber als eine Karte mit neun Bildern
+dastanden, zerfielen wieder. Der richtige Schluss war nicht, das Modell zu ersetzen, sondern
+seinen *einen* Fehler zu beheben.
+
+**Stand jetzt (und getestet):** OAM-Einträge werden je Frame über zusammenhängende
+Indexläufe zu Momentaufnahmen gruppiert; Identität ist die **Struktur** (welche Zellen, wo,
+Größe, Palette), die abweichenden **Inhalte sind die Animationsbilder**. Eine Karte je
+Objekt, Animation beim Überfahren, Export je Bild als eigene Datei (`ID_f00.png` …) mit
+`object`/`frame`/`frameCount` im Manifest — dieselbe Logik wie bei den Charakter-Sprites.
+
+Am Hub bestätigt: **2285 Objekte, 81 animiert**, 254 ms. Vom User geprüft und benannt:
+
+| ID | Objekt | |
+|---|---|---|
+| `G53-40x20-P0-77D8` | Fackelpaar Höhle | 9 Bilder |
+| `G53-33x17-P0-CB35` | Fackelpaar Hütte | 8 Bilder |
+| `G53-24x32-P0-C24E` | Flagge **mit Mast** | 4 Bilder |
+| `G53-16x16-P0-8AE5` | Flagge animiert, ohne Mast | 10 Bilder |
+| `G53-32x56-P2-C46A` | **Luftschiff** | 1 Bild, 13 Zellen |
+
+### Drei Versuche, die Flagge automatisch zusammenzuführen — alle verworfen
+
+Die beiden Flaggen-Karten teilen nachweislich **12 Kacheln**, gehören also zusammen. Keiner
+der Ansätze hat das ohne Kollateralschaden geschafft:
+
+1. **Verschmelzen über gemeinsame Kunst** → kettet transitiv über den Schirm: ein Klumpen
+   `219x184` mit **868 Bildern**, der beide Fackelpaare gefressen hatte.
+2. **Wachstumsbremse obendrauf** (eine Vereinigung darf das Objekt nicht vergrößern) → leckte
+   trotzdem (`131x88`), und **die notierten IDs lösten nicht mehr auf**.
+3. Davor schon: **Slot-Verfolgung über die Zeit** → zerlegt die Fackel in Flamme und Mast;
+   **„eine Animation kehrt zurück"** → stuft auch die Kartenbuchstaben als zyklisch ein.
+
+Die Verschmelzung ist **ganz entfernt**, mit einem Kommentar im Code, warum. Praktischer Weg
+bis auf Weiteres: **beide Flaggen-Karten exportieren** — der Import beansprucht Kacheln per
+Hash, Mast und Wehbilder landen beide im Pack. Dass die Vorschau die Flagge ohne Mast zeigt,
+ändert am Ergebnis im Spiel nichts.
+
+### ★ Merkliste
+
+Weil keine Regel zuverlässig ein brauchbares Objekt von einem Bruchstück trennt, ist das
+Urteil des Auges der einzige verlässliche Schritt — und muss deshalb einen Reload überleben.
+Jede Karte hat einen **Stern**; die Merkliste liegt in IndexedDB und ist über die
+Objekt-ID adressiert, die aus der Kunst abgeleitet und damit über Neuaufzeichnungen stabil
+ist. Dazu Filter **„★ nur Merkliste"** und Knopf **„★ Merkliste exportieren"**, der
+unabhängig von den Filtern arbeitet und fehlende IDs in der Konsole nennt.
+
+## [2026-08-04b] — Das falsche Problem: nicht Objekte, sondern Bilder
+
+Nach dem OAM-Umbau blieb die Ansicht unbefriedigend: die Flagge tauchte mehrfach auf und
+keine Kachel zeigte die ganze Animation, Rauchwolken bewegten sich nicht, Wespen erschienen
+verstreut. Ich habe daraufhin **drei** Verfahren für die Objekt-Identität gebaut und
+gemessen — und alle drei scheitern, jedes anders:
+
+| Identität | Fehler |
+|---|---|
+| **Struktur** (welche Zellen, wo) | Einzelzellen entarten: alles 16×16 auf P6 landet in einem Topf, sämtliche Kartenbuchstaben wurden „Phasen" eines Objekts |
+| **Slot über die Zeit** | zerlegt die Fackel in Flamme und Mast; große Objekte verschmelzen (101×135 mit 197 „Phasen") |
+| **„Animation kehrt zurück"** | stuft die Buchstaben ebenfalls als zyklisch ein — man läuft zum Level-Symbol zurück und sieht denselben Buchstaben |
+
+Der Grund, warum keines funktioniert: **eine Animation ändert ihre OAM-Zusammensetzung**
+(die wehende Flagge braucht mal mehr, mal weniger Einträge), und ein Slot wird
+weiterverwendet. Es gibt keine verlässliche Objektgrenze in diesen Daten.
+
+**Und sie wird auch nicht gebraucht.** Das Pack ist nach **Kachel-Hash** adressiert.
+Instanzen, Positionen, Phasenreihenfolge, ja die Animation selbst ändern nichts am Ergebnis:
+drei gleich aussehende Wespen brauchen ein Bild, eine Wespe mit fünf Posen braucht fünf.
+Gebraucht wird schlicht **jedes unterschiedliche Bild einmal** — und ein OAM-Eintrag *ist*
+per Definition ein zusammenhängendes Bild, die Einheit, die das Spiel selbst zeichnet.
+
+Das ist dieselbe Form wie bei der Schrift-Seite: Wörter liefern dem Upscaler **Kontext**,
+die Prüfliste sind die **Glyphen**. Hier liefert die Umgebung den Kontext, die Prüfliste sind
+die **distinkten Bilder**. Die perfekte Objekt-Identität zu suchen war das falsche Problem —
+sie hat nie beeinflusst, was produziert werden muss.
+
+**Die Ansicht zeigt jetzt Bilder statt Objekte**, jedes mit einer **stabilen ID** aus seinem
+Inhalt (`G53-16x16-P3-3424`) — kopierbar, über Sitzungen gleichbleibend, also als Handgriff
+zum manuellen Aussortieren brauchbar. Dazu Suche nach ID oder Hash, Palettenfilter,
+„8×8 ausblenden", und ein Zähler „N Bilder · davon HD · offen". Beim Überfahren zeigt die
+Karte, **womit** das Bild exportiert wird: nicht der nackte Ausschnitt, sondern die ganze
+OAM-Gruppe, in der es vorkam (im Mittel 10× so viel Fläche) — ein 8×8-Schnipsel allein
+upscalet schlecht, und der Import beansprucht Kacheln ohnehin per Hash.
+
+Gemessen am Hub: **240 distinkte Bilder** (226 zeichenbar), davon 42 ab 16 px. Darin die
+Wespe als **5 Posen**, die Piratenflagge als ~14, die Rauchwolken als ~20. IDs eindeutig.
+190 ms.
+
+Entfernt: die gesamte Objekt-Identitätslogik (`buildOamObjects`, `oamPhaseTiles`, 95 Zeilen)
+samt der Schalter *nur animierte*, *Einzelsprites aufteilen*, *Größe* und der Phasen-Vorschau.
+
+## [2026-08-04] — Laufzeit-Objekte kommen jetzt aus OAM (S17)
+
+Der bisherige Weg hat Objekte aus einer pixelweise abgetasteten, global deduplizierten
+Bildschirmaufnahme **erraten**. `sprpos` schreibt jede Kachel genau einmal je Sitzung, kein
+Frame ist also je vollständig — deshalb hing es am Frame-Fenster, ob ein Objekt überhaupt
+erschien. Die Piratenflagge des Hubs war bei Fenster 1 da und bei 600 weg. Das war kein
+Einstellungsproblem, die Information fehlte schlicht.
+
+**Sie fehlte nur in unseren Dateien, nicht im Emulator.** `SpriteInfo` trägt `Index` — die
+OAM-Nummer. Ein OAM-Eintrag **ist** ein Objekt (8×8 bis 64×64), vom Spiel so definiert,
+mit eigener Position, Größe, Palette und Spiegelung.
+
+**Mesen S17** schreibt `snes_hd_oam.txt`: je Frame ein Kopf plus eine Zeile je sichtbarem
+Eintrag, mit allen Unterkachel-Hashes. Geschrieben wird nur bei **geänderter** sichtbarer
+OAM-Belegung — ein stehender Schirm kostet einen Frame, eine Fackel einen je Phase.
+
+**Die Gruppierungsregel ist keine Heuristik mehr.** Räumliche Überlappung scheitert (auf dem
+Hub berühren sich Flagge, Kongs und Levelname und verschmelzen zu einem Block — gemessen,
+es reproduzierte exakt die alten Klumpen). Ein Spiel legt die Sprites eines Objekts aber in
+einem **zusammenhängenden OAM-Indexblock** ab. Danach gruppiert, fallen die Objekte einzeln
+heraus.
+
+**Identität = Struktur, Inhalt = Phase.** Ein Objekt wird über seine Zellen und deren Lage
+identifiziert; wechseln nur die Kachelnummern, ist das eine **Phase** desselben Objekts.
+Damit ist eine Fackel *ein* Eintrag mit 9 Phasen statt 9 unabhängiger Objekte, und der
+Export verschickt alle Phasen als nummerierte Serie.
+
+Gemessen an der Hub-Aufzeichnung (4264 Frames, 268 013 Einträge, **0 verworfen**):
+**1638 Objekte in 163 ms** — der alte Weg brauchte 4800 ms für ein schlechteres Ergebnis.
+Geometrie aller Phasen konsistent. Gerendert: Fackeln (9 Phasen), **wehende Piratenflagge**
+(6), Torhaus mit beiden Fackeln (8), Rauchwolken — jeweils vollständig und getrennt.
+
+**Aufgeräumt:** die Laufzeit-Toolbar verliert *Fenster*, *nach Palette trennen*,
+*Stapel zeigen*, *Einzelkacheln aus*, *nur 1. Phase* und den Palettenfilter — alles davon
+existierte nur, um die Rateverfahren zu bändigen. Übrig bleiben Gfxset, Größe,
+*nur zeichenbare* und *nur animierte*. Karten zeigen die Animation beim Überfahren.
+
+`sprpos` wird nur noch von der Schrift-Seite benutzt und kann entfallen, sobald diese
+ebenfalls auf OAM steht — sie läuft und ihre Kunst liegt im Container, deshalb bewusst
+nicht im selben Schritt angefasst.
+
+## [2026-08-03] — Laufzeit-Sprites: die Weltkarten-Schrift kommt in den Container
+
+Die Kartenschrift lief seit dem 31.07. in HD, aber **am Viewer vorbei**: erzeugt von zwei
+Wegwerf-Skripten, die Glyphen lagen ausschließlich im Pack-Ordner. Ein Ordner-Neuaufbau
+hätte sie gelöscht, und „nochmal upscalen" hätte bedeutet, die Skripte erneut zu schreiben.
+Dieser Eintrag holt den Weg in den Viewer.
+
+**Der Kern ist eine Beobachtung, keine neue Pipeline:** ein Wort von der Weltkarte
+(`KREM QUAY`) ist strukturell dasselbe wie ein Sprite-Frame — ein Bild plus eine Liste von
+(Hash, x, y)-Zellen. Es fehlte also nur eine neue *Quelle*, die in die vorhandene Kette
+einspeist, nicht ein zweiter Strang daneben.
+
+**Neu: Knopf „Laufzeit"** (Katalog-Toolbar) lädt `snes_hd_spritemiss.txt` (die Pixel:
+32 VRAM-Bytes + 16 CGRAM-Farben je Kachel) und `snes_hd_sprpos.txt` (die Positionen) —
+beide auf einmal, unterschieden **am Inhalt, nicht am Dateinamen**, weil beide Dateien
+über Sitzungen fortgeschrieben und dabei umbenannt/kopiert werden. Persistiert im
+vorhandenen IndexedDB-Store `recordings`, wie der Spritecap.
+
+**Die Gruppierung war die eigentliche Arbeit.** Drei Schritte, jeder als Antwort auf einen
+Defekt, der erst an den echten Aufzeichnungen sichtbar wurde (79 290 Positionszeilen):
+
+1. **Fenster über Frames.** sprpos dedupliziert über (hash,x,y) und lässt pro Frame die
+   Kacheln aus, deren VRAM sich mitten im Frame geändert hat (`SnesHdVideoFilter.cpp:1978`).
+   **Kein einziger Frame enthält daher ein ganzes Wort** — „GLOOMY GULCH" verteilt sich über
+   mehrere. Gruppierung pro Frame lieferte Fragmente wie `GU CH`.
+2. **Räumliches Clustern**, 8×8-Kästen die sich berühren. Erledigt nebenbei die 8×16-Schrift
+   ohne die alte (y, y+8)-Paarungsregel — genau die hatte am 31.07. den Apostroph und das
+   `V` aussortiert, weil Satzzeichen einzeilig sind.
+3. **Stapel trennen.** Zwei verschiedene Levelnamen an derselben Stelle innerhalb eines
+   Fensters überlagern sich zu Buchstabensalat. Ein sauberes Objekt hat nie zwei Kacheln auf
+   einer Position — wo doch, wird entlang von Lücken in den Frame-Nummern getrennt.
+
+**Zeit ist bewusst KEINE Cluster-Dimension.** Die Aufsplittung passiert *innerhalb* eines
+Wortes, eine Zeitbedingung zerlegt also Wörter statt sie zu trennen. Gemessen: 29 Objekte
+mit ⌀ 3,9 Kacheln gegen 15 mit ⌀ 6,2.
+
+Verifiziert **vor** dem Viewer-Code an den echten Daten (`scratchpad/final_algo.py`), danach
+die JS-Portierung gegen dieselben Daten gegengerechnet (`js_smoke.js`): beide liefern
+identisch **24 Objekte, die 63 Kartenschrift-Kacheln abdecken**; gerendert sind es lesbare
+Wörter (`MONKEY`, `TARGET`, `K.ROOL`, `CAULDRON`). 707 ms für 79 290 Positionen.
+
+**Neue Ansicht „⧉ Laufzeit"** in der Sprite-Galerie mit eigener Toolbar: Filter nach Gfxset
+und Palette, „nur zeichenbare", Stapel ein/aus, Einzelkacheln aus (die upscalen schlecht),
+und ein **Set-Cover-Vorschlag** — die kleinste Objektmenge, die jede sichtbare Kachel
+abdeckt. Ausdrücklich ein Vorschlag: die Auswahl bleibt frei änderbar, und ein Zähler sagt,
+wie viele Kacheln sie erreicht. Das **Fenster (30–600 Frames) ist einstellbar**, weil der
+beste Wert davon abhängt, wie schnell die Karte durchlaufen wurde.
+
+**Der Rundweg schließt sich:** SD-Export (`exportType: 'runtime'`, ein PNG je Objekt mit
+8 px Rand) → Upscale → `Import HD` misst die Skalierung **am Bild statt am Manifest** und
+schneidet sofort in hash-adressierte Kacheln → Container-Set `type:'spritemiss'` →
+Pack-Export nach `sprites/{hash16}_P{pal}.png`.
+
+Zwei Entscheidungen, die dabei bewusst anders sind als bei den Galerie-Sprites:
+- **Geschnitten wird beim Import, nicht beim Export.** Die Einheit ist die Kachel, nicht das
+  Objekt: derselbe Buchstabe steckt in vielen Wörtern, ganze Objekte zu speichern hieße,
+  ihn mehrfach abzulegen und offenzulassen, welche Kopie gilt.
+- **Die Palette kommt aus der Aufzeichnung, nicht aus dem Spritecap.** Die SPRMISS-Zeile
+  trägt sie mit. Damit hängt dieser Zweig nicht am Spritecap und kann nicht mangels
+  Aufzeichnung stillschweigend leer bleiben. Container-Import wie Pack-Export **mergen**,
+  damit die Schrift heute und der Schädelwagen nächsten Monat nebeneinander bestehen.
+
+### Nachtrag am selben Tag: S16 — der Positions-Recorder verlor systematisch Kacheln
+
+Der erste Viewer-Test zeigte Wörter mit **halben Buchstaben** (`ANTICS` ohne obere Hälfte
+von `C` und `S`, `FUNKY` ohne untere Hälfte des `Y`) und ein DK-Münz-Symbol, dem reihenweise
+eine **Ecke** fehlte. Die Objekte meldeten dabei `missing = 0` — die Kacheln fehlten also
+nicht an Pixeln, sondern **im Layout**: sie standen gar nicht erst in `sprpos`.
+
+**Ursache in Mesen, nicht im Viewer.** `SnesPpu::RenderSprites` (`SnesPpu.cpp:809`) hinterlegt
+die HD-Kachelinfo nur dort, wo `color != 0` — eine Sprite-Kachel existiert in `ScreenTiles`
+also ausschließlich an ihren **deckenden** Pixeln. S15 tastete ein 8-Pixel-Raster ab, pro
+Kachel genau einen Punkt; lag der auf einem transparenten Pixel, verschwand die Kachel
+spurlos. Das trifft zwangsläufig die dünnen Stellen: Buchstabenhälften ohne Tinte in der
+abgetasteten Zeile, und die Ecken runder Symbole, wo die Kunst leer ist.
+
+**S16** tastet jeden Pixel ab und meldet den **Kachelursprung statt des Abtastpunkts** —
+`OffsetX/OffsetY` sind der Versatz innerhalb der 8×8-Kachel, also ist der Ursprung
+`(px - OffsetX, py - OffsetY)`. Dedup über `(hash, originX, originY)`: damit ist gleichgültig,
+welcher Pixel getroffen wurde, und das Volumen bleibt bei etwa einer Zeile je Kachelinstanz.
+
+Der Viewer erkennt eine Aufzeichnung im alten Rasterformat an ihrer Signatur (alle x auf
+Vielfachen von 8, alle y auf demselben Rest) und sagt beim Laden, dass neu aufgezeichnet
+werden muss — **die alte Datei vorher löschen**, Mesen hängt an.
+
+### Zweiter Testlauf: Animationen, Überlappungen, und der Weg als Klumpen
+
+Mit S16 waren die Buchstaben vollständig. Der Test zeigte drei weitere Fälle, die alle
+denselben Kern haben — **mehrere Dinge im selben Bildbereich**:
+
+1. **Animierte Objekte lagen übereinander** (Fackeln, Bienen, Rauchwolken, Krokodilmaul,
+   Klubba-Symbol). Ein animiertes Sprite bemalt dieselben Positionen mit wechselndem Inhalt;
+   im Fenster stapeln sich damit alle Phasen. Zeit trennt sie nicht — die Phasen liegen
+   wenige Frames auseinander, enger als ein einzelnes Wort sich verteilt.
+   **Neu `rtSplitPhases`:** Kacheln in der Reihenfolge ihres ersten Auftretens in Schichten
+   legen, jede Kachel in die erste Schicht, in der sie nichts überlappt und nicht lange nach
+   deren letztem Eintrag kommt. **Schicht 0 ist damit das Objekt, wie es zuerst erschien** —
+   in sich stimmig und vollständig, und genau das genügt der Pipeline. Toolbar-Schalter
+   „nur 1. Phase" (Standard an), Karten zeigen `▶1/3`.
+2. **Zwei Levelnamen überlappten sich, ohne dieselbe Position zu belegen.** Seit S16 sind die
+   Koordinaten echte Kachelursprünge, zwei Namen an fast derselben Stelle liegen also wenige
+   Pixel versetzt — der alte Stapeltest auf *identische* Position sah nichts. Er prüft jetzt
+   **Überlappung** (`|dx| < 8 && |dy| < 8`): zwei Kacheln EINES Objekts bedecken nie dieselben
+   Pixel, Überlappung heißt also immer „zwei Dinge übereinander".
+3. **Der Kartenweg verschluckte die Levelnamen.** Die Pfad-Sprites liegen lückenlos
+   aneinander, reine Adjazenz kettet damit den halben Schirm zu einem Klumpen — und der
+   Levelname obendrauf verschwand darin. **Geclustert wird jetzt innerhalb einer Palette:**
+   eine OBJ-Kachel hat genau eine, die Schrift sitzt auf P6, der Weg nicht.
+   Ergebnis: die Abdeckung der Kartenschrift stieg von **72 auf 95 von 96 Kacheln**.
+
+Gemessen an der echten S16-Aufzeichnung: 3897 Objekte aus 60 006 Positionen in 638 ms,
+**0 nicht trennbare Stapel**, 18 Objekte decken die Schrift ab (⌀ 7,1 Kacheln, breitestes
+104 px). Gerendert sind es geschlossene Wörter — `BONUS BONANZA`, `KROCODILE`, `SWANKY'S`,
+`KREMLAND`, `TOPSAIL` — und das DK-Symbol **einmal vollständig**.
+
+Nebenbefund aus derselben Messung: die Datei hatte exakt 60 006 Zeilen, also den
+Recorder-Deckel. Die Aufzeichnung brach mitten im Kartenlauf ab, spätere Karten waren nur
+teilweise erfasst. **Deckel auf 200 000 angehoben** (~14 MB).
+
+### Nachhaltigkeit: die Schrift als Ground Truth statt als Fundstück
+
+Bis hierher war jeder Durchlauf Laufzeit-Archäologie: ablaufen, hinschauen, hoffen. Das
+muss er nur EINMAL sein — die Kartenschrift ist eine **geschlossene Menge** (28 Glyphen plus
+Satzzeichen, dieselben Kacheln auf allen Karten), und sie ist **überprüfbar**, weil die
+Levelnamen im Klartext lesbar sind. Was fehlte, war das Speichern.
+
+**Neu `font_groundtruth.js`** nach dem Muster von `vram_groundtruth.js`: `Zeichen →
+(oberer Hash, unterer Hash)`. 28 Glyphen aus der Sitzung vom 31.07., dazu zwei heute
+**aus dem Kontext abgeleitet** statt geraten:
+
+- **`'`** = `E7B7C0F1CBBEE6C1`, einzeilig — steht in `SWANKY?S`, `LUBBA?S`, `KROW?S`,
+  `JAW?S`, `OL?S`, `Y?S`. Sechs unabhängige Genitiv-Kontexte lassen nichts anderes zu.
+- **`-`** = `BCF61FDA52C9D363`/`AF750CD8D7718ED8` — `HOT?H` ist HOT-HEAD HOP.
+
+Beide waren am 31.07. **von Hand** ins Pack nachgeliefert worden, ohne dass jemals notiert
+wurde, welches Zeichen welcher Hash ist. Jetzt steht es fest.
+
+**`rtReadObjectText()`** liest ein Objekt als Text: erst nach y in Zeilen trennen (ein
+Objekt kann `MONKEY MUSEUM` zweizeilig tragen), dann Spalten von 1–2 Kacheln nachschlagen.
+Erkennt es weniger als die Hälfte, schweigt es — auf Palette 6 liegen auch die Kong-Köpfe,
+und eine Reihe `?` ist keine Information. Die Karten tragen damit **Namen statt Kachelzahlen**.
+
+**Knopf „🔤 Schrift-Status"** beantwortet „bin ich fertig?", ohne irgendetwas nachzuspielen:
+je Glyphe aufgezeichnet/HD, alle gelesenen Namen, unbekannte Glyphen **mit dem Wort, in dem
+sie stehen** (damit ist die nächste Zuordnung wieder eine Ableitung, keine Rateübung), und
+welche Karten und Shops der Recorder nie gesehen hat — letzteres aus `OVERWORLD_SETS`
+und der Aufzeichnung selbst, ohne erfundene Levelnamen-Liste.
+
+Gegen die echte S16-Aufzeichnung geprüft: **96 Namen gelesen** (`GANGPLANK`, `CROCODILE`,
+`KREMLAND`, `SWANKY'S`, `LOCKER!`, `KARNAGE!`, `TARGET`, `SHOWDOWN` …), nur noch
+**4 unbekannte Glyphen-Vorkommen** statt über 20. Damit wird aus „alle Level ablaufen"
+eine gezielte Restliste.
+
+### HD-Anzeige, Aufräumen, und die drei restlichen Objekte
+
+**Die HD-Kunst ist jetzt im Viewer sichtbar.** Die Schrift-Seite zeichnet wahlweise die
+Kacheln aus dem Container statt der aufgezeichneten SD-Kacheln („HD zeigen", Standard an);
+wo noch keine HD-Kachel liegt, bleibt die SD-Version stehen und das Wort bekommt einen
+orangen Rahmen — man sieht also sofort, was fertig ist. Die Blobs werden einmal dekodiert
+und zwischengespeichert.
+
+**Absturz behoben.** `renderRuntimeObject` legte **pro Kachel ein Canvas-Element** an (über
+1× sogar zwei). Beim Abschalten von „nur 1. Phase" vervielfacht sich die Objektzahl um die
+Animationslänge — die Galerie erzeugte zehntausende Canvases und der Browser stand.
+Jetzt ein Canvas je Objekt mit direkt geschriebenen Pixeln, Zoom über CSS. Dazu Kartenlimit
+2000 → 400 und `rtCoveredKeys()` aus der Kartenschleife gehoben (wurde 2000× neu gebaut).
+
+**Die Schrift-Seite lädt selbst.** Sie prüfte `runtimeObjects` — also die Gruppierung des
+*Laufzeit*-Reiters — statt der Aufzeichnung, und blieb deshalb leer, wenn man direkt auf
+Schrift ging. Sie fragt jetzt die Aufzeichnung ab und baut ihre eigene Gruppierung.
+
+**🧹 Aufräumen** wirft aus der gespeicherten Aufzeichnung alles heraus, was dieser
+Workstream nicht braucht. Ein Schirm bleibt, wenn er ein bekannter Karten-/Shop-Gfxset ist
+**oder Kartenschrift enthält** — die zweite Regel rettet die Karten ohne HD-Kunst, die
+`gfx=-1` melden und sonst wie Spielszenen aussähen (genau von so einem Schirm kam das V).
+Gemessen: Positionen 260 019 → 76 603, Kacheln 51 510 → 2 996, Gruppieren 4779 → 950 ms,
+weiterhin 106 lesbare Wörter. **Achtung:** der Schädelwagen lebt in einer Spielszene und
+würde dabei verworfen — die Dateien in Downloads bleiben unangetastet.
+
+**Das V ist gefunden** — in `CLAPPER'S CAVERN` (K. Rool's Keep, nicht Gloomy Gulch, wie ich
+zuerst behauptet hatte). Nicht über gelesene Wörter, sondern über die Kacheln: die Zeile las
+sich `C L _ P _ E R … C _ V _ R N`, C/R/N sitzen passend und das erste C hat denselben Hash
+wie das C von CAVERN. Gerendert ein eindeutiges V. **31 Glyphen — das Alphabet ist komplett.**
+Weil seine Nachbarn nie aufgezeichnet wurden, steht das V isoliert; deshalb neu: **Zeichen
+ohne Beispielwort werden einzeln als 8×16-Glyphe exportiert** statt zu fehlen.
+
+**Die drei restlichen Objekte sind alle in den Daten** — es fehlten nur die Einstellungen,
+um sie zu finden. Nachgerendert und bestätigt:
+
+| Objekt | Fenster | Palettentrennung | Filter |
+|---|---|---|---|
+| Lost-World-Steinweg | 120 | aus | G61, Palette 7, 1. Phase |
+| Fackeln / Kartenanimationen | 120 | aus | Karten-Gfxset, Größe ≤ 32 px |
+| Schädelwagen | **1** | aus | G-1, Palette 4, 1. Phase |
+
+Dafür zwei neue Bedienelemente: **Fenster 1** („bewegte Objekte" — ein bewegtes Sprite ist in
+einem einzelnen Frame vollständig, weil jeder Frame ihm neue Ursprünge gibt; ein statisches
+braucht dagegen das Fenster) und ein **Größenfilter**, weil Fackeln 16×16 sind und zwischen
+bildschirmgroßen Klumpen sonst untergehen.
+
+### Eine Seite statt einer Werkzeugkiste
+
+Rückmeldung nach dem Test: „aufgeblasen und nicht leicht verständlich". Zu Recht — für die
+Schrift, eine abgeschlossene Sache, gab es nur den allgemeinen Objekt-Browser mit sechs
+Filtern. **Neuer Reiter „🔤 Schrift"** mit genau zwei Abschnitten:
+
+1. **Das Alphabet**, alphabetisch, jedes Zeichen gerendert, farbcodiert: grün = HD-Kunst im
+   Container, orange = aufgezeichnet aber noch SD, rot = in der Aufzeichnung nicht enthalten.
+2. **Die Beispielwörter für den Upscale** — die kleinste Auswahl, die jedes erfasste Zeichen
+   mindestens einmal zeigt, mit Bild und gelesenem Text. Der Export-Knopf verschickt **genau
+   diese** Wörter, es gibt nichts einzustellen.
+
+Dazu die Klarstellung, warum der Palettenfilter „nicht funktionierte": **die Kong-Köpfe
+liegen selbst auf Palette 6.** Die Palette trennt Text nicht von Nicht-Text — was das tut,
+ist die Frage, ob die Glyphentabelle das Objekt LESEN kann. Genau das ist jetzt das Kriterium.
+
+Ein Zählfehler dabei gefunden: die DK-Symbole heißen `[DK1]`/`[DK2]`, ein Zeichenlauf zerlegte
+sie in `[`,`D`,`K`,`1`,`]`. Wird jetzt tokenisiert.
+
+Ergebnis an der echten Aufzeichnung: **alle 30 Zeichen erfasst, 12 Wörter decken sie
+vollständig ab** — `KROCODILE`, `SWANKY'S`, `GANGPLANK`, `LUBBA'S`, `HOT-H`, `A![DK1][DK2]`,
+`MUDHO`, `KRAZY`, `FLYIN`, `JAW'S`, `QU`, `X`. Nichts bleibt offen.
+
+Im Zuge dessen entfernt: „Aa Schrift-Filter", „🔤 Schrift-Status" und die 102-zeilige
+`reportFontCoverage` — die Seite ersetzt sie. Der Hinweis auf nie besuchte Schirme steht
+jetzt unten auf der Schrift-Seite, und nur solange oben noch etwas rot ist.
+
+### Nachbesserung nach dem Test: die Restliste muss man auch SEHEN
+
+Der Schrift-Status war richtig gerechnet und trotzdem unbrauchbar — die Liste ging in die
+**Konsole**, in die Meldung nur Zahlen. Eine Restliste, die niemand sieht, ist keine.
+Jetzt schreibt er in eine **Anzeige in der Seite**: nie aufgezeichnete Zeichen, aufgezeichnete
+aber noch SD (die eigentliche Upscale-Restmenge), Zeichen ohne Tabelleneintrag **mit dem Wort,
+in dem sie stehen**, und die Schirme, auf denen der Recorder nie war.
+
+Zwei weitere Punkte aus demselben Test:
+
+- **„Auswahl vorschlagen" war undurchschaubar.** Es rechnete ein Set-Cover über die gerade
+  *sichtbaren* Objekte — ohne gesetzten Filter also über alle Gfxsets und Paletten, weshalb
+  vor allem Kong-Köpfe vorgeschlagen wurden. Und es deckte auch Kacheln ab, die **längst
+  HD sind**. Jetzt heißt es **„✨ Offenes vorschlagen"** und überspringt, was der Container
+  schon hat; das Ergebnis erscheint als Liste mit den gelesenen Namen statt als
+  Konsolenzeile. Dazu **„Aa Schrift-Filter"**: ein Klick stellt Palette 6, nur zeichenbare,
+  nur 1. Phase, keine Einzelkacheln — damit der Vorschlag die Schrift meint und nicht alles.
+- **Unbeschriftete Karten auf Palette 6 erklären sich jetzt selbst** („? nicht in der
+  Schrifttabelle"). Es sind entweder Zeichen ohne Tabelleneintrag oder schlicht kein Text —
+  die Kong-Köpfe liegen auf derselben Palette.
+
+Was der Bericht mit der echten Aufzeichnung sagt: **alle 30 Glyphen sind aufgezeichnet**,
+96 Namen gelesen, 4 Vorkommen ohne Tabelleneintrag, und **8 Schirme nie besucht**
+(Cranky, Wrinkly, Swanky, Klubba, Krem Quay, Gloomy Gulch, K. Rool's Keep, The Flying Krock).
+
+### Zwei Bugs, die auf dem Weg gefunden wurden
+
+- **Der Container-ZIP-Roundtrip verlor Sprite-Metadaten.** `exportContainerAsZip` schrieb für
+  Sprite-Sets nur `type/setId/animId/name/frameCount` + die Frame-PNGs; `meta`
+  (offsetX/offsetY/**tiles[]**) und `scaleFactor` fielen heraus, der Re-Import stellte sie
+  nicht her. Die Frames überlebten als Bilder, aber **ohne die Zuordnung Frame→Kachel lassen
+  sie sich nie wieder ins Pack schneiden** — das ZIP-Backup war für Sprites also stumm
+  unvollständig. Der IndexedDB-Pfad persistierte `meta` längst, nur dieser Weg nicht.
+  Beide Seiten gefixt; ein ZIP ohne `meta` (alter Export) wird jetzt beim Import laut benannt,
+  statt erst am Ende eines langen Pack-Exports aufzufallen.
+- **„☑ Sichtbare wählen" leerte die Sprite-Galerie.** Die Auswahl-Knöpfe tragen die Klasse
+  `cat-btn` nur wegen der Optik, haben aber kein `data-cat`. Der Kategorie-Handler lief für
+  sie mit und setzte `activeCatFilter = undefined`, wonach jeder Kategorievergleich fehlschlug.
+  Der Selektor greift jetzt nur noch auf `.cat-btn[data-cat]`.
+
 ## [2026-07-31] — CHR-Animationen auf Weltkarten und in Shops
 
 Lost Worlds Rauchsäule war der letzte sichtbar in SD verbliebene Teil der Weltkarten. Die
