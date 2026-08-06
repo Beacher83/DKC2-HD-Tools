@@ -1,5 +1,107 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-06] — Parser gegen echte S18-Aufzeichnungen geprüft, toter sprpos-Block entfernt
+
+### Die Kopfzeilen-Änderung ist jetzt belegt, nicht mehr nur plausibel
+
+Die fünf Parser wurden **wörtlich aus `index.html` geschnitten** (Klammerzähler, der Strings,
+Kommentare und Regex-Literale überspringt) und in Node gegen die echten Aufzeichnungen des
+S18-Builds laufen gelassen — getestet ist damit der Code, der im Browser läuft, nicht eine
+Kopie davon. Skripte im Scratchpad: `viewer_check.js`, `line_budget.js`, `syntax_check.js`.
+
+| Datei | Größe | Ergebnis |
+|---|---|---|
+| `snes_hd_spritecap.txt` | 60,0 MB | 401 001 Zeilen, 35 963 Hashes, **0 verworfen** |
+| `snes_hd_bgcap.txt` | 3,5 MB | 21 886 Zeilen, 5476 distinkte Tiles, **0 verworfen** |
+| `snes_hd_spritemiss.txt` | 30,2 MB | 185 482 Zeilen, 52 531 (hash,pal), **0 verworfen** |
+| `snes_hd_sprpos.txt` | 87,0 MB | 1 277 327 Positionen, **0 verworfen** |
+| `snes_hd_oam.txt` | 197,7 MB | 66 628 Frames, 2 796 160 Einträge, **0 verworfen** |
+
+**Der stärkere Beweis ist die Zeilenbilanz:** gelesen + verworfen + Dubletten + Kopfzeilen +
+Leerzeilen == Zeilen der Datei, und das geht in **allen fünf** exakt auf. Bei OAM etwa
+66 628 + 2 796 160 + 1 = 2 862 789. Damit ist nicht nur „nichts fälschlich verworfen" gezeigt,
+sondern auch „nichts stillschweigend geschluckt" — die schwächere Aussage hätte ein Parser,
+der Zeilen kommentarlos überspringt, ebenfalls erfüllt.
+
+### Der tote sprpos-Gruppierungsblock ist raus (−141 Zeilen)
+
+Nach dem Ausbau von `rebuildRuntimeObjects` (05.08.) blieben sieben Bausteine als geschlossene
+Insel liegen: `RT_FRAME_WINDOW`, `RT_FRAME_GAP`, `rtClusterSpatial`, `rtOverlaps`, `rtHasStack`,
+`rtSplitPhases`, `rtSplitStacks`. `rtSplitStacks` rief nur noch sich selbst; von außen kam
+niemand mehr rein.
+
+**Wofür der Pfad da war:** die Objekterkennung der sprpos-Ära. `sprpos` schrieb jede Kachel nur
+einmal je Sitzung, kein Frame war je vollständig — Objekte mussten aus Nachbarschaft und einem
+Zeitfenster *geraten* werden. Drei Schritte, von denen zwei nur die Nebenwirkung des ersten
+aufräumten: das 120-Frame-Fenster setzte Wörter zusammen (`GU CH` → `GULCH`), stapelte dabei
+aber zwei Levelnamen an derselben Stelle und jede Animationsphase einer Fackel auf alle
+anderen — und `rtHasStack`/`rtSplitPhases`/`rtSplitStacks` nahmen das wieder auseinander.
+S17 hat die Grundlage weggezogen: ein OAM-Eintrag **ist** ein Objekt, jeder Frame ist
+vollständig. Eine Notiz im Code hält fest, warum der Block weg ist.
+
+Geprüft nach dem Eingriff: Syntaxprüfung aller `<script>`-Blöcke über `vm.Script` (kompiliert,
+führt nichts aus) und eine Restsuche über alle sieben Namen plus `runtimeObjects` —
+Treffer nur noch in Kommentaren. **CRLF wurde erhalten**, sonst hätte der Diff die ganze Datei
+als geändert gezeigt.
+
+### Nebenbefund für den nächsten Workstream
+
+`buildOamObjects()` schreibt `fontObjectsCache` bevor dessen `let`-Deklaration im Quelltext
+steht. Das ist unkritisch — alle Aufrufer sitzen in Handlern, keiner läuft beim Seitenaufbau,
+die temporale Totzone wird also nie berührt. Notiert, damit es bei einer künftigen Umsortierung
+nicht übersehen wird.
+
+## [2026-08-05d] — Die Schrift-Seite läuft auf OAM, die sprpos-Gruppierung ist weg
+
+Aufräum-Bestandsaufnahme über die acht Recorder-Dateien. Ergebnis der Zählung:
+
+| Datei | Größe | Leser |
+|---|---|---|
+| `oam` | 180,8 MB | Viewer (Objektmodell seit S17) |
+| `sprpos` | 87,0 MB | **nur noch die Schrift-Seite** |
+| `spritecap` | 58,6 MB | Viewer (Sprite-Paletten) |
+| `spritemiss` | 29,7 MB | Viewer (liefert die Pixel) |
+| `bgcap` | 3,5 MB | Viewer + Diagnose |
+| `cgramcap` | 3,1 MB | **niemand** |
+| `diag` / `context` | 0,3 MB / winzig | niemand im Code — aber die Menschen |
+
+**Korrektur einer früheren Behauptung:** ich hatte `sprpos` als „Ergebnis ungenutzt" geführt.
+Für die Galerie stimmte das, für die Schrift-Seite nicht — `fontObjects()` rief
+`rebuildRuntimeObjects({ pinned, splitByPal, window: 120 })` und das waren die 3836 ms pro Laden.
+
+**Migriert:** `fontObjects()` leitet seine Objekte jetzt aus `oamObjects` ab. Eine Eigenschaft
+des alten Pfades musste nachgebaut werden — `splitByPal`: ein Levelname liegt auf Palette 6,
+aber ein OAM-Indexlauf kann mehrere Paletten tragen (ein Name direkt neben einem Kong-Kopf
+landet im selben Lauf), und `rtTextObjects` verwirft alles mit mehr als einer Palette. Jedes
+Objekt wird deshalb auf seine P6-Zellen zurechtgeschnitten, mit Neu-Verankerung der
+Koordinaten — sonst trüge die Leinwand die Lücke der anderen Palette und der Leser sähe
+Phantom-Leerzeichen zwischen den Buchstaben.
+
+**Danach war `rebuildRuntimeObjects` ohne Aufrufer** — 107 Zeilen tote Gruppierung samt
+`runtimeObjects` entfernt. Der sprpos-**Loader** bleibt vorerst, damit vorhandene Aufzeichnungen
+weiter laden; er fällt, sobald Mesen aufhört, die Datei zu schreiben.
+
+Nebenbei: `buildOamObjects()` leert jetzt `fontObjectsCache`, sonst läse eine frische
+Aufzeichnung noch durch den alten Cache.
+
+**Vom User bestätigt:** Schrift-Reiter meldet `31/31 Zeichen erfasst · 31 in HD`. Die Wortliste
+ist dünner geworden (23 P6-Objekte aus 1638), aber das liegt an der **Aufzeichnung**, nicht am
+Umbau: die vorhandene OAM-Datei ist im Wesentlichen der Hub, wo immer nur ein Levelname
+gleichzeitig steht. Die alte `sprpos`-Datei stammte aus einem Durchgang über alle Weltkarten
+(71 263 Zeilen → 67 Textzeilen). Für einen künftigen Schrift-Upscale braucht es entsprechend
+eine OAM-Aufzeichnung über alle Karten — kein Codethema.
+
+### Parser vertragen die Sitzungs-Kopfzeilen von Mesen S18
+
+Mesen S18 stempelt beim Öffnen jeder Recorder-Datei eine `=== SESSION … ===`-Zeile, damit sich
+die Sitzungen im angehängten Log auseinanderhalten lassen. Alle fünf Parser (`parseSpriteCap`,
+`parseBgCap`, `parseSpriteMiss`, `parseSprPos`, `parseOam`) überspringen sie jetzt — sonst
+hätten sie sie als verworfene Zeilen gezählt und die Statistik verfälscht.
+
+Der `sprpos`-**Loader** bleibt bewusst erhalten, obwohl Mesen die Datei nicht mehr schreibt:
+vorhandene Aufzeichnungen sollen weiter ladbar sein. Er fällt erst, wenn feststeht, dass die
+alte Datei nicht mehr gebraucht wird.
+
 ## [2026-08-05c] — Der Pack-Export las Tilemaps > 32 Kacheln falsch
 
 Lockjaws Schiffswand kam in Mesen in HD an, aber **falsch angeordnet** — die Kunst war im

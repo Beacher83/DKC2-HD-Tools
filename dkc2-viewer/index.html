@@ -8029,6 +8029,7 @@ function parseSpriteCap(text) {
   const map = new Map();
   let lines = 0, bad = 0;
   for (const line of text.split('\n')) {
+    if (line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (Mesen S18)
     const m = line.match(/^SPR ([0-9A-F]{16}) P(\d) T([0-9A-F]{64}) C([0-9A-F]{64})/);
     if (!m) { if (line.trim()) bad++; continue; }
     lines++;
@@ -8070,7 +8071,7 @@ function parseBgCap(text) {
   const hashAddrKeys = new Map(); // hash -> Set(addrKey it was seen at)
   for (const raw of text.split('\n')) {
     const line = raw.trim().toUpperCase();
-    if (!line) continue;
+    if (!line || line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (S18)
     const m = line.match(/^BGA G(-?\d+) L(\d+) P(\d+) A([0-9A-F]+) H([0-9A-F]{16}) T([0-9A-F]+) C([0-9A-F]+)$/);
     if (!m) { bad++; continue; }
     const layer = parseInt(m[2]);
@@ -8166,7 +8167,7 @@ function parseSpriteMiss(text) {
   const perGfx = new Map();
   for (const raw of text.split('\n')) {
     const line = raw.trim().toUpperCase();
-    if (!line) continue;
+    if (!line || line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (S18)
     const m = line.match(/^SPRMISS ([MS]) P(\d+) O(\d+) G(-?\d+) H([0-9A-F]{16}) T([0-9A-F]{64}) C([0-9A-F]{64})$/);
     if (!m) { bad++; continue; }
     const bytes = new Uint8Array(32);
@@ -8200,7 +8201,7 @@ function parseSprPos(text) {
   const perGfx = new Map();
   for (const raw of text.split('\n')) {
     const line = raw.trim().toUpperCase();
-    if (!line) continue;
+    if (!line || line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (S18)
     const m = line.match(/^SPRPOS G(-?\d+) S([0-9A-F]{16}) F(\d+) X(\d+) Y(\d+) P(\d+) ([MS]) H([0-9A-F]{16})$/);
     if (!m) { bad++; continue; }
     lines++;
@@ -8280,7 +8281,7 @@ function parseOam(text) {
   const perGfx = new Map();
   for (const raw of text.split('\n')) {
     const line = raw.trim();
-    if (!line) continue;
+    if (!line || line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (S18)
     if (line.startsWith('OAMF ')) {
       const m = line.match(/^OAMF G(-?\d+) S([0-9A-F]{16}) F(\d+) M(\d+) N(\d+)$/);
       if (!m) { bad++; cur = null; continue; }
@@ -8353,6 +8354,9 @@ function oamGroupByRun(ents) {
 let oamObjects = null;
 
 function buildOamObjects() {
+  // The font page derives its objects from these, so its cache has to go with
+  // them — otherwise a fresh recording would still be read through the old one.
+  fontObjectsCache = null;
   if (!oamFrames || !oamFrames.length) { oamObjects = null; return null; }
   const t0 = performance.now();
 
@@ -8467,254 +8471,26 @@ function buildOamObjects() {
 }
 
 // ============================================================
-// Grouping runtime tiles into OBJECTS (words, carts, torches)
+// Grouping runtime tiles into OBJECTS — entfernt am 2026-08-06
 // ============================================================
-// An isolated 8x8 fragment upscales badly; a whole word upscales well. So the
-// captured tiles have to be reassembled into the things they belong to before
-// anything is handed to the upscaler.
+// Hier stand die Objekterkennung der sprpos-Ära: ein 120-Frame-Fenster
+// (RT_FRAME_WINDOW), räumliches Clustern über Union-Find (rtClusterSpatial) und
+// vier Helfer (rtOverlaps/rtHasStack/rtSplitPhases/rtSplitStacks), die den
+// Stapelschaden wieder aufräumten, den das Fenster selbst erst anrichtet.
 //
-// Three steps, each of them answering a defect found in the real recordings
-// (verified against snes_hd_sprpos.txt, 79 290 lines, in scratchpad/final_algo.py):
+// Nötig war das alles, weil sprpos jede Kachel nur EINMAL je Sitzung schrieb —
+// kein Frame war je vollständig, Objekte mussten aus Nachbarschaft und einem
+// Zeitfenster geraten werden. Genau daher kam die Piratenflagge, die bei
+// Fenster 120 da war und bei 600 verschwand.
 //
-//  1. MERGE A FRAME WINDOW per (gfxset, VRAM signature). sprpos dedups over
-//     (hash,x,y) and skips tiles whose live VRAM no longer matches mid-frame
-//     (SnesHdVideoFilter.cpp:1978), so NO single frame holds a whole word —
-//     "GLOOMY GULCH" arrives spread over a handful of consecutive frames.
-//     Grouping per frame produced fragments like "GU CH".
-//  2. CLUSTER SPATIALLY: 8x8 boxes that touch or overlap belong together. This
-//     also handles the 8x16 letters (two tiles above each other) without the
-//     y/y+8 pairing rule that used to drop single-row punctuation like the
-//     apostrophe.
-//  3. SPLIT STACKS. Two different level names shown at the SAME spot inside one
-//     window overlay each other into garble. A clean object never has two tiles
-//     at one (x,y) — where it does, split the cluster along gaps in frame
-//     numbers and re-cluster the parts.
+// S17 hat die Grundlage weggezogen: ein OAM-Eintrag IST ein Objekt (8x8-64x64,
+// vom Spiel so definiert) und jeder Frame ist vollständig. Siehe
+// buildOamObjects() weiter oben — 2285 Objekte in ~250 ms, wo der geratene Weg
+// 4800 ms für ein schlechteres Ergebnis brauchte.
 //
-// Time is deliberately NOT used as a clustering dimension: the splitting happens
-// WITHIN a word, so a time constraint fragments words instead of separating them
-// (measured: 29 objects averaging 3.9 tiles, against 15 averaging 6.2).
-
-// 120 is what measured best on the real recordings (scratchpad/window_test.py):
-// per-frame grouping gave fragments like "GU CH", 600 started merging different
-// names. Adjustable in the toolbar because it depends on how the session was
-// played — a slow pass over the map wants a wider window than a quick one.
-let RT_FRAME_WINDOW = 120;    // frames merged to reassemble one word
-const RT_FRAME_GAP = 30;      // frame gap that separates two different names
-let runtimeObjects = null;    // Array<{id, gfx, tiles:[{x,y,pal,hash}], w, h, stacked, missing, seen}>
-
-// Union tiles whose 8x8 boxes touch or overlap. tiles: [{x,y,pal,hash,frame}]
-function rtClusterSpatial(tiles) {
-  const n = tiles.length;
-  const parent = new Int32Array(n);
-  for (let i = 0; i < n; i++) parent[i] = i;
-  const find = (a) => { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
-  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
-  const buckets = new Map();
-  for (let i = 0; i < n; i++) {
-    const k = `${tiles[i].x >> 3},${tiles[i].y >> 3}`;
-    if (!buckets.has(k)) buckets.set(k, []);
-    buckets.get(k).push(i);
-  }
-  for (const [k, idxs] of buckets) {
-    const [bx, by] = k.split(',').map(Number);
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        const other = buckets.get(`${bx + dx},${by + dy}`);
-        if (!other) continue;
-        for (const i of idxs) for (const j of other) {
-          if (i === j) continue;
-          if (Math.abs(tiles[i].x - tiles[j].x) <= 8 && Math.abs(tiles[i].y - tiles[j].y) <= 8) union(i, j);
-        }
-      }
-    }
-  }
-  const groups = new Map();
-  for (let i = 0; i < n; i++) {
-    const r = find(i);
-    if (!groups.has(r)) groups.set(r, []);
-    groups.get(r).push(tiles[i]);
-  }
-  return [...groups.values()];
-}
-
-// Two tiles of ONE object never cover the same pixels — sprite tiles tile the
-// object, they do not sit on each other. Overlap therefore means two different
-// things got superimposed. Testing OVERLAP rather than an identical position
-// matters because since S16 the coordinates are true tile origins: two level
-// names at nearly the same spot are a few pixels apart, so they overlap
-// visually while occupying no single identical position.
-function rtOverlaps(a, b) { return Math.abs(a.x - b.x) < 8 && Math.abs(a.y - b.y) < 8; }
-
-function rtHasStack(grp) {
-  for (let i = 0; i < grp.length; i++) {
-    for (let j = i + 1; j < grp.length; j++) if (rtOverlaps(grp[i], grp[j])) return true;
-  }
-  return false;
-}
-
-// An ANIMATED sprite (torch, bee, crocodile mouth, smoke) redraws the same
-// positions with different content every few frames. Inside one window that
-// stacks every phase on top of every other, which is what made the torches show
-// up as a pile of overlaid images.
-//
-// Time cannot separate them — the phases are only a few frames apart, closer
-// than the spread of a single word. But POSITION can: sort each position's
-// candidates by frame and take the k-th of each, and phase k falls out whole.
-// Phase 0 (the earliest sighting per position) is the object as it first
-// appeared, so it is coherent and complete — which is all the pipeline needs.
-function rtSplitPhases(grp) {
-  // Walk the tiles in the order they were first seen and drop each into the
-  // first layer where it neither overlaps anything nor arrives long after that
-  // layer was last written to. Layer 0 is therefore the object as it FIRST
-  // appeared: coherent, overlap-free, complete — which is all the pipeline
-  // needs. Later layers are the remaining animation phases.
-  const sorted = [...grp].sort((a, b) => a.frame - b.frame);
-  const layers = [];
-  for (const t of sorted) {
-    let placed = false;
-    for (const L of layers) {
-      if (t.frame - L.lastFrame > RT_FRAME_GAP) continue;
-      if (L.tiles.some(u => rtOverlaps(u, t))) continue;
-      L.tiles.push(t); L.lastFrame = t.frame; placed = true; break;
-    }
-    if (!placed) layers.push({ tiles: [t], lastFrame: t.frame });
-  }
-  return layers.map((L, k) => ({ tiles: L.tiles, phase: k, phaseCount: layers.length }));
-}
-
-// Separate a stacked cluster. Two causes, two remedies, in this order:
-//   1. Two different things shown at the same spot far apart in time (two level
-//      names at one map position) — split along gaps in frame numbers.
-//   2. Otherwise it is an animation cycling in place — split by phase.
-// Returns [{tiles, phase, phaseCount}]; phase is null when no phase split ran.
-function rtSplitStacks(grp, depth) {
-  depth = depth || 0;
-  if (!rtHasStack(grp)) return [{ tiles: grp, phase: null, phaseCount: 1 }];
-  if (depth > 4) return rtSplitPhases(grp);
-  const frames = [...new Set(grp.map(t => t.frame))].sort((a, b) => a - b);
-  const runs = [];
-  let cur = [frames[0]];
-  for (let i = 1; i < frames.length; i++) {
-    if (frames[i] - cur[cur.length - 1] > RT_FRAME_GAP) { runs.push(cur); cur = []; }
-    cur.push(frames[i]);
-  }
-  runs.push(cur);
-  if (runs.length === 1) return rtSplitPhases(grp);
-  const out = [];
-  for (const run of runs) {
-    const lo = run[0], hi = run[run.length - 1];
-    const part = grp.filter(t => t.frame >= lo && t.frame <= hi);
-    for (const sub of rtClusterSpatial(part)) out.push(...rtSplitStacks(sub, depth + 1));
-  }
-  return out;
-}
-
-// opts lets a caller pin the two knobs instead of reading the toolbar. The font
-// page uses that: it ALWAYS needs the palette split (otherwise the map's path
-// sprites chain into the level name) and must not change behaviour because
-// someone unticked a box for the torches.
-function rebuildRuntimeObjects(opts) {
-  if (!(opts && opts.pinned)) fontObjectsCache = null;   // new settings/recording
-  if (!sprPosEntries || sprPosEntries.length === 0) { runtimeObjects = null; return null; }
-  const t0 = performance.now();
-  // The only caller left is the font page, which pins both knobs; the toolbar
-  // controls that used to feed them are gone with the OAM rewrite.
-  const pinned = !!(opts && opts.pinned);
-  RT_FRAME_WINDOW = (opts && opts.window) || 120;
-  const splitByPal = (opts && 'splitByPal' in opts) ? opts.splitByPal : true;
-
-  // Bucket positions per screen, then into runs of frames within the window.
-  const bySig = new Map();
-  for (const e of sprPosEntries) {
-    const k = `${e.gfx}|${e.sig}`;
-    if (!bySig.has(k)) bySig.set(k, []);
-    bySig.get(k).push(e);
-  }
-
-  const objects = new Map();   // signature -> object
-  let stacksSplit = 0, stacksLeft = 0;
-  for (const [k, list] of bySig) {
-    const gfx = list[0].gfx;
-    list.sort((a, b) => a.frame - b.frame);
-    const runs = [];
-    let cur = [], last = null;
-    for (const e of list) {
-      if (last !== null && e.frame - last > RT_FRAME_WINDOW) { runs.push(cur); cur = []; }
-      cur.push({ x: e.x, y: e.y, pal: e.pal, hash: e.hash, frame: e.frame });
-      last = e.frame;
-    }
-    if (cur.length) runs.push(cur);
-
-    for (const run of runs) {
-      // Exact duplicates inside one window carry no information.
-      const uniq = new Map();
-      for (const t of run) uniq.set(`${t.x},${t.y},${t.pal},${t.hash}`, t);
-      // Cluster WITHIN a palette. On the world maps the path and trail sprites lie
-      // edge to edge right across the screen, so pure adjacency chains half the
-      // map into one blob — and swallows the level name sitting on top of it.
-      // An OBJ tile has exactly one palette, and the things this view exists for
-      // (text on P6, the cart, the torches) each keep to their own, so the palette
-      // is the natural cut. A sprite that genuinely mixes two palettes is split in
-      // two here; those are gallery sprites, which this path is not for.
-      // ...but OFF by default, because it cuts the other way too: a torch made of
-      // a stem and a flame uses two OBJ palettes and comes out as two objects.
-      // Text needs the cut, multi-coloured objects must not have it, so it is a
-      // switch rather than a rule. The font page does not depend on it at all —
-      // it selects by "can the glyph table read this", not by palette.
-      const clusters = [];
-      if (splitByPal) {
-        const byPal = new Map();
-        for (const t of uniq.values()) {
-          if (!byPal.has(t.pal)) byPal.set(t.pal, []);
-          byPal.get(t.pal).push(t);
-        }
-        for (const tilesOfPal of byPal.values()) clusters.push(...rtClusterSpatial(tilesOfPal));
-      } else {
-        clusters.push(...rtClusterSpatial([...uniq.values()]));
-      }
-      for (const grp of clusters) {
-        const wasStacked = rtHasStack(grp);
-        const parts = rtSplitStacks(grp);
-        if (wasStacked) { if (parts.length > 1) stacksSplit++; else stacksLeft++; }
-        for (const p of parts) {
-          const minx = Math.min(...p.tiles.map(t => t.x));
-          const miny = Math.min(...p.tiles.map(t => t.y));
-          const tiles = p.tiles.map(t => ({ x: t.x - minx, y: t.y - miny, pal: t.pal, hash: t.hash }))
-                               .sort((a, b) => a.y - b.y || a.x - b.x);
-          const sig = gfx + '|' + tiles.map(t => `${t.x},${t.y},${t.pal},${t.hash}`).join(';');
-          const existing = objects.get(sig);
-          if (existing) { existing.seen++; continue; }
-          const w = Math.max(...tiles.map(t => t.x)) + 8;
-          const h = Math.max(...tiles.map(t => t.y)) + 8;
-          const missing = spriteMissByHash
-            ? tiles.filter(t => !spriteMissByHash.has(`${t.hash}_P${t.pal}`)).length
-            : tiles.length;
-          objects.set(sig, {
-            id: `G${gfx}_${objects.size}`, gfx, tiles, w, h,
-            pals: [...new Set(tiles.map(t => t.pal))].sort(),
-            stacked: rtHasStack(tiles), missing, seen: 1,
-            phase: p.phase, phaseCount: p.phaseCount,
-          });
-        }
-      }
-    }
-  }
-
-  const built = [...objects.values()].sort((a, b) => b.tiles.length - a.tiles.length);
-  const ms = Math.round(performance.now() - t0);
-  const drawable = built.filter(o => o.missing === 0).length;
-  console.log(`[laufzeit] ${built.length} Objekte aus ${sprPosEntries.length} Positionen ` +
-              `(Fenster ${RT_FRAME_WINDOW}, Palettentrennung ${splitByPal ? 'an' : 'aus'}; ` +
-              `${drawable} vollständig zeichenbar, ${stacksSplit} Stapel getrennt, ` +
-              `${stacksLeft} nicht trennbar) — ${ms} ms`);
-  if (pinned) return built;     // a caller's private build, not the shared view
-  runtimeObjects = built;
-  const perGfx = new Map();
-  for (const o of runtimeObjects) perGfx.set(o.gfx, (perGfx.get(o.gfx) || 0) + 1);
-  for (const [g, n] of [...perGfx.entries()].sort((a, b) => b[1] - a[1])) console.log(`  G${g}: ${n} Objekte`);
-  if (typeof renderRuntimeGallery === 'function') renderRuntimeGallery();
-  return runtimeObjects;
-}
+// Letzter Aufrufer war rebuildRuntimeObjects(), das mit der Migration der
+// Schrift-Seite auf OAM wegfiel (S18-Aufräumen). Der sprpos-LOADER bleibt
+// bewusst bestehen, damit alte Aufzeichnungen weiter laden.
 
 // ============================================================
 // Pruning the recordings down to what this workstream needs
@@ -8809,7 +8585,6 @@ async function applyRuntimePrune() {
   if (r.oam) oamFrames = r.oam; else sprPosEntries = r.pos;
   spriteMissEntries = r.miss;
   spriteMissByHash = new Map(r.miss.map(e => [e.key, e]));
-  runtimeObjects = null;
   fontObjectsCache = null;
   oamObjects = null;
   try {
@@ -8826,13 +8601,46 @@ async function applyRuntimePrune() {
   renderRuntimeGallery();
 }
 
-// The font page's own build: palette split forced on, window pinned. Cached,
-// because it is the same answer every time until a new recording is loaded.
+// The font page's objects, now derived from the OAM recording like everything
+// else. It used to call rebuildRuntimeObjects() on the sprpos positions, which
+// cost ~3.8 s on every load and was the last thing keeping snes_hd_sprpos.txt
+// alive (87 MB) after S17 replaced the guessing with real OAM entries.
+//
+// One thing the old path did has to be reproduced: splitByPal. A level name is
+// palette 6, but an OAM index run can carry more than one palette — a name that
+// happens to sit next to a Kong head lands in the same run, and rtTextObjects
+// drops anything with more than one palette. So each object is cut down to its
+// palette-6 cells before the text reader sees it.
 let fontObjectsCache = null;
 function fontObjects() {
   if (fontObjectsCache) return fontObjectsCache;
-  fontObjectsCache = rebuildRuntimeObjects({ pinned: true, splitByPal: true, window: 120 }) || [];
-  return fontObjectsCache;
+  if (!oamObjects || !oamObjects.length) return [];
+  const out = [];
+  for (const o of oamObjects) {
+    const p6 = o.tiles.filter(t => t.pal === 6);
+    if (p6.length === 0) continue;
+    if (p6.length === o.tiles.length) { out.push(o); continue; }   // schon rein P6
+    // Coordinates are relative to the object box, so cutting cells away means
+    // re-anchoring — otherwise the canvas would carry the gap the other palette
+    // left behind and the reader would see phantom spaces between letters.
+    const minX = Math.min(...p6.map(t => t.x)), minY = Math.min(...p6.map(t => t.y));
+    const tiles = p6.map(t => ({ ...t, x: t.x - minX, y: t.y - minY }));
+    const allTiles = [...new Set(tiles.map(t => `${t.hash}_P6`))];
+    out.push({
+      ...o,
+      id: `${o.id}-P6`,
+      tiles,
+      w: Math.max(...tiles.map(t => t.x)) + 8,
+      h: Math.max(...tiles.map(t => t.y)) + 8,
+      pals: [6],
+      phases: [tiles], phaseCount: 1,
+      allTiles,
+      missing: spriteMissByHash ? allTiles.filter(k => !spriteMissByHash.has(k)).length : allTiles.length,
+    });
+  }
+  fontObjectsCache = out;
+  console.log(`[schrift] ${out.length} Objekte mit Palette 6 aus ${oamObjects.length} OAM-Objekten.`);
+  return out;
 }
 
 // ============================================================
@@ -9302,11 +9110,7 @@ async function importHDRuntimePack(zip, manifest, rootPrefix, btn, origText, fil
     hdEnabled = true;
     hdRuntimeBitmaps = null;   // new art — drop the decoded cache
     updateHDToggleUI();
-    // oamObjects, not runtimeObjects: the gallery has been driven by the OAM
-    // recording since S17, and a session that loads only snes_hd_oam.txt leaves
-    // the old sprpos model null — the re-render never fired, so freshly imported
-    // art stayed invisible until a filter was touched.
-    if (oamObjects || runtimeObjects) renderRuntimeGallery();
+    if (oamObjects) renderRuntimeGallery();
     console.log(`[laufzeit] HD-Import: ${written} Kacheln aus ${objDone} Objekten bei ${scale}x` +
                 (blank ? `, ${blank} leer übersprungen` : '') +
                 (oob ? `, ${oob} außerhalb des Bildes` : ''));
@@ -10882,7 +10686,7 @@ async function loadContainerToHDPack(containerName) {
   redraw();
   if (catalogView) renderCatalog();
   if (spriteGalleryData) renderSpriteGallery();
-  if (oamObjects || runtimeObjects) renderRuntimeGallery();
+  if (oamObjects) renderRuntimeGallery();
   console.log(`Container "${containerName}" loaded: ${totalTiles} tiles, ${levelSets.length} level sets, ` +
               `${hdPack.sprites.size} sprites (${totalSpriteFrames} frames)` +
               (hdPack.runtimeTiles ? `, ${hdPack.runtimeTiles.size} Laufzeit-Kacheln` : ''));
@@ -16135,9 +15939,10 @@ function renderFontPage() {
   // Ask for the RECORDINGS, not for the runtime view's grouping: this page
   // builds its own (palette split pinned on) and must work without anyone having
   // opened the Laufzeit tab first.
-  if (!sprPosEntries || !spriteMissByHash) {
+  if (!oamObjects || !spriteMissByHash) {
     page.innerHTML = '<p style="color:#666;">Keine Laufzeit-Aufzeichnung geladen. Knopf <b>Laufzeit</b> ' +
-      'in der Katalog-Toolbar: <code>snes_hd_spritemiss.txt</code> und <code>snes_hd_sprpos.txt</code> wählen.</p>';
+      'in der Katalog-Toolbar: <code>snes_hd_oam.txt</code> (die Objekte) und ' +
+      '<code>snes_hd_spritemiss.txt</code> (die Pixel) wählen.</p>';
     toolbar.textContent = '';
     return;
   }
@@ -16215,7 +16020,7 @@ function renderFontPage() {
         // Only worth showing while something is still missing: then it says where
         // to go looking. Once every character is in, walking more maps is pointless.
         if (haveN === DKC2_MAP_FONT.length && !uncovered.size) return '';
-        const seenGfx = new Set((sprPosEntries || []).map(e => e.gfx));
+        const seenGfx = new Set((oamFrames || []).map(f => f.gfx));
         const todo = [];
         if (typeof OVERWORLD_SETS !== 'undefined') {
           for (const [id, cfg] of Object.entries(OVERWORLD_SETS)) {
@@ -16686,15 +16491,16 @@ document.querySelectorAll('.cat-btn[data-cat]').forEach(btn => {
     document.getElementById('rtReportPanel').style.display = 'none';
     document.getElementById('spriteGalleryGrid').style.display = (isRuntime || isFont) ? 'none' : '';
     if (isFont) {
-      // The font page still runs on sprpos: its art is finished and in the
-      // container, and re-deriving it on OAM would risk a working result for
-      // nothing. Migrating it is a separate step.
+      // Runs on OAM since 2026-08-05, like the gallery. The objects are already
+      // built by then (or are built here), so the seconds-long grouping pause the
+      // sprpos path needed is gone.
       const target = document.getElementById('fontPage');
-      if (!fontObjectsCache && sprPosEntries && sprPosEntries.length > 20000) {
-        target.innerHTML = `<p style="color:#ff9800;padding:20px;">Gruppiere ${sprPosEntries.length} ` +
-                           `Positionen … (einige Sekunden, passiert nur einmal je Aufzeichnung)</p>`;
-        setTimeout(() => ensureRuntimeHdBitmaps().then(() => renderFontPage()), 30);
+      if (!oamObjects && oamFrames && oamFrames.length > 500) {
+        target.innerHTML = `<p style="color:#ff9800;padding:20px;">Baue Objekte aus ` +
+                           `${oamFrames.length} Frames …</p>`;
+        setTimeout(() => { buildOamObjects(); ensureRuntimeHdBitmaps().then(() => renderFontPage()); }, 30);
       } else {
+        if (!oamObjects && oamFrames) buildOamObjects();
         ensureRuntimeHdBitmaps().then(() => renderFontPage());
       }
     } else if (isRuntime) {
@@ -16905,8 +16711,7 @@ document.getElementById('runtimeSprInput').addEventListener('change', async (e) 
                 `— bleibt über Reloads erhalten`);
     // Drop any grouping built from the previous files; the new one is computed
     // when a tab that needs it is opened, not here (it takes seconds).
-    runtimeObjects = null;
-    fontObjectsCache = null;
+      fontObjectsCache = null;
     oamObjects = null;
   }
 });
