@@ -4651,7 +4651,26 @@ async function loadRomFile(file) {
         levelSelect.appendChild(opt);
       }
     }
-    
+
+    // Standalone screens (title, file select, bonus rooms, game over). They are
+    // not levels and have no level ID, so they sit in their own block above
+    // SCREEN_ID_BASE and are routed by loadLevel() to the catalog view — that is
+    // where buildOverworldCatalog() already renders them from the VRAM dump.
+    screenSets = collectScreenSets();
+    if (screenSets.length > 0) {
+      const sep = document.createElement('option');
+      sep.disabled = true;
+      sep.textContent = '── Screens ──';
+      levelSelect.appendChild(sep);
+      for (let i = 0; i < screenSets.length; i++) {
+        const gfx = screenSets[i];
+        const opt = document.createElement('option');
+        opt.value = SCREEN_ID_BASE + i;
+        opt.textContent = `${OVERWORLD_SETS[gfx].name} (Set 0x${gfx.toString(16).toUpperCase()})`;
+        levelSelect.appendChild(opt);
+      }
+    }
+
     levelSelect.disabled = false;
     prevBtn.disabled = false;
     nextBtn.disabled = false;
@@ -4805,10 +4824,78 @@ const OVERWORLD_SETS = {
           extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x7800 }] },
   // Krazy Kremland's map is two separate screens, not one scrolled screen.
   0x3E: { kind: 'map', world: 4, levelId: 0x33, name: 'Krazy Kremland (screen 2)', chr: 0x2000, tm: 0x7800 },
+
+  // ---- Standalone screens (0x3F+) ----
+  // Neither map nor shop: single static screens the game shows outside level
+  // play. They have no level ID, so they are reachable only by picking the set.
+  // Addresses come from a Mesen Lua dump of the live PPU state (screen_dump.lua),
+  // not from guesswork — and only layers whose bit is actually set in
+  // mainScreenLayers/subScreenLayers are listed here. The register file also
+  // holds STALE bases from the previous screen; entering those would add
+  // phantom layers.
+  //
+  // The hidden room in Pirate Panic. BG1 is a large one-off picture (657
+  // distinct tiles in a 32x32 map, 5 of them known to the pack) — the game
+  // reloads only the BG1 CHR window and leaves the level's BG2 in place. That
+  // BG2 is Pirate Panic's own, byte for byte: all 254 tiles at their original
+  // addresses AND in the same palettes, so it needs no new art, only a copy
+  // into this gfxset (strict scoping blocks foreign gfxsets, SnesHdData.h:476).
+  0x3F: { kind: 'screen', levelId: null, name: 'Pirate Panic (hidden room)', chr: 0x2000, tm: 0x7000,
+          extraLayers: [{ layer: 2, chr: 0x6000, tm: 0x7800 }] },
+
+  // The three bonus screens. Identical PPU setup (main=$13, BG1+BG2+OBJ), and
+  // identical VRAM signature — Mesen cannot tell them apart by fingerprint, so
+  // at runtime they are ONE gfxset. They are three entries here anyway because
+  // the ROM keeps three of everything (GFX_Layer1_BonusRoomScreen_*,
+  // Tilemaps/Layer1_BonusRoomScreen_*, Palettes/Layer1_*Screen) and each has to
+  // be exported from its own VRAM dump; measured, BG1 shares exactly ONE tile
+  // across the three while BG2 shares 766 of 809.
+  // That shared BG2 is not bonus-room art at all: the assembly tables
+  // DATA_FD878C / FD87A9 / FD87C6 all start by loading GFX_Layer2_FileSelectBG,
+  // the same background the file-select screen uses. It needs upscaling ONCE
+  // and counts for all four screens.
+  0x40: { kind: 'screen', levelId: null, name: 'Bonus: Find the Token', chr: 0x6000, tm: 0x7800,
+          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x7400 }] },
+  0x41: { kind: 'screen', levelId: null, name: 'Bonus: Destroy Them All', chr: 0x6000, tm: 0x7800,
+          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x7400 }] },
+  0x42: { kind: 'screen', levelId: null, name: 'Bonus: Collect the Stars', chr: 0x6000, tm: 0x7800,
+          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x7400 }] },
+
+  // Title screen: BG1 only (main=$01, sub=$10 is just OBJ). BG2 carries stale
+  // bases and is not displayed. Confirmed against the ROM routine, which writes
+  // VRAMAddressLo $4000 for the CHR and $1C00 for the tilemap — the tilemap
+  // transfer is $0700 bytes = 896 entries = 32x28, exactly the visible area.
+  0x43: { kind: 'screen', levelId: null, name: 'Title Screen', chr: 0x4000, tm: 0x1C00 },
+
+  // File select / load screen. BG2 sits on main AND sub (sub=$02) and BG1 has
+  // colour math on with halve+add — the screen is BG1 blended with BG2, so a
+  // plain stack is an approximation of what the PPU shows.
+  0x44: { kind: 'screen', levelId: null, name: 'File Select (load screen)', chr: 0x5000, tm: 0x7400,
+          extraLayers: [{ layer: 2, chr: 0x1000, tm: 0x7C00 }] },
+
+  // Game Over: BG1+BG2 (main=$03), no sprites. BG1 is the only screen here with
+  // a 64x64 tilemap (doubleWidth AND doubleHeight); BG2 is 32x64. BG3 carries
+  // bases but its bit is not set, so it is left out.
+  0x45: { kind: 'screen', levelId: null, name: 'Game Over', chr: 0x2000, tm: 0x7000, wide: true, tall: true,
+          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x6800, tall: true }] },
 };
 
 function isOverworldSet(gfxSetIndex) {
   return Object.prototype.hasOwnProperty.call(OVERWORLD_SETS, gfxSetIndex);
+}
+
+// Standalone screens for the main level dropdown, in table order. They have no
+// level ID, so they cannot ride the 0..191 range — they get synthetic IDs from
+// SCREEN_ID_BASE upward, the same trick the "Backgrounds" block already uses
+// from 256. Kept as an array so the index in the dropdown maps straight back to
+// a gfxset without a second lookup table.
+const SCREEN_ID_BASE = 512;
+let screenSets = [];
+function collectScreenSets() {
+  return Object.keys(OVERWORLD_SETS)
+    .map(Number)
+    .filter(gfx => OVERWORLD_SETS[gfx].kind === 'screen')
+    .sort((a, b) => a - b);
 }
 
 function overworldSetId(gfxSetIndex) {
@@ -4891,6 +4978,18 @@ function buildOverworldCatalog(gfxSetIndex) {
     palette = new Uint16Array(cg.length >> 1);
     for (let i = 0; i < palette.length; i++) palette[i] = cg[i * 2] | (cg[i * 2 + 1] << 8);
   } else {
+    // A standalone screen has no level ID, so there is nothing to fall back TO:
+    // the ROM palette is reached through the level's overworld config. Say that
+    // plainly instead of letting loadOverworldLevel(rom, null) fail on a null
+    // levelId — the resulting "Cannot read properties of null" says nothing about
+    // the actual cause, which is a missing CGRAM dump.
+    if (def.levelId == null) {
+      console.error(`[overworld] ${setId} (${def.name}) hat keine CGRAM und keine Level-ID, ` +
+        `also auch keinen ROM-Palette-Rückfall. Den Schirm mit screen_dump.lua neu dumpen ` +
+        `(schreibt *_cgram.bin), die Datei als ${setId}_cgram.bin in den Dump-Ordner legen ` +
+        `und generate_vram_groundtruth.py erneut laufen lassen.`);
+      return null;
+    }
     console.warn(`[overworld] no CGRAM for ${setId} — falling back to ROM palette`);
     try {
       palette = loadOverworldLevel(rom, def.levelId).palette;
@@ -4932,7 +5031,10 @@ function buildOverworldCatalog(gfxSetIndex) {
     // hold leftover data — visible as a garbage strip along the bottom.
     // Excluded for shops, which are static single screens. NOT excluded for
     // maps: those scroll, so material outside the initial view is reachable.
-    const visibleRows = (def.kind === 'shop' && tilesH === 32) ? 28 : tilesH;
+    // 'screen' behaves like a shop here: a standalone screen does not scroll
+    // either, so rows 28-31 are below the 224 visible scanlines for it too.
+    const isStatic = def.kind === 'shop' || def.kind === 'screen';
+    const visibleRows = (isStatic && tilesH === 32) ? 28 : tilesH;
 
     owLayers.push({
       layer: cfg.layer,
@@ -5691,6 +5793,63 @@ function loadLevel(levelId) {
   currentLevelId = levelId;
   levelSelect.value = levelId;
   
+  // Standalone screen. Tested BEFORE the 256 range, which is open-ended.
+  // A screen has no level canvas of its own: it is composed from its VRAM dump
+  // by buildOverworldCatalog(), so picking one here switches the catalog to that
+  // gfxset instead of rendering into levelCanvas.
+  if (levelId >= SCREEN_ID_BASE) {
+    const gfx = screenSets[levelId - SCREEN_ID_BASE];
+    if (gfx == null) return;
+    const def = OVERWORLD_SETS[gfx];
+    statusText.textContent = `Lade ${def.name}…`;
+    try {
+      selectedGfxSet = gfx;
+      const sel = document.getElementById('catGfxSet');
+      if (sel) sel.value = gfx;
+      catalogMode = 'gfxset';
+      catalogData = buildCatalogByGfxSet(gfx);
+      if (!catalogData) {
+        statusText.textContent = `${def.name}: kein Katalog — siehe Konsole`;
+        return;
+      }
+      renderCatalog();
+      if (typeof ensureGfxSetHDLoaded === 'function') ensureGfxSetHDLoaded(gfx);
+      currentTileMap = null; currentTileParts = null; currentProp = null;
+      currentBgData = null; currentStyle = null; currentTileRawData = null;
+
+      // Compose the screen onto the level canvas so picking it here looks like
+      // picking a level or a shop, instead of silently only filling the catalog.
+      // The layers are already rendered by buildOverworldCatalog(); they just
+      // need stacking. Higher layer numbers sit further back, so draw
+      // descending — BG2 first, BG1 over it.
+      const layers = (catalogData.owLayers || []).slice().sort((a, b) => b.layer - a.layer);
+      if (layers.length) {
+        // visibleRows is the honest height: a static screen's rows 28-31 hold
+        // leftover data below the 224 visible scanlines.
+        const wPx = Math.max(...layers.map(l => l.image.widthPx));
+        const hPx = Math.max(...layers.map(l => Math.min(l.visibleRows || l.tilesH, l.tilesH) * 8));
+        welcome.style.display = 'none';
+        levelCanvas.style.display = 'block';
+        levelCanvas.width = wPx;
+        levelCanvas.height = hPx;
+        const lctx = levelCanvas.getContext('2d');
+        lctx.imageSmoothingEnabled = false;
+        lctx.clearRect(0, 0, wPx, hPx);
+        for (const l of layers) lctx.drawImage(l.image.canvas, 0, 0);
+        applyZoom();
+        statusText.textContent = `${def.name} (Set 0x${gfx.toString(16).toUpperCase()}) | ` +
+          `${wPx}x${hPx}px, ${layers.length} Ebene(n): ` +
+          layers.map(l => `BG${l.layer}`).join(' + ');
+      } else {
+        statusText.textContent = `${def.name}: keine Ebene gerendert — siehe Konsole`;
+      }
+    } catch (err) {
+      statusText.textContent = `Fehler: ${err.message}`;
+      console.error('[screen] load error:', err);
+    }
+    return;
+  }
+
   // Standalone BG entry
   if (levelId >= 256) {
     const bgIdx = levelId - 256;
@@ -16363,11 +16522,13 @@ function redraw() {
 // Event listeners
 levelSelect.addEventListener('change', () => loadLevel(parseInt(levelSelect.value)));
 prevBtn.addEventListener('click', () => {
-  if (currentLevelId >= 256) { if (currentLevelId > 256) loadLevel(currentLevelId - 1); else loadLevel(191); }
+  if (currentLevelId >= SCREEN_ID_BASE) { if (currentLevelId > SCREEN_ID_BASE) loadLevel(currentLevelId - 1); }
+  else if (currentLevelId >= 256) { if (currentLevelId > 256) loadLevel(currentLevelId - 1); else loadLevel(191); }
   else if (currentLevelId > 0) loadLevel(currentLevelId - 1);
 });
 nextBtn.addEventListener('click', () => {
-  if (currentLevelId >= 256) { if (currentLevelId < 256 + bgConfigs.length - 1) loadLevel(currentLevelId + 1); }
+  if (currentLevelId >= SCREEN_ID_BASE) { if (currentLevelId < SCREEN_ID_BASE + screenSets.length - 1) loadLevel(currentLevelId + 1); }
+  else if (currentLevelId >= 256) { if (currentLevelId < 256 + bgConfigs.length - 1) loadLevel(currentLevelId + 1); }
   else if (currentLevelId < 191) loadLevel(currentLevelId + 1);
   else if (bgConfigs.length > 0) loadLevel(256);
 });
@@ -17172,11 +17333,13 @@ document.addEventListener('keydown', (e) => {
   const tag = document.activeElement?.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || document.activeElement?.isContentEditable) return;
   if (e.key === 'ArrowLeft' || e.key === 'a') {
-    if (currentLevelId >= 256) { if (currentLevelId > 256) loadLevel(currentLevelId - 1); else loadLevel(191); }
+    if (currentLevelId >= SCREEN_ID_BASE) { if (currentLevelId > SCREEN_ID_BASE) loadLevel(currentLevelId - 1); }
+  else if (currentLevelId >= 256) { if (currentLevelId > 256) loadLevel(currentLevelId - 1); else loadLevel(191); }
     else if (currentLevelId > 0) loadLevel(currentLevelId - 1);
   }
   else if (e.key === 'ArrowRight' || e.key === 'd') {
-    if (currentLevelId >= 256) { if (currentLevelId < 256 + bgConfigs.length - 1) loadLevel(currentLevelId + 1); }
+    if (currentLevelId >= SCREEN_ID_BASE) { if (currentLevelId < SCREEN_ID_BASE + screenSets.length - 1) loadLevel(currentLevelId + 1); }
+  else if (currentLevelId >= 256) { if (currentLevelId < 256 + bgConfigs.length - 1) loadLevel(currentLevelId + 1); }
     else if (currentLevelId < 191) loadLevel(currentLevelId + 1);
     else if (bgConfigs.length > 0) loadLevel(256);
   }

@@ -1,5 +1,78 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-07] — Sieben eigenständige Schirme im Haupt-Dropdown, mit Level-Ansicht
+
+Die Schirme stehen jetzt dort, wo Level, Hintergründe und NPC-Shops stehen: ein Block
+`── Screens ──` mit synthetischen IDs ab `SCREEN_ID_BASE = 512` — dasselbe Muster, das der
+`── Backgrounds ──`-Block ab 256 schon benutzt. `loadLevel()` prüft den Schirm-Bereich **vor**
+dem 256er-Bereich, weil der nach oben offen ist.
+
+**Sie zeichnen in die Level-Ansicht**, nicht nur in den Katalog: die von
+`buildOverworldCatalog()` gerenderten Ebenen werden nach absteigender Ebenennummer gestapelt
+(BG2 zuerst, BG1 darüber) und auf `visibleRows` beschnitten. Der Katalog wird weiterhin
+mitbefüllt, beide Ansichten funktionieren.
+
+Nebenbei repariert: die Vor/Zurück-Knöpfe nahmen an, alles über 256 sei ein Hintergrund. Vom
+ersten Schirm aus wäre „Zurück" auf ID 511 gelaufen — kein gültiger Eintrag, und
+`currentLevelId` wäre auf einem nicht existierenden Wert stehen geblieben. Vier Stellen
+(Knöpfe und Tastatur) prüfen jetzt den Schirm-Bereich zuerst.
+
+**Sechs weitere Schirme eingetragen** (`0x40`–`0x45`), Adressen aus den Lua-Dumps gelesen und
+**nur Ebenen übernommen, deren Bit in `mainScreenLayers`/`subScreenLayers` gesetzt ist**:
+Bonus Find the Token / Destroy Them All / Collect the Stars, Title Screen, File Select,
+Game Over. Alle sieben liegen mit VRAM **und CGRAM** in der Ground Truth (46 Gfxsets).
+
+Ein eigenständiger Schirm hat keine Level-ID und damit **keinen ROM-Palette-Rückfall** — der
+führt über die Overworld-Config des Levels. Ohne CGRAM-Dump scheiterte das vorher an einem
+nichtssagenden „Cannot read properties of null". Die Meldung sagt jetzt, was zu tun ist.
+
+### Bekannt und noch offen
+
+- **Scroll wird ignoriert.** Ansicht und Export unterstellen 28 Zeilen ab Tilemap-Null. Die
+  Dumps sagen anderes: Bonus/Ladeschirm `vscroll 1023` (= −1, harmlos), **PP-Raum BG2
+  `hscroll 663`** = 151 px Versatz. Für die Anzeige kosmetisch, für den Export nicht — es
+  entscheidet, welche Kacheln als sichtbar gelten. **Vor dem ersten Upscale zu beheben.**
+- **BG1 des Ladeschirms wird nicht exportiert.** „SELECT GAME", drei Spielstände mit
+  Zeit/Münzen/Prozent, vier Optionen — alles Laufzeit-Text, ein Dump ist eine Momentaufnahme.
+  Ein Upscale davon ergäbe halb HD, halb SD mitten im Text. Die Schrift ist laut User eine
+  **dritte, eigene** (weder Shop- noch Weltkartenschrift) und gehört in den Schrift-Workstream.
+- **Bonusraum-Text ist die Weltkartenschrift und läuft im Spiel schon in HD** — er kommt über
+  Sprites (`LayerIndex 4`, scope-frei), nicht über die BG-Ebene. Die 127 BG1-Kacheln je
+  Bonusraum sind also im Wesentlichen die Kongs.
+- **Game Over** ist der einzige Schirm mit einer 64×64-Tilemap (`wide` und `tall`); bisher gab
+  es nur 32×64 und 64×32. Ungetestet, ob der Renderer die Kombination sauber liest.
+
+## [2026-08-06b] — Eigenständige Schirme als Set-Art, erster Eintrag: Pirate Panics versteckter Raum
+
+Neue `kind: 'screen'` neben `'shop'` und `'map'`: einzelne statische Schirme, die das Spiel
+außerhalb des Levelbetriebs zeigt. Sie haben keine Level-ID und sind nur über die Set-Auswahl
+erreichbar. Beim Zuschneiden verhalten sie sich wie Shops — sie scrollen nicht, also liegen
+Zeilen 28–31 auch bei ihnen unterhalb der 224 sichtbaren Zeilen.
+
+Erster Eintrag `0x3F` = **Pirate Panic, versteckter Raum**. Adressen stammen aus einem
+Lua-Dump des lebenden PPU-Zustands (`screen_dump.lua`), nicht aus Vermutungen — und
+übernommen wurden **nur Ebenen, deren Bit tatsächlich in `mainScreenLayers`/`subScreenLayers`
+steht**. Die Registerdatei trägt daneben veraltete Basen des vorigen Schirms; wer die
+einträgt, baut sich Phantomebenen. (Auf Gangplank Galleon stehen so die BG2/BG3-Basen des
+Hubs, obwohl `main=$11` nur BG1 zeigt.)
+
+**Gemessen an den Dumps, nicht geschätzt:**
+
+| Ebene | distinkte Kacheln | schon im Pack |
+|---|---|---|
+| BG1 ($2000/$7000) | 657 | 5 |
+| BG2 ($6000/$7800) | 254 | **254, alle an ihrer Adresse UND in ihrer Palette** |
+
+Das Spiel lädt für den Raum nur das BG1-CHR-Fenster neu und lässt Pirate Panics BG2 stehen.
+BG2 braucht deshalb **keine neue Kunst** — aber es muss trotzdem unter dem neuen Gfxset
+liegen, weil `SnesHdData.h:476` Kacheln fremder Gfxsets blockt. Das ist der Funky-Fall in
+seiner einfachen Form: bei Funky lagen 152 von 239 Kacheln an anderen Adressen, hier 0.
+
+**Fallstrick, der eine Fehldiagnose gekostet hat:** Pack-Dateinamen führen die VRAM-Adresse
+als Hex in **Kleinbuchstaben** (`60a0_P01.png`). Ein Vergleich mit großgeschriebenem Hex
+trifft nur die reinen Ziffernadressen — hier meldete er 154 falsche Fehlstellen, während in
+Wahrheit 255 von 255 vorhanden waren.
+
 ## [2026-08-06] — Parser gegen echte S18-Aufzeichnungen geprüft, toter sprpos-Block entfernt
 
 ### Die Kopfzeilen-Änderung ist jetzt belegt, nicht mehr nur plausibel
