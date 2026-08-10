@@ -4622,6 +4622,7 @@ async function loadRomFile(file) {
     
     rom = new RomBuffer(data);
     clearSpriteCache();
+    _animPaletteMapCache = null;   // derived from ROM contents — must not survive a ROM swap
     if (!rom.isValidDKC2()) {
       throw new Error('Not a valid DKC2 ROM (missing "DIDDY ASSEMBLY" signature)');
     }
@@ -12783,6 +12784,12 @@ async function exportAsTexturePack(containerName) {
   // with the S5a build grows the recording.
   let spriteExportedTiles = 0;
   let writtenSpriteKeys = new Set();   // "{hash}_P{pal}" — read again by the runtime block below
+  // Reference palettes for sprite_palettes.bin: the 16 colours each sprite's HD art
+  // was baked under. Mesen needs them because the OAM palette SLOT it sees at runtime
+  // is a dynamic allocation (bank_BB CODE_BB8A6F: 8 refcounted slots) and says nothing
+  // about the colours. With the reference it can recolour reference→live CGRAM, which
+  // is how the same crate ends up correctly tinted in every level.
+  const spriteRefPalettes = new Map();   // "{hash}" -> Uint16Array(16), only for sets that pass the guard
   {
     // Sprites are read from the CONTAINER, like every other part of this export.
     // They used to be taken only from the in-memory hdPack, so an export that did not
@@ -12800,7 +12807,11 @@ async function exportAsTexturePack(containerName) {
         if (!isNaN(idx) && f.blob) frames.push({ idx, blob: f.blob });
       }
       if (frames.length) {
-        sprSources.push({ key: s.setId, scaleFactor: s.scaleFactor || 4, metaMap, frames });
+        // animId/name carry the sprite's identity through to the reference-palette
+        // resolution below — without them the export cannot say which colours the
+        // art was baked under.
+        sprSources.push({ key: s.setId, scaleFactor: s.scaleFactor || 4, metaMap, frames,
+                          animId: s.animId ?? null, name: s.name || '' });
       }
     }
     // Fallback for sprites imported in this session but not (yet) written to the container.
@@ -12809,6 +12820,7 @@ async function exportAsTexturePack(containerName) {
         sprSources.push({
           key, scaleFactor: spr.scaleFactor || 4, metaMap: spr.meta || new Map(),
           frames: [...spr.frames].map(([idx, bitmap]) => ({ idx, bitmap })),
+          animId: spr.animId ?? null, name: spr.name || '',
         });
       }
       console.log(`[sprites] ${sprSources.length} Sprite-Sets aus dem Speicher (im Container liegen keine).`);
@@ -12832,6 +12844,41 @@ async function exportAsTexturePack(containerName) {
         const noPalHashes = new Set();       // seen but never recorded at runtime
         let noMetaFrames = 0, sprFrameCount = 0;
 
+        // Guard for the reference palette. The cascade in resolveSpritePalettes() can
+        // legitimately answer differently than it did when the SD art was exported (a
+        // manual override changed, a curated entry was added), and a wrong reference
+        // would make Mesen recolour away from the correct colours. So: measure how much
+        // of the actual HD art the candidate palette explains, and ship the reference
+        // only if it does. A missing reference is harmless — Mesen then leaves the tile
+        // alone, exactly as today.
+        //
+        // Measured per SET, not per tile: a single tile can legitimately be all
+        // anti-aliased edge and explain nothing, while the sprite as a whole does.
+        const NEAR_DIST2 = 30 * 30;   // squared RGB distance still counted as "flat texel"
+        const MIN_COVERAGE = 0.35;    // upscaled art keeps at least this much flat area
+        const palNearOf = (rgba, pal) => {
+          // → [nearTexels, opaqueTexels] for one decoded cell. Every 2nd texel is
+          // enough for a ratio, and this runs on ~20k tiles — the full scan would
+          // add minutes to the export for no better decision.
+          let near = 0, total = 0;
+          for (let p = 0; p + 3 < rgba.length; p += 8) {
+            if (rgba[p + 3] < 200) continue;   // skip transparent + soft edges
+            total++;
+            let best = Infinity;
+            for (let ci = 1; ci < 16; ci++) {
+              const c = pal[ci] & 0x7FFF;
+              const dr = ((c & 31) << 3) - rgba[p];
+              const dg = (((c >> 5) & 31) << 3) - rgba[p + 1];
+              const db = (((c >> 10) & 31) << 3) - rgba[p + 2];
+              const d2 = dr * dr + dg * dg + db * db;
+              if (d2 < best) { best = d2; if (best <= NEAR_DIST2) break; }
+            }
+            if (best <= NEAR_DIST2) near++;
+          }
+          return [near, total];
+        };
+        const refStats = { ok: 0, rejected: 0, noPalette: 0, noAnimId: 0 };
+
         for (const spr of sprSources) {
           const spriteKey = spr.key;
           const sprScale = spr.scaleFactor || 4;
@@ -12840,6 +12887,24 @@ async function exportAsTexturePack(containerName) {
             continue;
           }
           const cellSize = 8 * sprScale;
+
+          // Reference palette for this sprite — same cascade the gallery renders with.
+          let refPal = null;
+          if (rom && spr.animId != null) {
+            try {
+              const frames = parseAnimFrames(rom, spr.animId);
+              const hasComposite = frames.some(f => f.extraRefs && f.extraRefs.length > 0);
+              const res = resolveSpritePalettes(spr.animId, spr.name, getAnimPaletteMap().get(spr.animId) || null, hasComposite);
+              // A grey ramp is the "no palette found" placeholder, not a reference.
+              if (res && !res.isGrey) refPal = res.palette;
+            } catch (e) {
+              console.warn(`[sprites] ${spriteKey}: Referenzpalette nicht auflösbar:`, e.message);
+            }
+          }
+          if (spr.animId == null) refStats.noAnimId++;
+          else if (!refPal) refStats.noPalette++;
+          // Candidate hashes + coverage evidence, committed after the set is done.
+          const refCand = { pal: refPal, hashes: new Set(), near: 0, total: 0 };
 
           for (const fr of spr.frames) {
             const fi = fr.idx;
@@ -12891,6 +12956,15 @@ async function exportAsTexturePack(containerName) {
                 for (let a = 3; a < idata.length; a += 4) { if (idata[a] > 8) { anyOpaque = true; break; } }
                 if (!anyOpaque) continue;
 
+                // Evidence for the reference-palette guard, gathered from the very
+                // pixels that are about to be written.
+                if (refCand.pal) {
+                  const [nr, tt] = palNearOf(idata, refCand.pal);
+                  refCand.near += nr;
+                  refCand.total += tt;
+                  refCand.hashes.add(hashHex);
+                }
+
                 const dataUrl = outCanvas.toDataURL('image/png');
                 const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
                 const rawPng = atob(b64);
@@ -12910,7 +12984,24 @@ async function exportAsTexturePack(containerName) {
               if (!fr.bitmap) img.close();   // release container-decoded frames again
             }
           }
+
+          // Commit the reference palette for this sprite, if the art backs it up.
+          if (refCand.pal && refCand.hashes.size > 0) {
+            const coverage = refCand.total > 0 ? refCand.near / refCand.total : 0;
+            if (coverage >= MIN_COVERAGE) {
+              for (const h of refCand.hashes) if (!spriteRefPalettes.has(h)) spriteRefPalettes.set(h, refCand.pal);
+              refStats.ok++;
+            } else {
+              refStats.rejected++;
+              console.warn(`[sprpal] ${spriteKey}: Referenzpalette erklärt nur ` +
+                `${(coverage * 100).toFixed(1)}% der Texel (< ${(MIN_COVERAGE * 100)}%) — ` +
+                `keine Referenz geschrieben, Mesen lässt diese Kacheln unangetastet`);
+            }
+          }
         }
+        console.log(`[sprpal] Referenzpaletten: ${refStats.ok} Sprites übernommen, ` +
+          `${refStats.rejected} vom Wächter verworfen, ${refStats.noPalette} ohne auflösbare Palette, ` +
+          `${refStats.noAnimId} ohne animId; ${spriteRefPalettes.size} Kachel-Hashes abgedeckt`);
         console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert; ` +
           `${noPalHashes.size} Hashes ohne Runtime-Palette übersprungen (mehr Level mit S5a-Build spielen); ` +
           `${noMetaFrames} Frames ohne Platzierungs-Metadaten`);
@@ -13526,6 +13617,71 @@ async function exportAsTexturePack(containerName) {
     }
   }
 
+  // ---- sprite_palettes.bin generation ----
+  // The reference colours each HD sprite tile was baked under, keyed by the same
+  // content hash the tile filename uses.
+  //
+  // Why this is needed at all: DKC2 allocates OBJ palettes dynamically. A sprite's
+  // init script names a palette (init command $8D → table DATA_FD5FEE), and
+  // CODE_BB8A6F hands it one of 8 refcounted CGRAM slots — whichever is free. The
+  // slot number lands in the OAM attribute bits and is all Mesen can see at runtime;
+  // it carries no colour identity, and the same crate gets different slots in
+  // different levels. Meanwhile the LEVEL decides which palette the crate gets, which
+  // is why Hot Head Hop's crates are tinted and the baked-in HD art is not.
+  //
+  // With the reference palette Mesen can recolour reference→live CGRAM, so one piece
+  // of art per sprite serves every level — the way the hardware does it.
+  //
+  // Format (all little-endian):
+  //   uint8  version = 1
+  //   uint16 paletteCount
+  //   paletteCount × 16 × uint16 bgr555     (index 0 = transparent, written as-is)
+  //   uint32 entryCount
+  //   entryCount × { uint64 contentHash, uint16 paletteIndex }
+  let sprPalEntryCount = 0;
+  if (spriteRefPalettes.size > 0) {
+    showMesenExportProgress('sprite_palettes.bin generieren…', 0.94);
+    await _yieldToBrowser();
+    // Deduplicate: many sprites share a palette, and 19k entries of 32 bytes each
+    // would be mostly the same 30 bytes over and over.
+    const palIndexByKey = new Map();
+    const palList = [];
+    const entries = [];
+    for (const [hashHex, pal] of spriteRefPalettes) {
+      let key = '';
+      for (let i = 0; i < 16; i++) key += (pal[i] & 0x7FFF).toString(16) + ',';
+      let pi = palIndexByKey.get(key);
+      if (pi === undefined) {
+        pi = palList.length;
+        palIndexByKey.set(key, pi);
+        palList.push(pal);
+      }
+      entries.push({ hashHex, pi });
+    }
+    const buf = new ArrayBuffer(1 + 2 + palList.length * 32 + 4 + entries.length * 10);
+    const view = new DataView(buf);
+    let off = 0;
+    view.setUint8(off, 1); off += 1;
+    view.setUint16(off, palList.length, true); off += 2;
+    for (const pal of palList) {
+      for (let i = 0; i < 16; i++) { view.setUint16(off, pal[i] & 0x7FFF, true); off += 2; }
+    }
+    view.setUint32(off, entries.length, true); off += 4;
+    for (const e of entries) {
+      const h = BigInt('0x' + e.hashHex);
+      view.setUint32(off, Number(h & 0xFFFFFFFFn), true); off += 4;
+      view.setUint32(off, Number((h >> 32n) & 0xFFFFFFFFn), true); off += 4;
+      view.setUint16(off, e.pi, true); off += 2;
+    }
+    root.file('sprite_palettes.bin', new Uint8Array(buf));
+    sprPalEntryCount = entries.length;
+    console.log(`[sprpal] sprite_palettes.bin: ${entries.length} Kacheln, ` +
+      `${palList.length} verschiedene Paletten, ${(buf.byteLength / 1024).toFixed(1)} KB`);
+  } else {
+    console.warn('[sprpal] Keine Referenzpaletten ermittelt — sprite_palettes.bin wird NICHT geschrieben. ' +
+      'Mesen färbt HD-Sprites dann nicht um (Verhalten wie bisher).');
+  }
+
   // Write manifest
   root.file('manifest.json', JSON.stringify({
     format_version: 3,
@@ -13548,6 +13704,7 @@ async function exportAsTexturePack(containerName) {
     total_anim_tiles: animExportedTiles,
     has_fingerprints: fpEntries && fpEntries.size > 0,
     has_palettes: palSetCount > 0,
+    sprite_palette_entries: sprPalEntryCount,
     notes: `Exported from DKC2 Viewer container "${containerName}"`
   }, null, 2));
 
@@ -15265,6 +15422,114 @@ function buildAnimPaletteMapFromRom() {
   return map;
 }
 
+// The map above costs a 2048-entry initscript scan. The gallery builds it once per
+// build; the pack export needs the same thing and must not pay for it a second time.
+let _animPaletteMapCache = null;
+function getAnimPaletteMap() {
+  if (!_animPaletteMapCache) _animPaletteMapCache = buildAnimPaletteMapFromRom();
+  return _animPaletteMapCache;
+}
+
+// Resolve a sprite's palettes. Extracted from buildSpriteGallery so the pack export
+// can ask the same question without building the gallery — two copies of this
+// cascade would drift, and the export would then ship a reference palette that is
+// not the one the art was rendered under.
+//
+// Three tiers, name-based FIRST because the ROM initscript map is prone to wrong
+// assignments:
+//   1) SPRITE_PALETTE_DIRECT_ADDR / SPRITE_PALETTE_BY_KEY (curated, verified)
+//   2) localStorage override (manual correction — always wins)
+//   3) ROM initscript ($8D00 / $8400) via the anim→palette map
+// Composite sprites may replace the primary afterwards, so hasCompositeFrames comes
+// from the caller: deciding it needs parseAnimFrames, which the export does not run.
+function resolveSpritePalettes(animId, name, palInfo, hasCompositeFrames) {
+  let palette = null;
+  let resolvedPaletteSetId = null;
+  let resolvedPaletteAddr = null;
+
+  // Tier 1: name-based curated lookup (highest priority for known sprites)
+  const nameKey = extractSpriteKeyFromName(name);
+  if (nameKey !== null && SPRITE_PALETTE_DIRECT_ADDR[nameKey] !== undefined) {
+    // Direct ROM address (for 32-byte palette files or $8400 palettes)
+    const pa = SPRITE_PALETTE_DIRECT_ADDR[nameKey];
+    if (pa + 30 <= rom.size) {
+      palette = new Uint16Array(16);
+      palette[0] = 0;
+      rom.seek(pa);
+      for (let ci = 1; ci < 16; ci++) palette[ci] = rom.readWord();
+      resolvedPaletteAddr = pa;
+    }
+  }
+  if (!palette && nameKey !== null && SPRITE_PALETTE_BY_KEY[nameKey] !== undefined) {
+    const curatedId = SPRITE_PALETTE_BY_KEY[nameKey];
+    const curatedPal = loadSpritePalette(rom, curatedId);
+    if (curatedPal) { palette = curatedPal; resolvedPaletteSetId = curatedId; }
+  }
+
+  // Tier 2: saved override from localStorage (always wins if set)
+  if (spriteOverrides.has(animId)) {
+    const ovId = spriteOverrides.get(animId);
+    const ovPal = loadSpritePalette(rom, ovId);
+    if (ovPal) { palette = ovPal; resolvedPaletteSetId = ovId; }
+  }
+
+  // Tier 3: ROM initscript fallback (only if no curated or override palette)
+  if (!palette && palInfo) {
+    resolvedPaletteSetId = palInfo.paletteSetId;
+    resolvedPaletteAddr = palInfo.paletteAddr;
+    if (palInfo.paletteSetId !== null) palette = loadSpritePalette(rom, palInfo.paletteSetId);
+    if (!palette && palInfo.paletteAddr !== null) {
+      const pa = palInfo.paletteAddr;
+      if (pa + 30 <= rom.size) {
+        palette = new Uint16Array(16);
+        palette[0] = 0;
+        rom.seek(pa + 2);
+        for (let ci = 1; ci < 16; ci++) palette[ci] = rom.readWord();
+      }
+    }
+  }
+  const isGrey = !palette;
+  if (isGrey) {
+    palette = new Uint16Array(16);
+    for (let i = 0; i < 16; i++) { const v = Math.round(i * 31 / 15); palette[i] = v | (v << 5) | (v << 10); }
+  }
+
+  // Resolve composite palettes (extraRef-based or block2-based)
+  let secondaryPalette = null;
+  let secondaryPaletteSetId = null;
+  let block2Palette = null;
+  let block2PaletteSetId = null;
+  const compositePals = getCompositePalettes(animId, name);
+  if (compositePals) {
+    const isExtraRefComposite = !!hasCompositeFrames;
+    const isBlock2Composite = compositePals.block2PalId !== null;
+    // Force primary palette only for actual composites (extraRef-based or block2-based).
+    // Non-composite animations matching keywords (e.g. "DD Begin Grab Rattly") must NOT be overridden.
+    if (compositePals.primaryPalId !== null && (isExtraRefComposite || isBlock2Composite)) {
+      const forcedPrimary = loadSpritePalette(rom, compositePals.primaryPalId);
+      if (forcedPrimary) {
+        palette = forcedPrimary;
+        resolvedPaletteSetId = compositePals.primaryPalId;
+      }
+    }
+    // Load secondary palette for extraRefs (only relevant if animation has composite frames)
+    if (isExtraRefComposite && compositePals.secondaryPalId !== null) {
+      secondaryPalette = loadSpritePalette(rom, compositePals.secondaryPalId);
+      secondaryPaletteSetId = compositePals.secondaryPalId;
+    }
+    // Load block2 palette (for single-descriptor sprites with mixed palettes, e.g. SkullCart ride)
+    if (isBlock2Composite) {
+      block2Palette = loadSpritePalette(rom, compositePals.block2PalId);
+      block2PaletteSetId = compositePals.block2PalId;
+    }
+  }
+
+  return {
+    palette, isGrey, paletteSetId: resolvedPaletteSetId, paletteAddr: resolvedPaletteAddr,
+    secondaryPalette, secondaryPaletteSetId, block2Palette, block2PaletteSetId,
+  };
+}
+
 // ---- Animation helpers ----
 
 // Render a single gfxRef with the given palette, with result caching.
@@ -15588,8 +15853,9 @@ function buildSpriteGallery() {
   setTimeout(() => {
     gfxRefRenderCache.clear();
     animFramesCache.clear();
-    // Step 1: build palette reverse-map from all sprite types
-    const paletteMap = buildAnimPaletteMapFromRom();
+    // Step 1: build palette reverse-map from all sprite types (cached — the pack
+    // export asks for the same map and must not repeat the 2048-type scan)
+    const paletteMap = getAnimPaletteMap();
 
     // Step 2: collect all animation IDs to show
     // Start with all IDs in SPRITE_ANIM_NAMES, then add any from paletteMap not already covered
@@ -15616,93 +15882,20 @@ function buildSpriteGallery() {
         continue;
       }
 
-      // Load palette — 3-tier lookup (name-based FIRST for reliability):
-      // 1) Name-based SPRITE_PALETTE_BY_KEY (curated, verified)
-      // 2) localStorage override (user manual corrections)
-      // 3) ROM initscript map ($8D00 / $8400) — fallback only, prone to wrong assignments
-      let palette = null;
-      let resolvedPaletteSetId = null;
-      let resolvedPaletteAddr = null;
-
-      // Tier 1: name-based curated lookup (highest priority for known sprites)
-      const nameKey = extractSpriteKeyFromName(name);
-      if (nameKey !== null && SPRITE_PALETTE_DIRECT_ADDR[nameKey] !== undefined) {
-        // Direct ROM address (for 32-byte palette files or $8400 palettes)
-        const pa = SPRITE_PALETTE_DIRECT_ADDR[nameKey];
-        if (pa + 30 <= rom.size) {
-          palette = new Uint16Array(16);
-          palette[0] = 0;
-          rom.seek(pa);
-          for (let ci = 1; ci < 16; ci++) palette[ci] = rom.readWord();
-          resolvedPaletteAddr = pa;
-        }
-      }
-      if (!palette && nameKey !== null && SPRITE_PALETTE_BY_KEY[nameKey] !== undefined) {
-        const curatedId = SPRITE_PALETTE_BY_KEY[nameKey];
-        const curatedPal = loadSpritePalette(rom, curatedId);
-        if (curatedPal) { palette = curatedPal; resolvedPaletteSetId = curatedId; }
-      }
-
-      // Tier 2: saved override from localStorage (always wins if set)
-      if (spriteOverrides.has(animId)) {
-        const ovId = spriteOverrides.get(animId);
-        const ovPal = loadSpritePalette(rom, ovId);
-        if (ovPal) { palette = ovPal; resolvedPaletteSetId = ovId; }
-      }
-
-      // Tier 3: ROM initscript fallback (only if no curated or override palette)
-      if (!palette && palInfo) {
-        resolvedPaletteSetId = palInfo.paletteSetId;
-        resolvedPaletteAddr = palInfo.paletteAddr;
-        if (palInfo.paletteSetId !== null) palette = loadSpritePalette(rom, palInfo.paletteSetId);
-        if (!palette && palInfo.paletteAddr !== null) {
-          const pa = palInfo.paletteAddr;
-          if (pa + 30 <= rom.size) {
-            palette = new Uint16Array(16);
-            palette[0] = 0;
-            rom.seek(pa + 2);
-            for (let ci = 1; ci < 16; ci++) palette[ci] = rom.readWord();
-          }
-        }
-      }
-      const isGrey = !palette;
-      if (isGrey) {
-        palette = new Uint16Array(16);
-        for (let i = 0; i < 16; i++) { const v = Math.round(i * 31 / 15); palette[i] = v | (v << 5) | (v << 10); }
-      }
-
+      // Palette resolution lives in resolveSpritePalettes() — the pack export needs
+      // the identical answer to ship a correct reference palette, and a second copy
+      // of the cascade here would drift away from it.
       const frames = parseAnimFrames(rom, animId);
       const hasCompositeFrames = frames.some(f => f.extraRefs && f.extraRefs.length > 0);
-
-      // Resolve composite palettes (extraRef-based or block2-based)
-      let secondaryPalette = null;
-      let secondaryPaletteSetId = null;
-      let block2Palette = null;
-      let block2PaletteSetId = null;
-      const compositePals = getCompositePalettes(animId, name);
-      if (compositePals) {
-        const isExtraRefComposite = hasCompositeFrames;
-        const isBlock2Composite = compositePals.block2PalId !== null;
-        // Force primary palette only for actual composites (extraRef-based or block2-based).
-        // Non-composite animations matching keywords (e.g. "DD Begin Grab Rattly") must NOT be overridden.
-        if (compositePals.primaryPalId !== null && (isExtraRefComposite || isBlock2Composite)) {
-          const forcedPrimary = loadSpritePalette(rom, compositePals.primaryPalId);
-          if (forcedPrimary) {
-            palette = forcedPrimary;
-            resolvedPaletteSetId = compositePals.primaryPalId;
-          }
-        }
-        // Load secondary palette for extraRefs (only relevant if animation has composite frames)
-        if (isExtraRefComposite && compositePals.secondaryPalId !== null) {
-          secondaryPalette = loadSpritePalette(rom, compositePals.secondaryPalId);
-          secondaryPaletteSetId = compositePals.secondaryPalId;
-        }
-        // Load block2 palette (for single-descriptor sprites with mixed palettes, e.g. SkullCart ride)
-        if (isBlock2Composite) {
-          block2Palette = loadSpritePalette(rom, compositePals.block2PalId);
-          block2PaletteSetId = compositePals.block2PalId;
-        }
-      }
+      const palRes = resolveSpritePalettes(animId, name, palInfo, hasCompositeFrames);
+      let palette = palRes.palette;
+      const isGrey = palRes.isGrey;
+      let resolvedPaletteSetId = palRes.paletteSetId;
+      const resolvedPaletteAddr = palRes.paletteAddr;
+      const secondaryPalette = palRes.secondaryPalette;
+      const secondaryPaletteSetId = palRes.secondaryPaletteSetId;
+      const block2Palette = palRes.block2Palette;
+      const block2PaletteSetId = palRes.block2PaletteSetId;
 
       // Render thumbnail — prefer first composite frame (with extraRefs) to show full sprite
       const paletteKeyTmp = resolvedPaletteSetId !== null ? String(resolvedPaletteSetId) : 'grey';

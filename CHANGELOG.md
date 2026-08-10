@@ -1,5 +1,72 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-10] — `sprite_palettes.bin`: die Farben, unter denen ein Sprite gebacken wurde
+
+Phase 1 von vier. Der Export legt eine neue Datei in den Pack, die zu jedem HD-Sprite-Tile die
+16 Referenzfarben trägt. Im Spiel ändert sich damit noch nichts — Mesen liest die Datei erst in
+Phase 2.
+
+### Warum das nötig ist
+
+Der Auslöser: in Hot Head Hop sind die Kisten mit HD-Pack in der Default-Farbe statt in der
+Farbe des Levels; ohne HD-Pack stimmen sie. Die Disassembly erklärt es vollständig:
+
+```
+Level-Sprite-Daten → init-Command $8D <pal_index>      (sprite_property.cpp:40)
+  → DATA_FD5FEE + pal_index*2 → 15 Farben in Bank FD   (tile.cpp:21, index.html:3440)
+    → Allokator CODE_BB8A6F: 8 Slots ($0B64), Refcounts ($0B74)
+      → DMA nach CGRAM $80 + Slot*16 + 1
+        → Slot-Nummer in die OAM-Attributbits 9-11     (AND #$0E00)
+```
+
+Der **Inhalt** einer Sprite-Palette gehört also zum Sprite bzw. zu seinem Level-Eintrag, die
+**CGRAM-Zeile** dagegen ist eine dynamische Zuteilung. Genau diese Zeile ist aber alles, was
+Mesen zur Laufzeit sieht — und sie trägt keine Farbidentität. Der bisherige Umgang damit
+(`index.html:12780`) war, jede beobachtete `(Hash, Slot)`-Kombination aus dem Spritecap
+aufzuzeichnen und dieselbe Kunst pro Slot erneut zu schreiben. Gemessen am aktuellen Pack:
+31.417 Sprite-PNGs für 19.964 verschiedene Hashes, also 1,57 Kopien pro Hash und bei voller
+Abdeckung bis zu 8×. Abdeckung heißt hier außerdem: genug Level gespielt haben.
+
+Mit der Referenzpalette kann Mesen stattdessen Referenz→Live umfärben — eine Kunst pro Sprite,
+in jedem Level richtig eingefärbt, so wie es die Hardware macht.
+
+### Was drin steckt
+
+- **`resolveSpritePalettes()`** — die dreistufige Kaskade (kuratiert → localStorage-Override →
+  ROM-Initscript) aus `buildSpriteGallery()` herausgezogen. Beide rufen jetzt dieselbe
+  Funktion: eine zweite Kopie würde abdriften, und der Export würde eine Referenz ausliefern,
+  unter der die Kunst nie gerendert wurde.
+- **`getAnimPaletteMap()`** — cached den 2048-Typen-Initscript-Scan, den Galerie und Export
+  beide brauchen. Wird beim ROM-Wechsel verworfen.
+- **Wächter.** Die Kaskade kann heute anders antworten als beim SD-Export (Override geändert,
+  kuratierter Eintrag ergänzt). Eine falsche Referenz würde Mesen von den richtigen Farben
+  *weg* färben. Deshalb misst der Export an den tatsächlich geschriebenen Texeln, wie viel die
+  Kandidatenpalette erklärt, und liefert sie nur bei ≥ 35 % Abdeckung aus. Gemessen wird pro
+  Sprite, nicht pro Kachel — eine einzelne Kachel kann zu Recht nur aus Kantenpixeln bestehen.
+  Fehlende Referenz ist harmlos: Mesen lässt die Kachel dann in Ruhe.
+- **`animId`/`name`** werden aus den Container-Sprite-Sets in den Export durchgereicht; ohne sie
+  ist das Sprite nicht identifizierbar.
+
+### Format
+
+```
+uint8  version = 1
+uint16 paletteCount
+paletteCount × 16 × uint16le bgr555      (Index 0 = transparent)
+uint32 entryCount
+entryCount × { uint64le contentHash, uint16le paletteIndex }
+```
+
+Dedupliziert über den Paletteninhalt — viele Sprites teilen sich eine Palette. Round-Trip
+getestet inklusive max-uint64-Hash und gesetztem High-Bit.
+
+### Bekannte Lücke
+
+Laufzeit-Kacheln (`spritemiss`, Weltkarten-Schrift, Skull Cart, Fackeln) bekommen **keine**
+Referenz. Sie wurden vom Bildschirm erfasst und tragen die Live-Farben des Erfassungsmoments,
+nicht eine ROM-Referenz — dafür bräuchte es die CGRAM zum Erfassungszeitpunkt. Diese Kacheln
+verhalten sich weiter wie bisher.
+
 ## [2026-08-07b] — Cross-Gfxset-Wiederverwendung, und warum sie auf FARBEN schlüsseln muss
 
 Beim Pack-Export wird jede geschriebene BG-Kachel indiziert; ein Durchlauf davor füllt bei
