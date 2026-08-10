@@ -4840,8 +4840,23 @@ const OVERWORLD_SETS = {
   // BG2 is Pirate Panic's own, byte for byte: all 254 tiles at their original
   // addresses AND in the same palettes, so it needs no new art, only a copy
   // into this gfxset (strict scoping blocks foreign gfxsets, SnesHdData.h:476).
+  // hscroll/vscroll are the live BGnHOFS/BGnVOFS from the dump. They matter:
+  // the visible area is a 256x224 window at (hscroll, vscroll+1) into the
+  // tilemap, WITH wraparound — not rows 0..27 from the origin. Rendering from
+  // the origin is right only when that window happens to land there.
+  //
+  // The SNES shows BG line (vscroll + 1) on screen line 0, so vscroll 1023 on a
+  // 256 px tall tilemap is (1023+1) mod 256 = 0 — exactly the origin, not "minus
+  // one". Same for vscroll 255. Only two layers in this table are genuinely
+  // offset: this screen's BG2 (151 px across) and Game Over's two.
+  //
+  // Verified by rendering all seven screens straight from VRAM+CGRAM with these
+  // values (scratchpad/render_screen.js): every one comes out correct, and the
+  // "data garbage below the image" disappears, because rows 28-31 are leftover
+  // that the window never reaches.
   0x3F: { kind: 'screen', levelId: null, name: 'Pirate Panic (hidden room)', chr: 0x2000, tm: 0x7000,
-          extraLayers: [{ layer: 2, chr: 0x6000, tm: 0x7800 }] },
+          hscroll: 256, vscroll: 255,
+          extraLayers: [{ layer: 2, chr: 0x6000, tm: 0x7800, hscroll: 663, vscroll: 1023 }] },
 
   // The three bonus screens. Identical PPU setup (main=$13, BG1+BG2+OBJ), and
   // identical VRAM signature — Mesen cannot tell them apart by fingerprint, so
@@ -4876,8 +4891,14 @@ const OVERWORLD_SETS = {
   // Game Over: BG1+BG2 (main=$03), no sprites. BG1 is the only screen here with
   // a 64x64 tilemap (doubleWidth AND doubleHeight); BG2 is 32x64. BG3 carries
   // bases but its bit is not set, so it is left out.
+  // Game Over is the one screen where BOTH layers are genuinely scrolled, and the
+  // only one with a 64x64 tilemap. BG1: vscroll 1016 on 512 px -> first visible
+  // line 505, so the window wraps around the bottom edge. BG2: vscroll 255 on
+  // 512 px -> line 256, i.e. the SECOND screen of the tall tilemap; reading from
+  // the origin shows an empty map (measured: no row 0..31 carries content).
   0x45: { kind: 'screen', levelId: null, name: 'Game Over', chr: 0x2000, tm: 0x7000, wide: true, tall: true,
-          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x6800, tall: true }] },
+          hscroll: 0, vscroll: 1016,
+          extraLayers: [{ layer: 2, chr: 0x2000, tm: 0x6800, tall: true, hscroll: 0, vscroll: 255 }] },
 };
 
 function isOverworldSet(gfxSetIndex) {
@@ -4931,6 +4952,12 @@ function getOverworldLayers(gfxSetIndex) {
     layer: o.layer || 1,
     chrBase: o.chr,
     tilemapBase: o.tm,
+    // Live scroll registers. Consumers that still render the whole tilemap from
+    // the origin can ignore these; the visible window is 256x224 at
+    // (hscroll, vscroll+1) with wraparound. Default 0 keeps every existing
+    // shop and map exactly as it was.
+    hscroll: o.hscroll || 0,
+    vscroll: o.vscroll || 0,
     wide: !!o.wide,
     tall: !!o.tall,
     // Mode 1: BG1/BG2 are 4bpp, BG3 is 2bpp.
@@ -4940,8 +4967,11 @@ function getOverworldLayers(gfxSetIndex) {
     // then blocks HD for the WHOLE screen — not just the animated part.
     animated: !!o.animated,
   });
+  // hscroll/vscroll must be forwarded here too — extraLayers carry their own
+  // because they are spread straight into mk(), but BG1's were being dropped,
+  // so its window silently stayed at the origin.
   return [mk({ layer: 1, chr: def.chr, tm: def.tm, wide: def.wide, tall: def.tall,
-               animated: def.animated }),
+               animated: def.animated, hscroll: def.hscroll, vscroll: def.vscroll }),
           ...(def.extraLayers || []).map(mk)];
 }
 
@@ -5036,9 +5066,39 @@ function buildOverworldCatalog(gfxSetIndex) {
     const isStatic = def.kind === 'shop' || def.kind === 'screen';
     const visibleRows = (isStatic && tilesH === 32) ? 28 : tilesH;
 
+    // What the PPU actually shows: a 256x224 window at (hscroll, vscroll+1) into
+    // the tilemap, WITH wraparound. Rendering the whole tilemap from the origin
+    // and cropping to 28 rows is only right when that window happens to land
+    // there — and it does not always. Pirate Panic's hidden room offsets BG2 by
+    // 151 px, and Game Over's BG2 sits at y=256, the SECOND screen of its tall
+    // tilemap, so reading from the origin shows an entirely empty map.
+    //
+    // Rows 28-31 hold uninitialised leftovers, which is why the same background
+    // shows DIFFERENT junk on different visits. The window never reaches them.
+    //
+    // Kept SEPARATE from image.canvas on purpose: the export slices 8x8 tiles out
+    // of that canvas by grid position, and a 151 px offset is not a multiple of 8
+    // — slicing the scrolled window would cut across tile boundaries and mislabel
+    // every tile. The aligned full tilemap stays the export's source.
+    let viewCanvas = null;
+    if (isStatic) {
+      const VW = 256, VH = 224;
+      const ox = ((cfg.hscroll % widthPx) + widthPx) % widthPx;
+      const oy = (((cfg.vscroll + 1) % heightPx) + heightPx) % heightPx;
+      viewCanvas = new OffscreenCanvas(VW, VH);
+      const vctx = viewCanvas.getContext('2d');
+      vctx.imageSmoothingEnabled = false;
+      // Four draws cover every wraparound case; the ones off-canvas cost nothing.
+      for (const dx of [0, widthPx]) {
+        for (const dy of [0, heightPx]) vctx.drawImage(canvas, dx - ox, dy - oy);
+      }
+    }
+
     owLayers.push({
       layer: cfg.layer,
       image: { canvas, widthPx, heightPx, tilesW, tilesH, tileSize: 8 },
+      viewCanvas,
+      scrollX: cfg.hscroll, scrollY: cfg.vscroll,
       chrBase: cfg.chrBase,
       tilemapBase: cfg.tilemapBase,
       tilesW, tilesH, visibleRows,
@@ -5824,10 +5884,31 @@ function loadLevel(levelId) {
       // descending — BG2 first, BG1 over it.
       const layers = (catalogData.owLayers || []).slice().sort((a, b) => b.layer - a.layer);
       if (layers.length) {
-        // visibleRows is the honest height: a static screen's rows 28-31 hold
-        // leftover data below the 224 visible scanlines.
-        const wPx = Math.max(...layers.map(l => l.image.widthPx));
-        const hPx = Math.max(...layers.map(l => Math.min(l.visibleRows || l.tilesH, l.tilesH) * 8));
+        // Prefer the scrolled 256x224 window when the layer has one — that is
+        // what the PPU shows. Falls back to the old crop for maps, which scroll
+        // freely and have no single "the" window.
+        const useView = layers.every(l => l.viewCanvas);
+
+        // HD art, looked up by gfxset exactly like renderCatalog does. Without
+        // this the catalog would show HD and this view would quietly stay SD —
+        // the same class of failure as the runtime gallery on 2026-08-05, where
+        // the import was correct and only the renderer never asked for it.
+        const hdOwSet = (typeof hdEnabled !== 'undefined' && hdEnabled &&
+                         typeof hdPack !== 'undefined' && hdPack && hdPack.owLayers)
+          ? hdPack.owLayers[gfx] : null;
+        const hdOf = (l) => (hdOwSet && hdOwSet[l.layer] && hdOwSet[l.layer].img)
+          ? hdOwSet[l.layer].img : null;
+        // One scale for the whole composite: mixing a 4x layer with a 1x one at
+        // native size would shrink the HD layer back to SD.
+        let scale = 1;
+        for (const l of layers) {
+          const hd = hdOf(l);
+          if (hd && l.image.widthPx) scale = Math.max(scale, Math.round(hd.width / l.image.widthPx));
+        }
+
+        const wPx = (useView ? 256 : Math.max(...layers.map(l => l.image.widthPx))) * scale;
+        const hPx = (useView ? 224
+          : Math.max(...layers.map(l => Math.min(l.visibleRows || l.tilesH, l.tilesH) * 8))) * scale;
         welcome.style.display = 'none';
         levelCanvas.style.display = 'block';
         levelCanvas.width = wPx;
@@ -5835,11 +5916,31 @@ function loadLevel(levelId) {
         const lctx = levelCanvas.getContext('2d');
         lctx.imageSmoothingEnabled = false;
         lctx.clearRect(0, 0, wPx, hPx);
-        for (const l of layers) lctx.drawImage(l.image.canvas, 0, 0);
+        let hdUsed = 0;
+        for (const l of layers) {
+          const hd = hdOf(l);
+          if (!hd) {
+            // No HD for this layer — stretch the SD render so it still lines up
+            // with the HD ones instead of sitting in a corner.
+            lctx.drawImage(useView ? l.viewCanvas : l.image.canvas, 0, 0, wPx, hPx);
+            continue;
+          }
+          hdUsed++;
+          if (!useView) { lctx.drawImage(hd, 0, 0, wPx, hPx); continue; }
+          // Same window as the SD path, but at HD resolution: the scroll offset
+          // has to be scaled with the art, and the four draws cover wraparound.
+          const s = Math.round(hd.width / l.image.widthPx) || 1;
+          const ox = (((l.scrollX % l.image.widthPx) + l.image.widthPx) % l.image.widthPx) * s;
+          const oy = ((((l.scrollY + 1) % l.image.heightPx) + l.image.heightPx) % l.image.heightPx) * s;
+          for (const dx of [0, hd.width]) {
+            for (const dy of [0, hd.height]) lctx.drawImage(hd, dx - ox, dy - oy);
+          }
+        }
         applyZoom();
         statusText.textContent = `${def.name} (Set 0x${gfx.toString(16).toUpperCase()}) | ` +
           `${wPx}x${hPx}px, ${layers.length} Ebene(n): ` +
-          layers.map(l => `BG${l.layer}`).join(' + ');
+          layers.map(l => `BG${l.layer}`).join(' + ') +
+          (hdUsed ? `  |  HD: ${hdUsed}/${layers.length}` : '  |  SD');
       } else {
         statusText.textContent = `${def.name}: keine Ebene gerendert — siehe Konsole`;
       }
@@ -12040,6 +12141,62 @@ async function exportAsTexturePack(containerName) {
   // snapshot rather than carried through the ZIP: image and tilemap must come
   // from the same VRAM or tiles get named after the wrong addresses, and the
   // ground truth already holds a real dump for every one of these screens.
+  // Cross-gfxset reuse: HD art is keyed by (content hash, palette, layer), so the
+  // SAME tile under the SAME palette on the SAME layer is interchangeable between
+  // gfxsets. What is NOT interchangeable is the file: pack tiles are named after
+  // their VRAM address and scoped per gfxset (SnesHdData.h:476 blocks a foreign
+  // one), so art that exists under gfxset_07 is invisible to a screen running as
+  // gfxset_3F. Recording what was written lets a later pass fill those gaps by
+  // copying, with no second upscale.
+  //
+  // Measured on Pirate Panic's hidden room: all 254 of its BG2 tiles exist under
+  // gfxset_07, at the same addresses AND in the same palettes. Funky's BG2 is the
+  // harder case and only partly solved this way — 99 of its 252 tiles exist on
+  // palette 7, the rest Mainbrace uses with other palettes, and palette-specific
+  // art cannot stand in for them.
+  // The key must carry the palette's actual COLOURS, not its index. The index is
+  // just a number, and which colours sit in it is decided by that screen's CGRAM
+  // — two gfxsets can both call something "palette 7" and mean entirely different
+  // colours. HD art has the donor's colours baked in, so matching on the index
+  // alone hands over the right shape in the wrong colour. That is exactly what
+  // showed up in Funky's sky: a few tiles came out grey instead of blue.
+  //
+  // Fewer tiles match this way, and that is the point: a tile that cannot be
+  // matched on colour is honestly reported as needing a real upscale.
+  const _palCache = new Map();
+  const _palOf = (gfxset) => {
+    if (_palCache.has(gfxset)) return _palCache.get(gfxset);
+    let pal = null;
+    const key = `gfxset_${gfxset.toString(16).toUpperCase().padStart(2, '0')}`;
+    if (typeof CGRAM_GROUND_TRUTH !== 'undefined' && CGRAM_GROUND_TRUTH[key]) {
+      const cg = _b64ToUint8Array(CGRAM_GROUND_TRUTH[key]);
+      pal = new Uint16Array(cg.length >> 1);
+      for (let i = 0; i < pal.length; i++) pal[i] = (cg[i * 2] | (cg[i * 2 + 1] << 8)) & 0x7FFF;
+    }
+    _palCache.set(gfxset, pal);
+    return pal;
+  };
+  // No CGRAM means we cannot prove the colours agree, so the signature is made
+  // unique to that gfxset — it will only ever match itself, i.e. no cross-set
+  // reuse. Silently falling back to the index is what caused the wrong colours.
+  const _palSig = (gfxset, pal, is4bpp) => {
+    const p = _palOf(gfxset);
+    if (!p) return `nocg:${gfxset}`;
+    const base = is4bpp === false ? pal * 4 : pal * 16;
+    const n = is4bpp === false ? 4 : 16;
+    let s = '';
+    for (let i = 0; i < n; i++) s += (p[base + i] || 0).toString(16) + ',';
+    return s;
+  };
+
+  const _hdTileIndex = new Map();   // "hash|palSig|layer" -> Blob
+  const _writtenTiles = new Set();  // "gfxset|layer|addr|pal"
+  const _noteTile = (gfxset, layer, addr, pal, hash, blob, is4bpp) => {
+    _writtenTiles.add(`${gfxset}|${layer}|${addr}|${pal}`);
+    const k = `${hash}|${_palSig(gfxset, pal, is4bpp)}|${layer}`;
+    if (!_hdTileIndex.has(k)) _hdTileIndex.set(k, blob);
+  };
+
   let owExportedTiles = 0;
   showMesenExportProgress('Shop-/Weltkarten-Tiles exportieren…', 0.60);
   await _yieldToBrowser();
@@ -12113,7 +12270,11 @@ async function exportAsTexturePack(containerName) {
           const raw = atob(dataUrl.slice(dataUrl.indexOf(',') + 1));
           const arr = new Uint8Array(raw.length);
           for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-          folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
+          const owBlob = new Blob([arr], { type: 'image/png' });
+          folder.file(`${fileKey}.png`, owBlob);
+          _noteTile(set.gfxSetIndex, layer - 1, vramWordAddr, palRow,
+                    fnv1a_64(vram, vramWordAddr * 2, wordsPerTile * 2).toString(), owBlob,
+                    meta.is4bpp !== false);
           owExportedTiles++;
         }
       }
@@ -12216,7 +12377,17 @@ async function exportAsTexturePack(containerName) {
         const raw = atob(b64);
         const arr = new Uint8Array(raw.length);
         for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-        bg2Folder.file(`${fileKey}.png`, new Blob([arr], { type: 'image/png' }));
+        const bg2Blob = new Blob([arr], { type: 'image/png' });
+        bg2Folder.file(`${fileKey}.png`, bg2Blob);
+        // This is where a LEVEL's BG2 art enters the index — and it is exactly the
+        // art the hidden room needs, since its BG2 is Pirate Panic's own.
+        if (set.vramSnapshot && set.vramSnapshot.length >= 0x10000) {
+          const _v = set.vramSnapshot instanceof Uint8Array
+            ? set.vramSnapshot : new Uint8Array(set.vramSnapshot);
+          _noteTile(bg2GfxIdx, 1, vramWordAddr, palRow,
+                    fnv1a_64(_v, vramWordAddr * 2, wordsPerTile * 2).toString(), bg2Blob,
+                    is4bpp);
+        }
         if (_prevFlipped === undefined) bg2ExportedTiles++;   // Ueberschreiben ist kein neues Tile
       }
     }
@@ -12799,7 +12970,86 @@ async function exportAsTexturePack(containerName) {
   let usesContentHash = false;
   let fpEntries = null;   // fingerprint entries per gfxset (declared outside { } for manifest visibility)
   {
+    // ---- Cross-gfxset reuse pass ----
+    // Runs BEFORE hashes.bin is built, because a copied tile needs its entry
+    // there too — the loader resolves a BG tile's ContentHash from
+    // (gfxset, layer, vramAddr) and skips the file outright without it
+    // ("No content hash for tile ... - skipping", SnesHdPackLoader.cpp:459).
+    //
+    // Only overworld/screen sets are filled: a set may legitimately have no HD
+    // art of its own for a layer (the hidden room never gets a BG2 upscale
+    // because Pirate Panic's already exists), and that layer would otherwise
+    // ship nothing at all and render SD despite the art being in the pack.
+    let _reused = 0, _reuseMissing = 0;
+    const _reuseStats = new Map();   // "gfxset_XX BGn" -> {gfx, ok, miss}
+    const hashEntriesPending = [];   // gesammelt, unten in hashEntries eingespeist
+    for (const set of levelSets) {
+      if (set.gfxSetIndex == null || !isOverworldSet(set.gfxSetIndex)) continue;
+      const snap = set.vramSnapshot;
+      if (!snap || snap.length < 0x10000) continue;
+      const v = snap instanceof Uint8Array ? snap : new Uint8Array(snap);
+      const gfxIdStr = String(set.gfxSetIndex).padStart(2, '0');
+
+      for (const cfg of (getOverworldLayers(set.gfxSetIndex) || [])) {
+        const layerIdx = cfg.layer - 1;                 // BG1 -> 0
+        const words = cfg.is4bpp === false ? 8 : 16;
+        const tilesW = cfg.wide ? 64 : 32, tilesH = cfg.tall ? 64 : 32;
+        const folder = root.folder(`bg/bg${cfg.layer}/gfxset_${gfxIdStr}`);
+        const seen = new Set();
+        const statKey = `gfxset_${gfxIdStr} BG${cfg.layer}`;
+        if (!_reuseStats.has(statKey)) {
+          _reuseStats.set(statKey, { gfx: set.gfxSetIndex, ok: 0, miss: 0 });
+        }
+        const stat = _reuseStats.get(statKey);
+
+        for (let ty = 0; ty < tilesH; ty++) {
+          for (let tx = 0; tx < tilesW; tx++) {
+            let so = 0;
+            if (tx >= 32) so += 0x400;
+            if (ty >= 32) so += (tilesW > 32) ? 0x800 : 0x400;
+            const tmo = (cfg.tilemapBase + so + (ty & 31) * 32 + (tx & 31)) * 2;
+            if (tmo + 1 >= v.length) continue;
+            const e = v[tmo] | (v[tmo + 1] << 8);
+            const addr = (cfg.chrBase + (e & 0x3FF) * words) & 0x7FFF;
+            const pal = (e >> 10) & 7;
+            const dk = `${addr}|${pal}`;
+            if (seen.has(dk)) continue;
+            seen.add(dk);
+            if (_writtenTiles.has(`${set.gfxSetIndex}|${layerIdx}|${addr}|${pal}`)) continue;
+
+            const hash = fnv1a_64(v, addr * 2, words * 2);
+            const donor = _hdTileIndex.get(
+              `${hash.toString()}|${_palSig(set.gfxSetIndex, pal, cfg.is4bpp !== false)}|${layerIdx}`);
+            if (!donor) { _reuseMissing++; stat.miss++; continue; }
+
+            const name = `${addr.toString(16).padStart(4, '0')}_P${String(pal).padStart(2, '0')}`;
+            folder.file(`${name}.png`, donor);
+            hashEntriesPending.push({ vramAddr: addr, layer: layerIdx,
+                                      gfxset: set.gfxSetIndex, hash });
+            _writtenTiles.add(`${set.gfxSetIndex}|${layerIdx}|${addr}|${pal}`);
+            _reused++; stat.ok++;
+          }
+        }
+      }
+    }
+    if (_reused || _reuseMissing) {
+      console.log(`[reuse] ${_reused} Kachel(n) aus einem anderen Gfxset uebernommen, ` +
+                  `${_reuseMissing} ohne Spender (brauchen echten Upscale)`);
+      // Ohne Aufschluesselung ist die Gesamtzahl nicht auswertbar: 570 fehlende
+      // Spender sind harmlos, wenn sie auf einer Ebene liegen, die absichtlich
+      // keinen Upscale bekommt (BG1 des Ladeschirms ist Laufzeit-Text), und ein
+      // echter Fund, wenn sie auf einer Ebene liegen, die HD sein sollte.
+      for (const [k, s] of [..._reuseStats.entries()].sort()) {
+        const name = (OVERWORLD_SETS[s.gfx] && OVERWORLD_SETS[s.gfx].name) || '?';
+        console.log(`  ${k}  uebernommen ${s.ok}, ohne Spender ${s.miss}` +
+                    `${s.ok || s.miss ? `   (${name})` : ''}`);
+      }
+    }
+
     const hashEntries = [];  // { vramAddr, layer, gfxset, hash: BigInt }
+    // Die kopierten Kacheln zuerst: ihr Eintrag darf nicht fehlen, sonst
+    // ueberspringt der Loader die Datei. Die regulaeren Wege haengen unten an.
+    for (const he of hashEntriesPending) hashEntries.push(he);
     const dedupKey = new Set();
 
 

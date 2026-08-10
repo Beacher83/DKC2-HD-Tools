@@ -1,5 +1,41 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-07b] — Cross-Gfxset-Wiederverwendung, und warum sie auf FARBEN schlüsseln muss
+
+Beim Pack-Export wird jede geschriebene BG-Kachel indiziert; ein Durchlauf davor füllt bei
+Overworld-/Schirm-Sets die Lücken, indem er dieselbe Kachel aus einem anderen Gfxset kopiert.
+Kein zweiter Upscale. Er läuft **vor** `hashes.bin`, weil eine kopierte Kachel dort einen
+Eintrag braucht — der Loader leitet den ContentHash aus (Gfxset, Layer, VRAM-Adresse) ab und
+überspringt die Datei sonst wortlos (`SnesHdPackLoader.cpp:459`).
+
+**Ergebnis im Spiel: Funkys BG2 läuft nach Monaten in HD.** `bg2/gfxset_09` (252 Dateien)
+existierte vorher überhaupt nicht. Der Abgleich läuft über den Inhalts-Hash, nicht über den
+Dateinamen — nötig, weil 152 der Kacheln bei Funky an anderen VRAM-Adressen liegen als bei
+Mainbrace, woran das bloße Kopieren am 31.07. gescheitert war.
+
+**Korrektur am selben Tag:** Der erste Schlüssel war `(ContentHash, Paletten-INDEX, Layer)` und
+lieferte im Spiel ein paar graue Kacheln in Funkys blauem Himmel. Der Index ist nur eine
+Nummer — welche Farben darin stehen, entscheidet die CGRAM des jeweiligen Schirms, und HD-Kunst
+trägt die Farben des Spenders eingebacken. Der Schlüssel führt jetzt die **16 echten
+CGRAM-Farben** der Zeile. Ohne CGRAM wird die Signatur absichtlich gfxset-eindeutig, es findet
+dann also gar keine Übernahme statt: lieber eine Lücke als eine falsche Farbe.
+
+Gegengeprüft: Funkys und Mainbrace' Palettenzeile 7 sind byte-identisch, die richtige Übernahme
+überlebt den strengeren Schlüssel also. Nur die Fehlgriffe fallen weg.
+
+Die Ausgabe schlüsselt jetzt je Set und Ebene auf — eine Gesamtzahl allein ist nicht auswertbar:
+fehlende Spender sind harmlos auf einer Ebene, die absichtlich keinen Upscale bekommt
+(BG1 des Ladeschirms ist Laufzeit-Text), und ein echter Fund auf einer, die HD sein sollte.
+
+### Offen aus dem Mesen-Test
+
+- **Soundeffekte hängen nach** — Effekt kommt Sekunden verspätet. Emulator, nicht Pack.
+  Erste Eingrenzung: tritt es auch mit deaktiviertem HD-Pack auf?
+- **HD-Sprites ignorieren Level-Farbeffekte** — in Hot Head Hop stechen alle HD-Kisten heraus,
+  zu hell. SD-Sprites bekommen den Effekt. Verdacht auf den S4-Sprite-Pfad
+  (`SnesHdVideoFilter.cpp:959ff`), Zusammenhang mit dem Kanten-Befund vom 06.08. prüfen.
+- Ladeschirm `0x44` braucht einen Container-Eintrag, damit der Durchlauf ihn erreicht.
+
 ## [2026-08-07] — Sieben eigenständige Schirme im Haupt-Dropdown, mit Level-Ansicht
 
 Die Schirme stehen jetzt dort, wo Level, Hintergründe und NPC-Shops stehen: ein Block
