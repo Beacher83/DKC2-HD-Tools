@@ -8286,8 +8286,79 @@ let hdEnabled = false;
 // cannot be derived from ROM, so tiles without a recording are skipped.
 let spriteCapPairs = null;
 
+// Hashes the game draws under a palette AND an entry-wise dimmed copy of it —
+// see findDimmedHashes() for why the pack must not ship those without a
+// reference palette.
+let spriteCapDimmed = new Set();
+
+// DKC2 draws the inactive partner Kong with a dimmed copy of the active one's
+// palette: among the 188 rows a recording holds there are exactly two such
+// pairs (Diddy and Dixie), both at factor 0.70. A tile drawn under BOTH rows
+// only looks right if it is recoloured, so shipping it WITHOUT a reference
+// guarantees it is wrong half the time — it stays bright while the game dims
+// it. That was the last flicker left after the v4 reference selection, and no
+// reference can be derived for those tiles: measured, their best-fitting
+// palettes are foreign ones, which is exactly the mistake v3 made. The export
+// drops their art instead; Mesen renders them natively, which is correct under
+// either palette.
+//
+// rowsHex: the distinct CGRAM rows seen, as 64 hex chars each.
+// hashRows: hash → Set(index into rowsHex).
+function findDimmedHashes(rowsHex, hashRows) {
+  const rows = rowsHex.map(hex => {
+    const c = new Uint16Array(16);
+    for (let i = 0; i < 16; i++) c[i] = parseInt(hex.substr(i * 4, 4), 16) & 0x7FFF;
+    return c;
+  });
+
+  // Is b the same palette as a, every entry scaled by roughly one factor?
+  const isDimmedCopy = (a, b) => {
+    let n = 0, sum = 0, lo = Infinity, hi = -Infinity;
+    for (let i = 1; i < 16; i++) {            // index 0 is transparent, never drawn
+      for (let shift = 0; shift <= 10; shift += 5) {
+        const ca = (a[i] >> shift) & 31;
+        if (ca < 6) continue;                 // too dark to tell dimming from rounding
+        const r = ((b[i] >> shift) & 31) / ca;
+        sum += r; n++;
+        if (r < lo) lo = r;
+        if (r > hi) hi = r;
+      }
+    }
+    if (n < 15) return false;                 // too little evidence
+    const mean = sum / n;
+    return mean >= 0.30 && mean <= 0.90 && (hi - lo) <= 0.30;
+  };
+
+  const partners = new Map();                 // row → rows that are a dimmed copy of it
+  for (let i = 0; i < rows.length; i++) {
+    for (let j = 0; j < rows.length; j++) {
+      if (i !== j && isDimmedCopy(rows[i], rows[j])) {
+        if (!partners.has(i)) partners.set(i, new Set());
+        partners.get(i).add(j);
+      }
+    }
+  }
+
+  const dimmed = new Set();
+  for (const [hash, ids] of hashRows) {
+    for (const i of ids) {
+      const p = partners.get(i);
+      if (!p) continue;
+      for (const j of p) {
+        if (ids.has(j)) { dimmed.add(hash); break; }
+      }
+      if (dimmed.has(hash)) break;
+    }
+  }
+  console.log(`[spritecap] ${partners.size} Palettenzeilen haben eine gedimmte Kopie, ` +
+              `${dimmed.size} Kacheln werden unter beiden gezeichnet`);
+  return dimmed;
+}
+
 function parseSpriteCap(text) {
   const map = new Map();
+  const rowId = new Map();      // CGRAM row (64 hex) → dense index
+  const hashRows = new Map();   // hash → Set(row index)
   let lines = 0, bad = 0;
   for (const line of text.split('\n')) {
     if (line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (Mesen S18)
@@ -8300,12 +8371,16 @@ function parseSpriteCap(text) {
     for (let i = 0; i < 32; i++) bytes[i] = parseInt(m[3].substr(i * 2, 2), 16);
     const h = fnv1a_64(bytes, 0, 32).toString(16).padStart(16, '0').toUpperCase();
     if (h !== m[1]) { bad++; continue; }
-    if (!map.has(m[1])) map.set(m[1], new Set());
+    if (!map.has(m[1])) { map.set(m[1], new Set()); hashRows.set(m[1], new Set()); }
     map.get(m[1]).add(parseInt(m[2]));
+    let rid = rowId.get(m[4]);
+    if (rid === undefined) { rid = rowId.size; rowId.set(m[4], rid); }
+    hashRows.get(m[1]).add(rid);
   }
   const pairs = [...map.values()].reduce((a, s) => a + s.size, 0);
   console.log(`[spritecap] ${lines} Zeilen gelesen, ${map.size} distinkte Hashes, ${pairs} (hash,pal)-Paare, ${bad} verworfen`);
-  return { map, lines, pairs, bad };
+  const dimmed = findDimmedHashes([...rowId.keys()], hashRows);
+  return { map, dimmed, lines, pairs, bad };
 }
 
 // S6b: runtime BG-miss capture (snes_hd_bgcap.txt from Mesen build S6a+).
@@ -9952,9 +10027,15 @@ async function restoreSpriteCapFromDb() {
     const rec = await loadRecording('spritecap');
     if (!rec || !rec.entries || rec.entries.length === 0) return;
     spriteCapPairs = new Map(rec.entries);
+    spriteCapDimmed = new Set(rec.dimmed || []);
     updateSpriteCapButton(spriteCapPairs.size, rec.pairs, rec.savedAt);
     console.log(`[spritecap] ${spriteCapPairs.size} Hashes aus der Datenbank wiederhergestellt ` +
                 `(gespeichert am ${rec.savedAt}) — kein erneutes Hochladen nötig`);
+    if (!rec.dimmed) {
+      console.warn('[spritecap] Diese Aufzeichnung stammt aus einer älteren Version und kennt die ' +
+                   'gedimmten Palettenpaare nicht — der Export kann Kacheln des inaktiven Partner-Kongs ' +
+                   'nicht aussortieren. Spritecap einmal neu laden.');
+    }
   } catch (e) {
     console.warn('[spritecap] restore failed:', e);
   }
@@ -12935,7 +13016,7 @@ async function exportAsTexturePack(containerName) {
           }
           return bestPal && bestErr <= MAX_REF_ERR ? { pal: bestPal, err: bestErr } : null;
         };
-        const refStats = { assigned: 0, unexplained: 0, noPalette: 0, composite: 0, errSum: 0 };
+        const refStats = { assigned: 0, unexplained: 0, noPalette: 0, composite: 0, errSum: 0, droppedDimmed: 0 };
 
         for (const spr of sprSources) {
           const spriteKey = spr.key;
@@ -13036,6 +13117,15 @@ async function exportAsTexturePack(containerName) {
                   }
                 }
 
+                // Without a reference this tile keeps its baked colours, and the
+                // game draws it under a dimmed palette too (the inactive partner
+                // Kong) — so it would be wrong half the time. Ship nothing and let
+                // Mesen render it natively, which is right under either palette.
+                if (spriteRefVetoed.has(hashHex) && spriteCapDimmed.has(hashHex)) {
+                  refStats.droppedDimmed++;
+                  continue;
+                }
+
                 const dataUrl = outCanvas.toDataURL('image/png');
                 const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
                 const rawPng = atob(b64);
@@ -13061,7 +13151,8 @@ async function exportAsTexturePack(containerName) {
           `(mittlerer Fehler ${refStats.assigned ? Math.round(refStats.errSum / refStats.assigned) : 0}), ` +
           `${refStats.unexplained} von der eigenen Palette nicht erklärt (ohne Referenz), ` +
           `${refStats.noPalette} Sprites ohne auflösbare Palette, ` +
-          `${refStats.composite} Sprites mit mehreren Kandidaten (Composite); ` +
+          `${refStats.composite} Sprites mit mehreren Kandidaten (Composite), ` +
+          `${refStats.droppedDimmed} Kacheln ohne Referenz verworfen (werden auch gedimmt gezeichnet); ` +
           `${spriteRefPalettes.size} Kachel-Hashes abgedeckt`);
         console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert; ` +
           `${noPalHashes.size} Hashes ohne Runtime-Palette übersprungen (mehr Level mit S5a-Build spielen); ` +
@@ -13097,13 +13188,17 @@ async function exportAsTexturePack(containerName) {
       showMesenExportProgress('Laufzeit-Kacheln exportieren…', 0.85);
       await _yieldToBrowser();
       const spritesFolder = root.folder('sprites');
-      let skippedScale = 0, overwritten = 0;
+      let skippedScale = 0, overwritten = 0, droppedDimmed = 0;
       for (const t of rtTiles) {
         if ((t.scaleFactor || 4) !== 4) { skippedScale++; continue; }
         if (!/^[0-9A-F]{16}_P\d$/.test(t.key)) {
           console.warn(`[laufzeit] Schlüssel "${t.key}" passt nicht auf {hash16}_P{pal} — übersprungen`);
           continue;
         }
+        // Runtime art never keeps a reference (see below), so a tile the game
+        // also draws dimmed cannot follow that palette and would stay bright.
+        // Same call as in the gallery export: native beats wrong.
+        if (spriteCapDimmed.has(t.key.split('_P')[0])) { droppedDimmed++; continue; }
         // Runtime art WINS over a gallery sprite of the same hash: it was captured
         // from the exact tile the game drew, while a gallery frame is a ROM
         // reconstruction that may differ in palette handling.
@@ -13121,6 +13216,7 @@ async function exportAsTexturePack(containerName) {
       }
       console.log(`[laufzeit] ${runtimeExportedTiles} Laufzeit-Kachel-PNGs exportiert` +
                   (overwritten ? `, davon ${overwritten} über gleichnamige Sprite-Kacheln` : '') +
+                  (droppedDimmed ? `; ${droppedDimmed} verworfen (werden auch gedimmt gezeichnet)` : '') +
                   (skippedScale ? `; ${skippedScale} mit Skalierung != 4x übersprungen` : ''));
     }
   }
@@ -17292,10 +17388,11 @@ document.getElementById('spriteCapInput').addEventListener('change', async (e) =
     return;
   }
   spriteCapPairs = res.map;
+  spriteCapDimmed = res.dimmed;
   updateSpriteCapButton(res.map.size, res.pairs, null);
   // Persist so it survives reloads — re-picking a file just overwrites it.
   try {
-    await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs });
+    await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs, dimmed: [...res.dimmed] });
     console.log(`[spritecap] ${res.map.size} Hashes gespeichert — bleibt über Reloads erhalten`);
   } catch (err) {
     console.warn('[spritecap] konnte nicht gespeichert werden:', err);

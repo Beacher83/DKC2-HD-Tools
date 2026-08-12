@@ -1,5 +1,47 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-12] — v4 bestätigt; Kacheln ohne Referenz, die gedimmt gezeichnet werden, fliegen raus
+
+**v4 ist im Spiel bestätigt:** das Sprite-Flimmern ist weg, die getönten Kisten bleiben getönt.
+Übrig blieb eine Kleinigkeit — der **inaktive Partner-Kong** (der dem aktiven folgt und
+abgedunkelt dargestellt wird) sprang im Idle gelegentlich auf die helle Form.
+
+**Ursache, komplett offline aus `snes_hd_spritecap.txt`, dem Diag-Log und dem installierten
+Pack ermittelt (kein zusätzlicher Spiellauf nötig):**
+1. Die Abdunklung ist **eine eigene CGRAM-Palette**, kein Color Math: unter den 188
+   aufgezeichneten Palettenzeilen gibt es **exakt zwei** Paare „B ist die eintragsweise
+   gedimmte Kopie von A", beide mit **Faktor 0,70** — Diddy und Dixie. 7.629 Kacheln werden
+   unter beiden Zeilen gezeichnet.
+2. Davon hatten **139 Kacheln HD-Kunst, aber keine Referenzpalette**. Mesen lässt
+   referenzlose Kunst unangetastet, also blieben sie hell, während das Spiel dimmte. Über die
+   Animationsphasen wechselten referenzierte und referenzlose Kacheln — das Flackern.
+3. **Für diese 139 ist keine Referenz ableitbar.** Gemessen: ihre bestpassenden Paletten sind
+   *fremde* (Median-Fehler 434–816) — exakt die v3-Falle. Ein Pool aus den Paletten der
+   Geschwisterkacheln desselben Sprites rettet nur ~30 %, die im spritecap aufgezeichneten
+   Zeilen der Kachel nur 52 von 139.
+
+**Lösung: für solche Kacheln gar keine Kunst ausliefern.** `findDimmedHashes()` erkennt beim
+Einlesen des Spritecaps die gedimmten Palettenpaare (das CGRAM-Feld jeder `SPR`-Zeile wurde
+bisher gelesen und weggeworfen) und merkt sich, welche Kacheln unter beiden Zeilen laufen.
+Fehlt so einer Kachel die Referenz, überspringt der Export ihr PNG — in der Galerie-Schleife
+wie im Laufzeit-Pfad, der Referenzen ohnehin grundsätzlich entzieht. Mesen rendert sie dann
+nativ, und nativ ist unter *beiden* Paletten richtig. Konsole meldet die Zahl in der
+`[sprpal]`- bzw. `[laufzeit]`-Zeile.
+
+**Vorab verifiziert statt vermutet:** die 174 betroffenen PNGs wurden aus dem installierten
+Pack in Quarantäne verschoben und der User hat gegengesehen — **kein Flimmern mehr am
+abgedunkelten Kong.** Danach wurde die ausgelieferte `findDimmedHashes()` in Node gegen die
+echte Aufzeichnung laufen gelassen: sie findet dieselben 2 Paare, dieselben 7.629 Kacheln und
+verwirft **exakt dieselben 174 Dateien** (Differenz 0). Die 5.969 Kacheln mit Referenz bleiben
+im Pack, die werden ja korrekt umgefärbt.
+
+**Offen:** warum passt die Kunst dieser 139 Kacheln nicht zur Palette ihres eigenen Sprites?
+Verdacht Grau-Rampen-Platzhalter beim Galerie-Rendern (`res.isGrey` fliegt aus dem
+Kandidatenpool, die Kunst selbst aber nicht) — Vermutung, nicht gemessen.
+
+**Spritecaps aus älteren Sitzungen** kennen die Dimm-Paare nicht; beim Wiederherstellen aus der
+Datenbank warnt die Konsole und bittet um einmaliges Neuladen der Datei.
+
 ## [2026-08-10b] — Referenzwahl: drei Anläufe, zwei davon falsch (UNCOMMITTED, ungetestet)
 
 Fortsetzung des Eintrags darunter. Phase 1 lieferte die Referenzpaletten aus, Phase 2 (Mesen,
