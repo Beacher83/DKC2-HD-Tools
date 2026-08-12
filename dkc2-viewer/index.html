@@ -12790,6 +12790,7 @@ async function exportAsTexturePack(containerName) {
   // about the colours. With the reference it can recolour reference→live CGRAM, which
   // is how the same crate ends up correctly tinted in every level.
   const spriteRefPalettes = new Map();   // "{hash}" -> Uint16Array(16), only for sets that pass the guard
+  const spriteRefVetoed = new Set();     // hashes that must never get one (see the per-tile veto below)
   {
     // Sprites are read from the CONTAINER, like every other part of this export.
     // They used to be taken only from the in-memory hdPack, so an export that did not
@@ -12854,30 +12855,87 @@ async function exportAsTexturePack(containerName) {
         //
         // Measured per SET, not per tile: a single tile can legitimately be all
         // anti-aliased edge and explain nothing, while the sprite as a whole does.
-        const NEAR_DIST2 = 30 * 30;   // squared RGB distance still counted as "flat texel"
-        const MIN_COVERAGE = 0.35;    // upscaled art keeps at least this much flat area
-        const palNearOf = (rgba, pal) => {
-          // → [nearTexels, opaqueTexels] for one decoded cell. Every 2nd texel is
-          // enough for a ratio, and this runs on ~20k tiles — the full scan would
-          // add minutes to the export for no better decision.
-          let near = 0, total = 0;
-          for (let p = 0; p + 3 < rgba.length; p += 8) {
-            if (rgba[p + 3] < 200) continue;   // skip transparent + soft edges
-            total++;
-            let best = Infinity;
-            for (let ci = 1; ci < 16; ci++) {
-              const c = pal[ci] & 0x7FFF;
-              const dr = ((c & 31) << 3) - rgba[p];
-              const dg = (((c >> 5) & 31) << 3) - rgba[p + 1];
-              const db = (((c >> 10) & 31) << 3) - rgba[p + 2];
-              const d2 = dr * dr + dg * dg + db * db;
-              if (d2 < best) { best = d2; if (best <= NEAR_DIST2) break; }
-            }
-            if (best <= NEAR_DIST2) near++;
+        // ---- Reference palette per TILE, decided by the tile's own pixels ----
+        //
+        // The first version asked the owning sprite and shipped ITS palette. That
+        // is wrong often enough to be useless: measured on the 2026-08-10 pack,
+        // only 67.6% of the Kong tiles had been given the palette that actually
+        // fits them best, 19.4% had one that fits distinctly worse (typically 3-4x
+        // the error). Two reasons — a content hash is shared by whichever sprites
+        // happen to use the same 8x8 CHR (52.5% of packed tiles are drawn under
+        // more than one real palette), and composite sprites render parts of a
+        // frame with their secondary/block2 palette, not the primary.
+        //
+        // A coverage threshold cannot repair that: the wrong palette is a PLAUSIBLE
+        // palette, it just is not the right one. In game it showed as Dixie's
+        // colours flickering, because her animation cycles between tiles whose
+        // references disagree.
+        //
+        // So let the art decide. Every candidate palette is scored against the
+        // tile's own texels and the best one wins — the same method the BG path
+        // already uses in scorePalette() above.
+        // The candidates are ONLY the palettes this sprite itself renders with:
+        // primary, plus the secondary (extraRefs) and block2 palettes of a
+        // composite. Scoring against ALL known palettes was tried and was much
+        // worse — the recolour maps BY PALETTE INDEX (nearest reference entry i,
+        // then live[i] - ref[i]), so the reference has to be the palette the art
+        // was actually baked under, not merely one that explains the pixels well.
+        // A tile with few colours is "explained" by plenty of foreign palettes,
+        // and then the index correspondence is arbitrary: in game that turned one
+        // flickering character into single tiles flickering in wrong colours
+        // across nearly every sprite.
+        //
+        // Restricted to the sprite's own palettes, every candidate is semantically
+        // valid and the fit only has to decide WHICH PART of a composite frame a
+        // tile came from — which is exactly the question v1 got wrong by always
+        // assuming the primary.
+        const MAX_REF_ERR = 1500;  // mean squared RGB distance; above this the art
+                                   // is not this sprite's (runtime capture etc.)
+        const SCORE_SAMPLES = 64;  // texels per tile — enough to separate 2-3 candidates
+
+        const toRgbTable = (p) => {
+          const rgb = new Int32Array(15 * 3);
+          for (let i = 1; i < 16; i++) {
+            const c = p[i] & 0x7FFF;
+            rgb[(i - 1) * 3] = (c & 31) << 3;
+            rgb[(i - 1) * 3 + 1] = ((c >> 5) & 31) << 3;
+            rgb[(i - 1) * 3 + 2] = ((c >> 10) & 31) << 3;
           }
-          return [near, total];
+          return { pal: p, rgb };
         };
-        const refStats = { ok: 0, rejected: 0, noPalette: 0, noAnimId: 0 };
+
+        // → { pal, err } for the best-fitting candidate, or null if none explains it
+        const bestRefFor = (rgba, refPool) => {
+          if (!refPool || refPool.length === 0) return null;
+          // Collect opaque texels first so every candidate scores the same pixels.
+          const px = [];
+          for (let p = 0; p + 3 < rgba.length && px.length < SCORE_SAMPLES * 3; p += 8) {
+            if (rgba[p + 3] < 200) continue;
+            px.push(rgba[p], rgba[p + 1], rgba[p + 2]);
+          }
+          if (px.length < 32 * 3) return null;   // too little evidence to judge
+          let bestPal = null, bestErr = Infinity;
+          for (const cand of refPool) {
+            const c = cand.rgb;
+            let sum = 0;
+            for (let i = 0; i < px.length; i += 3) {
+              const r = px[i], g = px[i + 1], b = px[i + 2];
+              let m = Infinity;
+              for (let k = 0; k < 45; k += 3) {
+                const dr = r - c[k], dg = g - c[k + 1], db = b - c[k + 2];
+                const d = dr * dr + dg * dg + db * db;
+                if (d < m) { m = d; if (m === 0) break; }
+              }
+              sum += m;
+              if (sum >= bestErr * (px.length / 3)) { sum = Infinity; break; }   // cannot win any more
+            }
+            if (sum === Infinity) continue;
+            const err = sum / (px.length / 3);
+            if (err < bestErr) { bestErr = err; bestPal = cand.pal; }
+          }
+          return bestPal && bestErr <= MAX_REF_ERR ? { pal: bestPal, err: bestErr } : null;
+        };
+        const refStats = { assigned: 0, unexplained: 0, noPalette: 0, composite: 0, errSum: 0 };
 
         for (const spr of sprSources) {
           const spriteKey = spr.key;
@@ -12888,23 +12946,27 @@ async function exportAsTexturePack(containerName) {
           }
           const cellSize = 8 * sprScale;
 
-          // Reference palette for this sprite — same cascade the gallery renders with.
-          let refPal = null;
+          // This sprite's own palettes — the only semantically valid references for
+          // its tiles. Usually one; two or three for a composite.
+          const sprPool = [];
           if (rom && spr.animId != null) {
             try {
               const frames = parseAnimFrames(rom, spr.animId);
               const hasComposite = frames.some(f => f.extraRefs && f.extraRefs.length > 0);
-              const res = resolveSpritePalettes(spr.animId, spr.name, getAnimPaletteMap().get(spr.animId) || null, hasComposite);
-              // A grey ramp is the "no palette found" placeholder, not a reference.
-              if (res && !res.isGrey) refPal = res.palette;
+              const res = resolveSpritePalettes(spr.animId, spr.name,
+                getAnimPaletteMap().get(spr.animId) || null, hasComposite);
+              if (res) {
+                // A grey ramp is the "no palette found" placeholder, not a reference.
+                if (!res.isGrey) sprPool.push(toRgbTable(res.palette));
+                if (res.secondaryPalette) sprPool.push(toRgbTable(res.secondaryPalette));
+                if (res.block2Palette) sprPool.push(toRgbTable(res.block2Palette));
+              }
             } catch (e) {
-              console.warn(`[sprites] ${spriteKey}: Referenzpalette nicht auflösbar:`, e.message);
+              console.warn(`[sprpal] ${spriteKey}: Palette nicht auflösbar:`, e.message);
             }
           }
-          if (spr.animId == null) refStats.noAnimId++;
-          else if (!refPal) refStats.noPalette++;
-          // Candidate hashes + coverage evidence, committed after the set is done.
-          const refCand = { pal: refPal, hashes: new Set(), near: 0, total: 0 };
+          if (sprPool.length === 0) refStats.noPalette++;
+          else if (sprPool.length > 1) refStats.composite++;
 
           for (const fr of spr.frames) {
             const fi = fr.idx;
@@ -12956,13 +13018,22 @@ async function exportAsTexturePack(containerName) {
                 for (let a = 3; a < idata.length; a += 4) { if (idata[a] > 8) { anyOpaque = true; break; } }
                 if (!anyOpaque) continue;
 
-                // Evidence for the reference-palette guard, gathered from the very
-                // pixels that are about to be written.
-                if (refCand.pal) {
-                  const [nr, tt] = palNearOf(idata, refCand.pal);
-                  refCand.near += nr;
-                  refCand.total += tt;
-                  refCand.hashes.add(hashHex);
+                // Let this tile's own pixels choose its reference palette.
+                // First writer of a hash wins, exactly like the PNG itself does, so
+                // reference and art always describe the same image.
+                if (!spriteRefPalettes.has(hashHex) && !spriteRefVetoed.has(hashHex)) {
+                  const best = bestRefFor(idata, sprPool);
+                  if (best) {
+                    spriteRefPalettes.set(hashHex, best.pal);
+                    refStats.assigned++;
+                    refStats.errSum += best.err;
+                  } else {
+                    // No known palette explains this art. Shipping a wrong reference
+                    // is worse than shipping none: Mesen leaves referenceless tiles
+                    // alone, which is simply the old behaviour.
+                    spriteRefVetoed.add(hashHex);
+                    refStats.unexplained++;
+                  }
                 }
 
                 const dataUrl = outCanvas.toDataURL('image/png');
@@ -12985,23 +13056,13 @@ async function exportAsTexturePack(containerName) {
             }
           }
 
-          // Commit the reference palette for this sprite, if the art backs it up.
-          if (refCand.pal && refCand.hashes.size > 0) {
-            const coverage = refCand.total > 0 ? refCand.near / refCand.total : 0;
-            if (coverage >= MIN_COVERAGE) {
-              for (const h of refCand.hashes) if (!spriteRefPalettes.has(h)) spriteRefPalettes.set(h, refCand.pal);
-              refStats.ok++;
-            } else {
-              refStats.rejected++;
-              console.warn(`[sprpal] ${spriteKey}: Referenzpalette erklärt nur ` +
-                `${(coverage * 100).toFixed(1)}% der Texel (< ${(MIN_COVERAGE * 100)}%) — ` +
-                `keine Referenz geschrieben, Mesen lässt diese Kacheln unangetastet`);
-            }
-          }
         }
-        console.log(`[sprpal] Referenzpaletten: ${refStats.ok} Sprites übernommen, ` +
-          `${refStats.rejected} vom Wächter verworfen, ${refStats.noPalette} ohne auflösbare Palette, ` +
-          `${refStats.noAnimId} ohne animId; ${spriteRefPalettes.size} Kachel-Hashes abgedeckt`);
+        console.log(`[sprpal] Referenzen: ${refStats.assigned} Kacheln zugewiesen ` +
+          `(mittlerer Fehler ${refStats.assigned ? Math.round(refStats.errSum / refStats.assigned) : 0}), ` +
+          `${refStats.unexplained} von der eigenen Palette nicht erklärt (ohne Referenz), ` +
+          `${refStats.noPalette} Sprites ohne auflösbare Palette, ` +
+          `${refStats.composite} Sprites mit mehreren Kandidaten (Composite); ` +
+          `${spriteRefPalettes.size} Kachel-Hashes abgedeckt`);
         console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert; ` +
           `${noPalHashes.size} Hashes ohne Runtime-Palette übersprungen (mehr Level mit S5a-Build spielen); ` +
           `${noMetaFrames} Frames ohne Platzierungs-Metadaten`);
@@ -13048,6 +13109,14 @@ async function exportAsTexturePack(containerName) {
         // reconstruction that may differ in palette handling.
         if (writtenSpriteKeys.has(t.key)) overwritten++;
         spritesFolder.file(`${t.key}.png`, t.blob);
+        // The art just changed under the reference palette. A runtime capture holds
+        // the LIVE colours of the moment it was grabbed, not the ROM palette the
+        // gallery sprite was rendered with, so any reference recorded for this hash
+        // now describes art that is no longer in the file. Drop it — Mesen leaves
+        // tiles without a reference untouched, which is the correct outcome here.
+        const rtHash = t.key.split('_P')[0];
+        spriteRefVetoed.add(rtHash);
+        spriteRefPalettes.delete(rtHash);
         runtimeExportedTiles++;
       }
       console.log(`[laufzeit] ${runtimeExportedTiles} Laufzeit-Kachel-PNGs exportiert` +

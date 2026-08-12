@@ -1,5 +1,58 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-10b] — Referenzwahl: drei Anläufe, zwei davon falsch (UNCOMMITTED, ungetestet)
+
+Fortsetzung des Eintrags darunter. Phase 1 lieferte die Referenzpaletten aus, Phase 2 (Mesen,
+Build S19) färbte damit um — und **die Kisten in Hot Head Hop waren korrekt getönt**, der
+Mechanismus stimmt also. Gleichzeitig fing Dixie an zu flimmern. Die Suche danach ging dreimal
+schief, bevor sie saß; das ist hier festgehalten, damit der Fehler nicht wiederkommt.
+
+### ★ DIE ZENTRALE LEHRE
+
+**Das Umfärben rechnet ÜBER DEN PALETTENINDEX**, nicht über Farbähnlichkeit:
+`nächster Referenzeintrag i` → `live[i] − ref[i]`. Die Referenz muss deshalb **die Palette
+sein, unter der die Kunst gebacken wurde** — nicht irgendeine, die die Pixel gut erklärt.
+Sonst ist die Index-Zuordnung willkürlich, und das Ergebnis sind zufällige Farben statt einer
+kleinen Abweichung. „Passt am besten" und „ist die richtige" sind hier nicht dasselbe.
+
+### Die Anläufe
+
+**v1 — Referenz = Primärpalette des besitzenden Sprites.** Ergebnis: 1,1 % der Kacheln trugen
+eine Referenz, die ihre eigenen Pixel zu unter 35 % erklärt, konzentriert auf die beiden
+Kong-Paletten. Im Spiel: Dixies Haare flimmerten. Zwei Ursachen — zusammengesetzte Sprites
+zeichnen Teile eines Frames mit ihrer Sekundär-/Block2-Palette statt der primären, und die
+Referenz wurde erst am Sprite-Ende hinter einem Aggregat-Wächter festgeschrieben, wodurch
+Kunst und Referenz auseinanderlaufen konnten.
+
+**v2 — Veto pro Kachel (<35 % Deckung) plus Referenzentzug für laufzeit-überschriebene Kunst.**
+Ergebnis: besser, Haare ruhig, aber das Shirt flimmerte weiter. Ursache: die verbliebenen
+falschen Referenzen sind *plausibel* und kommen durch jede Deckungsschwelle. Gemessen: nur
+67,6 % der Kong-Kacheln hatten die bestpassende Palette, bei 19,4 % passte eine andere deutlich
+besser (oft 3–4× kleinerer Fehler).
+
+**v3 — beste Palette aus ALLEN 27 Kandidaten. ★ FEHLSCHLAG, deutlich schlimmer.** Fast alle
+Sprites flimmerten, einzelne Kacheln in willkürlich falschen Farben. Genau der Fehler aus der
+Lehre oben: eine farbarme Kachel wird von vielen fremden Paletten gut „erklärt", und dann ist
+die Index-Zuordnung Zufall. **Diesen Weg nicht noch einmal einschlagen.**
+
+**v4 — aktueller, ungetesteter Stand.** Kandidaten sind nur noch die Paletten *des jeweiligen
+Sprites* (Primär, Sekundär, Block2) — jede semantisch gültig, die Bewertung entscheidet nur,
+aus welchem Teil eines Frames die Kachel stammt. Referenz und PNG werden in **derselben
+Schleifeniteration** vergeben, können also nicht mehr auseinanderlaufen. Ceiling
+`MAX_REF_ERR = 1500` fängt Kunst ab, die gar nicht von diesem Sprite stammt.
+
+### Wie es entschieden wurde
+
+Ein A/B-Schalter in Mesen (`SNES_HD_NO_SPRITE_RECOLOR=1`) rendert Sprites exakt wie S18. Zwei
+Läufe mit demselben Pack: mit Umfärbung flimmerte alles, ohne Umfärbung war alles ruhig
+(196 Frames, `sprRecol` durchgehend 0, davon 163 mit HD-Sprites). Damit war die Ursache
+bewiesen statt vermutet.
+
+**Prozess-Lehre:** dieser Schalter hätte am ANFANG der Fehlersuche stehen müssen. Stattdessen
+wurde zweimal an der Zuordnung geschraubt, ohne zu wissen, ob die Umfärbung überhaupt schuld
+ist — und v3 hat die Lage dabei klar verschlechtert. Bei der nächsten unklaren Regression:
+erst eine Messung bauen, die die Ursache eingrenzt, dann ändern.
+
 ## [2026-08-10] — `sprite_palettes.bin`: die Farben, unter denen ein Sprite gebacken wurde
 
 Phase 1 von vier. Der Export legt eine neue Datei in den Pack, die zu jedem HD-Sprite-Tile die
