@@ -12864,6 +12864,7 @@ async function exportAsTexturePack(containerName) {
   // without a recorded (hash,pal) pair are skipped; playing more levels
   // with the S5a build grows the recording.
   let spriteExportedTiles = 0;
+  let spriteSlotFreeTiles = 0;   // of those, written once instead of once per OAM slot
   let writtenSpriteKeys = new Set();   // "{hash}_P{pal}" — read again by the runtime block below
   // Reference palettes for sprite_palettes.bin: the 16 colours each sprite's HD art
   // was baked under. Mesen needs them because the OAM palette SLOT it sees at runtime
@@ -13133,13 +13134,26 @@ async function exportAsTexturePack(containerName) {
                 for (let k = 0; k < rawPng.length; k++) arr[k] = rawPng.charCodeAt(k);
                 const blob = new Blob([arr], { type: 'image/png' });
 
-                for (const p of pals) {
+                // Art WITH a reference follows the live OBJ row on its own, so one
+                // copy is right in every slot the allocator may hand out — Mesen
+                // (S20) stores it slot-free and looks it up that way. Only art
+                // without a reference still needs one file per recorded slot,
+                // because it can only be correct under the row it was baked for.
+                // Runtime tiles never reach this loop (they have no gallery entry
+                // at all), so their unconditional reference removal cannot turn a
+                // collapsed tile back into a per-slot one behind our back.
+                const slotFree = spriteRefPalettes.has(hashHex);
+                const emit = slotFree ? [Math.min(...pals)] : [...pals];
+                for (const p of emit) {
                   const fileKey = `${hashHex}_P${p}`;
                   if (writtenKeys.has(fileKey)) continue;
-                  writtenKeys.add(fileKey);
                   spritesFolder.file(`${fileKey}.png`, blob);
                   spriteExportedTiles++;
+                  if (slotFree) spriteSlotFreeTiles++;
                 }
+                // Mark every slot as done regardless, so a later frame carrying the
+                // same tile does not slice and re-encode it for nothing.
+                for (const p of pals) writtenKeys.add(`${hashHex}_P${p}`);
               }
             } finally {
               if (!fr.bitmap) img.close();   // release container-decoded frames again
@@ -13154,7 +13168,8 @@ async function exportAsTexturePack(containerName) {
           `${refStats.composite} Sprites mit mehreren Kandidaten (Composite), ` +
           `${refStats.droppedDimmed} Kacheln ohne Referenz verworfen (werden auch gedimmt gezeichnet); ` +
           `${spriteRefPalettes.size} Kachel-Hashes abgedeckt`);
-        console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert; ` +
+        console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert ` +
+          `(davon ${spriteSlotFreeTiles} slot-frei, also einmal statt je OAM-Slot — braucht Mesen S20+); ` +
           `${noPalHashes.size} Hashes ohne Runtime-Palette übersprungen (mehr Level mit S5a-Build spielen); ` +
           `${noMetaFrames} Frames ohne Platzierungs-Metadaten`);
         if (noMetaFrames > 0 && spriteExportedTiles === 0) {

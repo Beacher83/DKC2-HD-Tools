@@ -1,5 +1,41 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-12b] — Phase 3+4: die OAM-Slot-Nummer fällt aus dem Sprite-Schlüssel (UNGETESTET)
+
+**Das Problem:** für Sprites ist `Key.PaletteIndex` die OAM-Palette**n-SLOT**-Nummer
+(`SnesPpu.cpp:1086`), und ein Slot trägt keine Identität — DKC2s Allokator (`CODE_BB8A6F`)
+vergibt den nächsten freien von acht. Dasselbe Sprite landet je nach Level in einer anderen
+Zeile, und das Pack musste dieselbe Kunst einmal pro Slot ausliefern, in dem sie je
+aufgezeichnet wurde: **31.243 Dateien für 19.825 verschiedene Kacheln.**
+
+Seit der Umfärbung ist das unnötig: eine Kachel **mit Referenzpalette** wird von ihrer
+Referenz auf die lebende Zeile umgerechnet, ist also in jedem Slot richtig. Eine Kopie genügt.
+
+**Mesen (Build S20, `SnesHdData.h` + `SnesHdPackLoader.cpp`):**
+- Neue Konstante `SnesHdSpriteAnyPalette = 0xFF`. Sprite-Kunst **mit** Referenz wird unter
+  diesem Wildcard-Slot abgelegt, Kunst **ohne** Referenz behält ihren aufgezeichneten Slot —
+  die kann nur unter der Zeile richtig sein, für die sie gebacken wurde.
+- `GetMatchingTile` probiert weiter zuerst den exakten Slot und fällt erst dann auf die
+  Wildcard zurück. Ein Pack im alten Format verhält sich damit **exakt wie vorher**.
+- Der Loader überspringt weitere Slot-Varianten desselben Hashes, **bevor** er sie dekodiert,
+  und meldet `(N redundant slot copies skipped)`.
+- **Der Schlüssel selbst (`GetHashCode`/`operator==`) bleibt unangetastet** — bewusst: die
+  Wildcard ist nur ein weiterer Slot-Wert, kein Sonderfall im Vergleich.
+- Die Umfärbung liest den Live-Slot weiter aus der **PPU**-Information
+  (`pixelInfo.Sprites[0]`), nicht aus dem Pack-Schlüssel; die Wildcard kann dort nicht
+  ankommen.
+
+**Viewer (Export):** Kacheln mit Referenz werden nur noch **einmal** geschrieben statt einmal
+je Slot. Die `[sprites]`-Zeile weist die Zahl getrennt aus.
+
+**Erwartung mit dem aktuell installierten Pack** (ohne Neuexport, nur neuer Mesen-Build):
+`31.243` Dateien → `20.063` geladene Kacheln, Meldung `11180 redundant slot copies skipped`.
+Nach einem Neuexport schrumpft `sprites/` auf dieselben 20.063 Dateien.
+
+**★ Kompatibilität:** ein mit dieser Viewer-Version exportiertes Pack braucht **Mesen S20+**.
+Auf S19 und älter fänden die zusammengelegten Kacheln nur noch in genau einem Slot statt.
+Umgekehrt ist S20 mit alten Packs unkritisch.
+
 ## [2026-08-12] — v4 bestätigt; Kacheln ohne Referenz, die gedimmt gezeichnet werden, fliegen raus
 
 **v4 ist im Spiel bestätigt:** das Sprite-Flimmern ist weg, die getönten Kisten bleiben getönt.
