@@ -1,5 +1,48 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-08-12c] — Die verworfenen Kong-Kacheln waren nie fremd: der Mittelwert war es (UNGETESTET)
+
+Nachtrag zum Eintrag darunter. Dort wurden 139 Kong-Kacheln aus dem Pack genommen, weil ihre
+Kunst zu keiner Palette ihres eigenen Sprites passte. **Sie passte doch — die Statistik hat sie
+verworfen.**
+
+**Messung an den 174 aussortierten PNGs, gegen eine Kontrollgruppe referenzierter Kacheln
+desselben Kongs:**
+
+| | verworfen | Kontrolle |
+|---|---|---|
+| deckende Fläche | 32,8 % | 67,2 % |
+| **Median**-Fehler zur eigenen Kong-Palette | **635** | 196 |
+| Texel weiter als 1500 weg | 31,2 % | 9,6 % |
+| Farbsättigung | 59 % | 82 % |
+
+Die Sättigung erledigt die alte Grau-Rampen-Vermutung: die Kunst ist voll gefärbt, kein
+Platzhalter. Und der Median liegt bequem **innerhalb** der Schwelle — es ist der **Mittelwert**,
+den ein Schwanz von Ausreißern darüber zieht. Diese Ausreißer sind Texel auf einem
+Farbübergang, die im 4×-Bild zwischen zwei Paletteneinträgen liegen und zu keinem passen. Auf
+einer vollflächigen Kachel sind sie eine Minderheit, auf einer dünn besetzten Silhouettenkachel
+ist fast alles Rand — daher trifft es genau die Randkacheln.
+
+**Änderung, bewusst so klein wie möglich:**
+1. **WELCHER Kandidat gewinnt, entscheidet weiter der normale Mittelwert.** Das trennt die
+   Teile eines Composite-Frames und bleibt unangetastet — hier steckt die Lehre aus v1/v3.
+2. Nur das Tor „ist das überhaupt die Kunst dieses Sprites?" urteilt auf einem **getrimmten
+   Mittelwert** (schlechtestes Viertel der Texel fällt raus).
+3. Die Abtastung weicht auf **jedes** Texel aus, wenn jedes zweite zu wenig deckende findet.
+   Betrifft ausschließlich Kacheln, die heute ohnehin durchfallen.
+
+**Gegengeprüft mit der ausgelieferten Funktion in Node, an den echten PNGs:**
+**120 der 139 Kacheln bekommen ihre Referenz und damit ihre HD-Kunst zurück**, und **alle 300
+Kontrollkacheln behalten exakt die Referenz, die sie heute haben** (0 verändert, 0 verloren).
+Das ist die entscheidende Eigenschaft: der Eingriff kann nichts umwerten, was bereits sitzt.
+
+19 Kacheln bleiben ohne Referenz und werden weiter verworfen — 4 davon haben selbst bei
+dichtester Abtastung zu wenig deckende Texel.
+
+**Nach dem nächsten Export** sollte `sprites/` rund 20.183 Dateien haben (statt 20.063), und der
+inaktive Kong bleibt flackerfrei, weil die 120 Kacheln jetzt mit korrekter Referenz mitgedimmt
+werden statt zu fehlen.
+
 ## [2026-08-12b] — Phase 3+4: die OAM-Slot-Nummer fällt aus dem Sprite-Schlüssel (UNGETESTET)
 
 **Das Problem:** für Sprites ist `Key.PaletteIndex` die OAM-Palette**n-SLOT**-Nummer

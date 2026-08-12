@@ -12990,11 +12990,19 @@ async function exportAsTexturePack(containerName) {
         const bestRefFor = (rgba, refPool) => {
           if (!refPool || refPool.length === 0) return null;
           // Collect opaque texels first so every candidate scores the same pixels.
-          const px = [];
-          for (let p = 0; p + 3 < rgba.length && px.length < SCORE_SAMPLES * 3; p += 8) {
-            if (rgba[p + 3] < 200) continue;
-            px.push(rgba[p], rgba[p + 1], rgba[p + 2]);
-          }
+          // Every second texel is plenty for a 32x32 cell, but a sparse edge tile
+          // can run out of opaque ones — then look at every texel instead of
+          // giving up. Only tiles that would fail outright are affected.
+          const collect = (step) => {
+            const out = [];
+            for (let p = 0; p + 3 < rgba.length && out.length < SCORE_SAMPLES * 3; p += step) {
+              if (rgba[p + 3] < 200) continue;
+              out.push(rgba[p], rgba[p + 1], rgba[p + 2]);
+            }
+            return out;
+          };
+          let px = collect(8);
+          if (px.length < 32 * 3) px = collect(4);
           if (px.length < 32 * 3) return null;   // too little evidence to judge
           let bestPal = null, bestErr = Infinity;
           for (const cand of refPool) {
@@ -13015,7 +13023,42 @@ async function exportAsTexturePack(containerName) {
             const err = sum / (px.length / 3);
             if (err < bestErr) { bestErr = err; bestPal = cand.pal; }
           }
-          return bestPal && bestErr <= MAX_REF_ERR ? { pal: bestPal, err: bestErr } : null;
+          if (!bestPal) return null;
+
+          // WHICH candidate wins is still decided on the plain mean — that part
+          // separates the parts of a composite frame and must stay as it is.
+          // Only the "is this art this sprite's at all?" gate is judged on a
+          // TRIMMED mean, with the worst quarter of the texels dropped.
+          //
+          // Why: the 4x art carries texels that sit on a colour transition and
+          // land between two palette entries, matching neither. On a solid tile
+          // they are a small minority, but a sparse silhouette tile is mostly
+          // border — measured on the Kong tiles that were being rejected, 31% of
+          // their texels sat far from any entry, against 9.6% on solid ones. Their
+          // MEDIAN error to their own palette was 635, comfortably inside the
+          // ceiling, while the mean was dragged past it by that tail. The tiles
+          // were this sprite's art all along; the statistic was the problem, and
+          // rejecting them cost their HD art entirely (they are drawn dimmed too,
+          // so they get dropped rather than shipped without a reference).
+          const winner = refPool.find(c => c.pal === bestPal).rgb;
+          const perTexel = [];
+          for (let i = 0; i < px.length; i += 3) {
+            const r = px[i], g = px[i + 1], b = px[i + 2];
+            let m = Infinity;
+            for (let k = 0; k < 45; k += 3) {
+              const dr = r - winner[k], dg = g - winner[k + 1], db = b - winner[k + 2];
+              const d = dr * dr + dg * dg + db * db;
+              if (d < m) { m = d; if (m === 0) break; }
+            }
+            perTexel.push(m);
+          }
+          perTexel.sort((a, b) => a - b);
+          const keep = Math.max(1, Math.floor(perTexel.length * 0.75));
+          let trimmed = 0;
+          for (let i = 0; i < keep; i++) trimmed += perTexel[i];
+          trimmed /= keep;
+
+          return trimmed <= MAX_REF_ERR ? { pal: bestPal, err: bestErr } : null;
         };
         const refStats = { assigned: 0, unexplained: 0, noPalette: 0, composite: 0, errSum: 0, droppedDimmed: 0 };
 
