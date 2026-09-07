@@ -1,5 +1,98 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-07] — S21b: zwei Fehler in der Kantenglättung, und der Beweis dass sie wirkt
+
+Nur Mesen (`SnesPpu.h`, `SnesPpu.cpp`, `SnesHdVideoFilter.cpp`).
+
+**Zuerst der Beweis, den S21 schuldig geblieben war.** Am 12.08. zeichnete Wand 1 im Level
+nichts — 25.319 Kandidaten, **0** Subpixel — weil die Pack-Kunst von vor dem Kantenfix stammte;
+der Neu-Export kam erst danach und wurde nur noch auf der Weltkarte getestet. Am 07.09. mit der
+neu hochgerechneten Kunst gemessen: **76.941 gezeichnete Saum-Subpixel** im Level (max 1.013 je
+Frame). User-Urteil: „die Kongs haben glatte Außenkanten". Damit ist die Kantenglättung
+erstmals als wirksam belegt, und das negative Gesamturteil vom 12.08. ist gegenstandslos — es
+galt einem Build, dem die passende Kunst fehlte.
+
+**Fix 1 — halbtransparente Sprite-Texel mischten gegen die falsche Unterlage.** Wand 2 nimmt
+die BG-Kachel als Grund unter dem Sprite. Steht ein **zweites Sprite** dazwischen, ist das die
+falsche Unterlage: durch die weiche Kante schien der Hintergrund statt der Figur dahinter
+(Dixies Haare vor Diddy). Die Zeilenpuffer behalten nur den Gewinner, das verdeckte Sprite ist
+also gar nicht bekannt. Neues Flag `HdSpritePixel::MultiOpaque`, in `FetchSpriteTile` gesetzt
+**bevor** das neuere Sprite das ältere überschreibt → `SpriteCount` Bit 3 → Wand 2 lässt
+solche Pixel in Ruhe.
+**Bekannte Nebenwirkung, zweimal beobachtet:** wo Sprites einander überlappen, ist die
+Außenkante damit wieder hart — Krunchas Arm vor der Sonne in Gangplank, die Kongs
+hintereinander. Das Abschalten ist die grobe Lösung; die richtige ist, das verdrängte Sprite
+in `Sprites[3]` zu retten (Slot und Bit 3 gehören zusammen und sind frei) und **dagegen** zu
+mischen. Als nächster Schritt vorgemerkt.
+
+**Fix 2 — heller Saum an Dixies Haaren, nur unter Wasser.** Zwei Anläufe. Der erste (Saum von
+nach Color Math in die Vor-Math-Hauptfarbe verschoben) änderte nichts am Bild, bleibt aber
+drin: der Saum sitzt an einem Pixel, das der BG gewonnen hat, und muss dessen Math mitmachen.
+**Die echte Ursache** fand sich erst nach der Rückmeldung „sieht aus wie vorher": die
+Bottom-Suche akzeptierte eine BG-Ebene, die nur auf dem **Sub**-Screen liegt
+(`MainScreenLayers | SubScreenLayers`). Unter der Wasserlinie schaltet DKC2 Main per HDMA auf
+`$00`/`$04` und lässt BG1/BG2 nur auf Sub — die helle Sub-Kunst wurde damit zur „Unterlage"
+hinter Dixie, obwohl auf dem Main-Screen etwas Dunkles steht. **Fix: `MainScreenLayers`-Gate**,
+exakt dieselbe Korrektur, die Issue T am 17.07. einen Block weiter oben gebraucht hat.
+**Merke:** jede „was liegt hinter diesem Pixel"-Frage gehört auf `MainScreenLayers` — nicht auf
+`BgLayerMask`, nicht auf Main|Sub. Das war jetzt zweimal dieselbe Falle.
+User-bestätigt am 07.09.: „der Saum unter Wasser ist weg". Das Gate sitzt nur in Wand 2, die
+**Außen**kantenglättung läuft unter Wasser unverändert weiter (54.245 Subpixel gemessen).
+
+**Messwerte:** `ms` max 6,53 bei 16,7 Budget, 0 Fehler-/Warnzeilen über vier Kontexte.
+
+## [2026-08-12d] — S21: Kantenglättung für Sprites, beide Wände
+
+Nur Mesen. **Vorher analysiert, nicht vermutet** — Messungen und Sichtvergleiche siehe
+`project_status`; die Bilder liegen unter `Downloads\dkc2_kantenvergleich\`.
+
+**Warum es zwei Änderungen sind:** die SNES entscheidet Sprite-Deckung auf dem 1×-Raster
+(Farbindex 0 = nichts), die 4×-Kunst bringt ihren eigenen weichen Saum mit. Bisher ging beides
+verloren — außerhalb der Silhouette wurde gar keine HD-Identität hinterlegt, und innerhalb
+mischte ein halbtransparenter Texel gegen `nm*`, was an einem Sprite-Pixel die **SD-Sprite-Farbe
+selbst** ist. Sprite gegen Sprite gemischt ergibt keine sichtbare Glättung. Im Detailbild sieht
+man, dass Wand 2 **allein** sogar schlechter aussieht (dünner, fransig) — die beiden gehören
+zusammen.
+
+**Wand 1** (`SnesPpu.cpp`): `FetchSpriteTile` hinterlegt die OBJ-Kachelidentität jetzt auch an
+nativ TRANSPARENTEN Pixeln; die nativen Puffer bleiben unverändert gegated, das emulierte Bild
+ist bitgleich. Ein deckender Eintrag gewinnt immer (`NativeOpaque`), damit das transparente
+Pixel eines später gezeichneten Sprites die Identität eines überlappenden nicht löscht.
+`RenderSprites` erfasst diese Pixel in **Slot 2**, mit Fenstermaskierung, aber **ohne** die
+Prioritätsentscheidung — die kann dort nicht fallen, weil die Tilemaps noch nicht komponiert
+haben. Der Filter entscheidet sie gegen `MainScreenFlags & 0x0F`, das den echten Gewinner trägt.
+Dazu: `_hdSpritePixelsCopy` wird jetzt je Scanline geleert — bisher unnötig, weil jeder Zugriff
+durch `_spritePriority[x] < 4` geschützt war; der Saumpfad hat diesen Schutz nicht und würde
+sonst die Kunst der Vorzeile über den Schirm schmieren.
+
+**Wand 2** (`SnesHdVideoFilter.cpp`): ein Sprite-Gewinner bekommt jetzt eine Bottom-Kachel aus
+`BgTiles[]`, genau wie ein BG-Gewinner. Damit mischt der bestehende Kompositionspfad
+halbtransparente Sprite-Texel gegen die HD-Kunst des Hintergrunds statt gegen die SD-Sprite-Farbe.
+Wo der Hintergrund keine HD-Kunst hat, bleibt das alte Verhalten.
+
+Der Saum wird **nach** Color Math gemischt: die Math-Flags des Pixels gehören dem BG, der es
+gewonnen hat, und DKC2 wendet auf OBJ nie Color Math an (jeder aufgezeichnete Kontext hat
+`CMEnabled` mit `OBJ=0`). Die Umfärbung auf die lebende OBJ-Palette gilt für den Saum genauso —
+sonst wäre er der einzige Teil einer Figur, der die Level-Tönung ignoriert.
+
+**A/B-Schalter `SNES_HD_NO_SPRITE_EDGES=1`** schaltet beide Hälften ab (S20-Verhalten).
+Neue Zähler im FRAME-Log: `sprEdge=<Pixel mit Saumkunst>/<tatsächlich gezeichnete Subpixel>`.
+
+**Erwartung:** sichtbar nur bei Kunst, die MIT Kantenglättung hochgerechnet wurde. Kruncha
+(25,5 % weiche Texel) profitiert sofort, die Kongs (0,7 %) erst nach dem Neu-Upscale.
+
+**★ NACHTRAG nach dem ersten Spieltest: beide Wände wirken nur noch auf Kunst MIT
+Referenzpalette.** Der User bestätigte den Gewinn bei Kruncha und den Kisten, meldete aber die
+Laufzeit-Objekte auf dem Hub (Wespen, Piratenflagge, Fackeln) als „verwaschener". Das Log
+zeigte, warum: im Level zeichnete Wand 1 **nichts** (25.319 Kandidaten, 0 Subpixel — die dortige
+Kunst stammt von vor dem Kantenfix), auf der Weltkarte dagegen 6.194 Subpixel pro Frame, und
+genau dort liegen die Laufzeit-Objekte. Deren Kunst ist vom laufenden Bild abgegriffen, trägt
+also Hintergrundfarbe in den Randtexeln; sie nach außen zu verlängern schmiert diesen
+Hintergrund ins Bild. Der Export entzieht solchen Kacheln ohnehin die Referenz — **„hat eine
+Referenzpalette" trennt Laufzeit- von Galerie-Kunst also exakt** und ist jetzt Bedingung für
+beide Wände. Kruncha behält den Gewinn; die Kartenschrift verliert ihren Saum mit (sie hat
+ebenfalls keine Referenz), was der User als unkritisch eingestuft hat.
+
 ## [2026-08-12c] — Die verworfenen Kong-Kacheln waren nie fremd: der Mittelwert war es (UNGETESTET)
 
 Nachtrag zum Eintrag darunter. Dort wurden 139 Kong-Kacheln aus dem Pack genommen, weil ihre
