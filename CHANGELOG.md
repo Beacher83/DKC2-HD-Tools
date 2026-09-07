@@ -1,5 +1,48 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-08] — S22–S24: Sprite-Kanten bei Überlappung
+
+Nur Mesen (`SnesPpu.h`, `SnesPpu.cpp`, `SnesHdVideoFilter.cpp`).
+
+**S21b hatte die Glättung dort abgeschaltet, wo zwei Sprites einander überlappen** — sichtbar
+als harte Kante an Krunchas Arm vor der Sonne. **S22** rettet stattdessen das **verdrängte
+Sprite** und benutzt es als Unterlage: `FetchSpriteTile` ist der einzige Moment, in dem beide
+Sprites in der Hand sind; veröffentlicht wird es als `Sprites[3]` + `SpriteCount` Bit 3 — Slot
+und Bit waren das letzte freie Paar. Zwei Fallen vorher im Code gefunden statt später im Bild:
+`botLut` hatte keine Sprite-Ausnahme (der R3-LUT deckt nur BG-CGRAM-Reihen 0–7 ab, OBJ-Paletten
+liegen bei 128–255), und eine Sprite-Unterlage braucht die Umfärbung auf die lebende
+OBJ-Palette, sonst behält die Figur hinter der weichen Kante ihre eingebackenen Farben.
+
+**S23 war ein Fehlschlag, und die Zähler haben ihn entlarvt.** Die Idee: `!spriteWon` streichen,
+damit ein Saum auch über einem Sprite gezeichnet wird, das den Pixel gewonnen hat.
+Das Ergebnis im Log: **`sprFrOver` blieb 0**, während `sprFrTie` in die Tausende ging — Saum
+und Gewinner teilen sich fast immer eine Priorität, und der Prioritätsvergleich lehnt sie
+korrekt ab. Der Zweig hat also nichts genutzt und dafür einen neuen Fehler erzeugt: Dixies
+gelbe Haare schienen durch die Kiste, die sie über dem Kopf trägt.
+
+**Entschieden haben zwei A/B-Schalter, nicht ein Argument** — die Hypothese des Autors war
+falsch und wurde in einem Zug widerlegt:
+
+| Lauf | Krunchas Arm | Dixies Haare |
+|---|---|---|
+| `SNES_HD_NO_SPRITE_UNDER=1` (S22 aus) | kantig | Bug da |
+| `SNES_HD_NO_FRINGE_OVER_SPR=1` (S23 aus) | glatt | Bug weg |
+
+Die Glättung kommt aus S22, der Bug aus S23. **S24** macht das zum Standard: `!spriteWon` ist
+wieder drin, `sprFrOver` und der zugehörige Schalter entfallen (per Konstruktion wirkungslos).
+`SNES_HD_NO_SPRITE_UNDER` bleibt — er hat sich bewährt.
+
+**Performance.** Die zwei neuen Zeilenpuffer wurden je Scanline kopiert UND geleert und haben
+damit die Sprite-Puffer-Last im **Emulations-Thread** verdreifacht — genau die Quelle, die seit
+R6.1 als Verdacht für das Restruckeln notiert ist, und die in `ms` grundsätzlich nicht
+auftaucht (`ms` misst nur den Filter). Vier Dirty-Flags lassen memcpy/memset nur noch dort
+laufen, wo wirklich zwei Sprites aufeinandertreffen: `ms` max von **14,82 auf 5,53**, unter dem
+Stand vor der ganzen Saum-Arbeit (6,53). Das Leeren beim Übergang „Copy leer, Ziel noch voll"
+bleibt bewusst drin, sonst schmiert die Kunst der Vorzeile nach unten.
+
+**Nebenbefund für später:** der in der Projektdoku als „risikoarmer Quick-Win" geführte
+Umbau `Sprites[4]`→`Sprites[2]` ist **hinfällig** — S21 belegt Slot 2, S22 Slot 3.
+
 ## [2026-09-07] — S21b: zwei Fehler in der Kantenglättung, und der Beweis dass sie wirkt
 
 Nur Mesen (`SnesPpu.h`, `SnesPpu.cpp`, `SnesHdVideoFilter.cpp`).
