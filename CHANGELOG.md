@@ -1,5 +1,49 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-08] — S25–S27: die Kantenglättung erreicht die Overlay-Level
+
+Nur Mesen (`SnesPpu.cpp`, `SnesHdVideoFilter.cpp`), Commit `4482908a`.
+
+**In Mainbrace, Rambi Rumble und Lockjaw unter Wasser lief die Kantenglättung nie — und die
+Ursache war eine einzige Gate-Bedingung.** DKC2 nimmt OBJ per HDMA vom Main-Screen
+(`$212C=$04`), also war `drawMain` für Sprites falsch und `RenderSprites` füllte den
+Saum-Slot dort gar nicht erst. `sprEdge=0/0` in jedem Frame las sich wie kaputter Code und
+war dieses Tor; die Saum-Zeilenpuffer waren die ganze Zeit gefüllt.
+
+**S25** zeichnet den Saum in den **Color-Math-Operanden** statt in die Hauptfarbe — in einem
+Overlay-Level existiert die Figur nur dort, ein Saum in der Hauptfarbe würde zum Nebel
+*addiert* statt durch ihn hindurch gezeichnet.
+**S26** gibt dem Sub-Sprite einen Untergrund. Es mischte noch gegen `nsR/nsG/nsB`, und das
+ist an einem Sprite-Pixel die **eigene SD-Farbe** — dieselbe Wand, die S21 im Main-Pfad
+eingerissen hat, hier unangetastet. Der Untergrund ist streng begründet: in diesem Zweig hat
+das Sprite jede Sub-BG-Ebene geschlagen, sonst hätte `RenderTilemap` `SubScreenHasSprite`
+gelöscht.
+**S27** nimmt bevorzugt ein **zweites Sprite** als diesen Untergrund, exakt wie S22 im
+Main-Pfad. `Sprites[3]` wird auch für den Sub-Slot gefüllt — nichts Neues aufzuzeichnen.
+Beide S22-Fallen mitgenommen: die R3-Zeilen-LUT bleibt von einer Sprite-Unterlage fern, und
+die Unterlage braucht die Umfärbung.
+
+**Gemessen, nicht argumentiert.** Fünf A/B-Läufe über 3.634 Frames haben S25/S26 getrennt:
+mit S26 aus meldet der User „nicht geglättet“ in Mainbrace und Lockjaw, während S25 weiter
+über 400 Subpixel je Frame zeichnet — **der sichtbare Effekt ist S26, S25s Nutzen ist
+unbelegt.** S27 hat eine saubere A/B/A-Kette am Fass, das Dixie über dem Kopf trägt:
+glatt → hart → glatt, bei `subSprUnder` = 106 px/Frame in 140 von 248 Frames.
+
+**Ein Zweig wurde als Zähler ausgeliefert und danach entfernt.** Die Vermutung, auch auf
+Scanlines *mit* OBJ auf Main fehle Saum, war aus `sprHdSub` hochgerechnet — aber diese Pixel
+liegen INNERHALB der Silhouette, und direkt daneben lässt `$212D=$10` den Sub-Screen leer.
+Der Zähler kam in allen fünf Läufen als **0** zurück, auch in dem, der den Schalter
+einschaltete. Raus statt auf der Begründung behalten — wie `sprFrOver` in S23.
+
+**Recorder aufgeräumt.** `snes_hd_oam.txt` dedupliziert auf die **Komposition** eines Frames,
+also zählte fast jedes Frame als neu; die Datei war auf **813 MB** gewachsen, während
+`spritecap`/`bgcap`/`spritemiss` (Dedup je Kachel) seit dem 10.08. gesättigt sind. OAM ist
+jetzt aus per Vorgabe (`SNES_HD_OAMCAP=1`) — dieselbe Behandlung wie `cgramcap` in S18; der
+Viewer liest die Datei weiterhin über `parseOam` für die Laufzeit-Objekte.
+Die zwei kleinen Logs hängen an und rotieren bei 16 MB. Ein erster Versuch mit „frisch je
+Start“ hat binnen einer Stunde eine Vergleichsserie zerstört, weil ein außerhalb der
+Testskripte gestarteter Lauf die beiden davor löschte.
+
 ## [2026-09-08] — S22–S24: Sprite-Kanten bei Überlappung
 
 Nur Mesen (`SnesPpu.h`, `SnesPpu.cpp`, `SnesHdVideoFilter.cpp`).
