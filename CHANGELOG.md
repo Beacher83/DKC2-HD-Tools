@@ -1,5 +1,27 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-08] — S25 wieder ausgebaut (Rekonstruktion: Commit `4482908a`)
+
+Nur Mesen. **S25 zeichnete, aber niemand konnte es sehen** — also raus, bevor es zu Code
+wird, dessen einziger Beleg ist, dass er ausgeführt wird. Genau so hat sich der S23-Zweig
+zu lange gehalten.
+
+**Entfernt:** die Aufzeichnung des Saum-Slots auf dem Sub-Screen in `RenderSprites`
+(`objDrawn`/`fringeWindowCount` zurück auf `drawMain`/`mainWindowCount`), die
+Scanline-Flags `objOnMain`/`objOnSub`, der dritte Saum-Zweig im Filter samt Prio-Test gegen
+den Sub-Gewinner, der Saum-Blend im Operanden, der Schalter `SNES_HD_NO_SUB_FRINGE` und die
+Zähler `sprEdgeSub=A/B`.
+
+**Beleg:** fünf A/B-Läufe über 3.634 Frames. S25 zeichnete 747 Subpixel je Frame in
+Mainbrace — mit S25 aus meldete der User **keinen** Unterschied, mit dem Untergrund
+(S26/S27) aus dagegen „nicht geglättet“. Vermutung, ungeprüft: der Operand wird zum Nebel
+addiert und oft halbiert, was ein schwach gedeckter Saum nicht überlebt.
+**Einschränkung:** Augen-A/B, kein Standbildvergleich derselben Stelle — wer S25
+rehabilitieren will, macht genau den.
+
+**S26 und S27 bleiben** und hängen nicht an S25: Slot 3 wird über den `drawSub`-Pfad
+gefüllt, nicht über den Saum-Slot. Log-Rotation und OAM-Gate bleiben ebenfalls.
+
 ## [2026-09-08] — S25–S27: die Kantenglättung erreicht die Overlay-Level
 
 Nur Mesen (`SnesPpu.cpp`, `SnesHdVideoFilter.cpp`), Commit `4482908a`.
