@@ -1,5 +1,329 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-10, Abend] — Weltkarten-Köpfe und Zahlen: HD, aber hart — die fehlende Referenzpalette
+
+Nur Viewer (`dkc2-viewer/index.html`, Pack-Export). Kein C++.
+
+**User-Test mit dem neuen Pack:** Köpfe auf der Weltkarte in HD, Zahlen in HD — aber beide
+**ohne Kantenglättung**, am deutlichsten an den großen weißen Bonus-Countdown-Ziffern.
+
+**An der Kunst liegt es nicht** — gemessen an den installierten Kacheln, Anteil
+teiltransparenter Texel: Map Icons 22,6 %, HUD-Ziffern 27,9 %, Fass-Ziffern 17,2 %, gegen
+`bg3/gfxset_07` 20,7 % (dort glättet es nachweislich).
+
+**Die Ursache steht im Filter** (`SnesHdVideoFilter.cpp`, S28-Notiz bei Z. ~2473): *jede*
+Kantenmechanik für Sprites — Außensaum (S21), Untergrund unter weichen Texeln (S21),
+Sub-Screen-Untergrund (S26/S27) — ist an `GetSpriteRefPalette(...) != nullptr` gebunden. Ohne
+Referenz mischt ein halbtransparenter Texel gegen die eigene SD-Farbe, und die weichste Kante
+kommt so hart heraus wie die härteste. Das Log bestätigt es: Weltkarte `sprNoRef=2644` von
+`sprHd=2755`, `SPRAREA withRef=4,0 % / 5,3 %` (in Leveln 75–97 %), jede der großen
+Kacheln `art=1 ref=0`.
+
+**Warum beide keine Referenz hatten:**
+- **Map Icons:** die Namenskaskade `resolveSpritePalettes()` löst jedes Icon zu `"Map"` auf und
+  findet nichts — obwohl `buildMapIconEntries()` die Palette kennt, mit der es sie zeichnet.
+- **Zahlen/HUD:** Laufzeit-Kunst verliert ihre Referenz im Pack-Export grundsätzlich. Das
+  Mesen-Tor ist als Stellvertreter für „Galerie-Kunst" gedacht (Laufzeit-Kunst von vor dem
+  Kantenfix 05.08. hatte Schwarz in den Randtexeln) — trifft auf heute mit `_edge`
+  hochgerechnete Kunst nicht zu.
+
+**Belegt, bevor gebaut:**
+- Die ROM-Palette jedes Icons ist **in allen 15 Einträgen identisch mit der Live-CGRAM-Zeile**
+  auf der Karte (spritecap, je 1 344–4 160 Sichtungen). Mesen färbt bei Referenz = Live
+  exakt nicht um (`HdSpriteRecolor::Init`, `anyDelta = false`) — die Referenz schaltet also nur
+  die Kantenmechanik frei.
+- Das Tor im Pack-Export (`bestRefFor`, echter Code aus `index.html`) gegen die **installierten**
+  HD-Kacheln: **242/242** Icon-Kacheln bekommen die Referenz, Fehler Median 430–672, max 1 227
+  (Grenze 1 500).
+- Zahlen/HUD: die eingebettete Palette ist bei **161/161** Kacheln die Live-Zeile aus
+  spritecap. Nur der Diddy-Kopf hat eine zweite Zeile — die gedimmte.
+
+**Gebaut:**
+1. `mapIconPalette(animId)`: der Sprite-Block des Pack-Exports nimmt sie als Kandidaten, wenn
+   die Kaskade für eine synthetische ID ab `0xF000` nichts findet. Die Icons werden damit
+   slotfrei und mit Referenz geschrieben.
+2. Laufzeit-Block: Kacheln aus `DKC2_NUMBER_PIXELS` bekommen ihre eingebettete Palette als
+   Referenz statt des Vetos. Folgen: Kantenmechanik an; slotfrei (HUD-Ziffern im Shop auf
+   P7 werden jetzt mit umgefärbt); **der Diddy-Kopf wird nicht mehr verworfen** — er folgt der
+   gedimmten Zeile per Umfärbung. Konsole: `… N mit Referenzpalette (Zahlen/HUD)`.
+   Alle übrigen Laufzeit-Kacheln (Kartenschrift usw.) bleiben wie bisher ohne Referenz.
+
+**Kein neuer Upscale nötig** — nur Pack-Export neu, nach Mesen kopieren. **Im Spiel ungetestet.**
+
+
+## [2026-09-10] — Weltkarten-Köpfe: warum sie nie im Pack ankamen
+
+Nur Viewer (`dkc2-viewer/index.html`).
+
+**Die Map Icons (DD, DX, Cranky, Wrinkly, Swanky, Funky, Klubba, Kremlin, Skull) konnten den
+Pack nie erreichen — keine einzige ihrer 242 Kacheln.** Aufgefallen am SD-Export des Users
+(`sprites_export weltkartenköpfe.zip`): **alle 144 Frames `"tiles": null`**.
+
+**Die Kette.** `buildMapIconEntries()` zeichnet die Icons direkt aus den ROM-Bytes in einen
+Canvas (`GFX_Sprite_MapIcons.bin` bei `$3C14E0`, 16 Frames × `$400`). Nur der normale Pfad
+`renderCompositeFrame()` liefert die Frame→Kachel-Zuordnung — dieser nicht. Also schreibt der
+SD-Export `tiles: null`, der HD-Import übernimmt das 1:1 in den Container (`meta.tiles`), und
+der Pack-Export verwirft jeden solchen Frame (`if (!meta || !meta.tiles) { noMetaFrames++; continue; }`).
+Die Kunst lag im Container, und der Export hat sie jedes Mal still liegen gelassen.
+
+**Belegt, nicht vermutet.** Die Hashes der Icon-Frames aus dem ROM nachgerechnet (FNV-1a über
+die 32 Bytes, dieselbe Funktion wie im Viewer) und gegen die Liste der fehlenden
+Weltkarten-Kacheln vom 08.09. (`snes_hd_diag.txt`, 49 Kacheln) gelegt: **47 davon sind
+Icon-Frames** (DD 12, DX 9, Cranky 18, Funky 8). Die übrigen **2** sind die weißen
+**Richtungspfeile** (8×8, `$3C14A0`/`$3C14C0`, direkt vor dem Icon-Block), für die es gar
+keinen Eintrag gab. Im installierten Pack: **0 von 242** Icon-Kacheln.
+
+**Der Rest der Kette ist in Ordnung — geprüft, bevor gebaut wurde:**
+- `spritecap` kennt jede Icon-Kachel mit genau dem Slot aus `DATA_B4C449` (DD/DX P6,
+  Cranky/Wrinkly P0, Swanky/Funky P1, Klubba/Kremlin P5; Pfeile P6 und P7).
+- Keine falsche Referenzpalette: `extractSpriteKeyFromName` liefert für alle `"Map"`, keine
+  Stufe der Kaskade greift, die Icons werden also ohne Referenz je aufgezeichnetem Slot
+  geschrieben — richtig, ihre Slots sind fest.
+- Keine Icon-Kachel ist „gedimmt" (die würde ohne Referenz verworfen).
+- **Ausnahme Skull:** 0 von 36 in `spritecap`, und in 278 307 OAM-Frames kein Tile `$80` auf
+  Palette 2 — der Totenkopf war nie im Bild. Seine Dekodierung ist damit **ungeprüft**; stimmt
+  sie nicht, treffen die Hashes nie und der Export überspringt sie, schaden kann es nicht.
+
+**Gebaut:**
+1. `buildMapIconEntries()` gibt jedem Frame `tiles` mit (auch dem Skull). Ein gespiegeltes
+   Icon bekäme keine Zuordnung statt einer falschen — heute ist keins gespiegelt.
+2. Der Sprite-Export reicht die Zuordnung vorgerenderter Frames durch (`frame.tiles`).
+3. Neuer Eintrag **`Map Icon Arrows (Pfeile)`** (`0xF008`), zwei Frames: hoch, rechts.
+4. **Rückgriff im Pack-Export:** Fehlt einem Set mit synthetischer ID ab `0xF000` die
+   Zuordnung, wird sie aus dem ROM nachgerechnet (`mapIconFrameTiles`). Damit wird schon
+   importierte Icon-HD exportierbar, ohne neu hochzurechnen.
+
+**Geprüft in Node** mit dem geänderten Viewer-Code gegen das echte ROM: alle 146 Frames mit
+Zuordnung, die 8 Icons und die Pfeile vollständig in `spritecap`, **49 von 49** fehlenden
+Kacheln abgedeckt, Rückgriff und Export liefern identische Listen. **Im Browser ungetestet.**
+
+**Nicht geändert, nur notiert:** Die Icons haben je 16 Frames, aber nur 6–16 verschiedene
+(DD 7, DX 8, Kremlin 6) — Wiederholungen werden mit hochgerechnet, der Pack nimmt je Hash den
+ersten. Und der Sprite-Export setzt generell keinen Rand um die Frames (die Icons füllen ihre
+16×16 bis zur Kante).
+
+
+## [2026-09-10] — Neue Seite 🔢 Zahlen: zwei Ziffernschriften
+
+Nur Viewer (`dkc2-viewer/index.html`, neu `dkc2-viewer/zahlen_groundtruth.js`).
+
+**Der erste HUD-Export hat gezeigt, dass ein Zähler nicht als Objekt gehört, sondern als
+SCHRIFT** — 1 465 Bilder für 101 Kacheln, weil ein zweistelliger Zähler dieselben zehn
+Glyphen in sechzig Paarungen zeichnet. Dasselbe Problem hatte die Weltkartenschrift, und die
+Schrift-Seite löst es seit Juli: Grundwahrheitstabelle → Objekte zurücklesen → Greedy-Cover
+über ZEICHEN. Die neue Seite ist dieselbe Konstruktion für Ziffern.
+
+### `zahlen_groundtruth.js` — zwei Schriften, beide Palette 0
+
+| | Geometrie | Kacheln je Glyphe | wo |
+|---|---|---|---|
+| **HUD (gold)** | 8×16 | 2 (gestapelt) | Bananenzähler links oben, Lebenzähler neben dem Kong-Portrait |
+| **Fass (weiß)** | 16×24 | 5–6, **freie Offsets** | Countdown im Bonusraum |
+
+**Die weiße Schrift liegt nicht auf einem Raster.** Eine Ziffer ist ein 16×16-Sprite plus ein
+oder zwei 8×8 darüber, und das Spiel setzt die oberen an ungerade x: die `1` auf x = 4 und 7,
+die `4` hat nur EIN oberes Teil auf x = 1. Eine Rasterannahme verliert die Hälfte des Satzes
+(sie hat es beim Bauen zweimal getan). Die Tabelle speichert deshalb Kachellisten mit Offsets.
+
+**Verifiziert wie die Schrift — durch Zurücklesen, nicht durch Zuweisen.** Über alle 278 306
+OAM-Frames gelesen: die Fass-Schrift ergibt **20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 09
+… 01** — ein lückenloser Countdown, nichts außerhalb. Ein falsches Etikett hätte ihn sofort
+zerrissen. Die Gold-Schrift ergibt einen Bananenzähler durch 0–99 und einen Lebenzähler, der
+auf seiner 99er-Kappe sitzt (5 086 Sichtungen) und nie darüber liest.
+
+### Die Seite
+
+- Bestandsraster je Schrift: welche der zehn Ziffern **erfasst**, welche schon **HD**, welche
+  in keinem Objekt vorkommen — dieselben vier Randfarben wie auf der Schrift-Seite.
+- Greedy-Cover über **Ziffern**: die wenigsten Zählerstände, die zusammen alle zehn zeigen.
+  Gemessen am Testauszug: **5 Stände für Gold, 8 fürs Fass = 13 Bilder** gegen 1 465.
+- Exportiert wird die gewählte **Phase**, nicht das ganze Objekt — sonst kämen die übrigen
+  59 Lesungen wieder mit, genau das, wogegen die Seite gebaut ist.
+- `readNumber()` bindet die Ziffern an eine **Grundlinie**. Ohne das las der Bananenzähler
+  `120`, weil eine Glyphe im Nachbarblock mitmatchte. Echte dreistellige Zähler gibt es
+  trotzdem (39 Lesungen, Symbol + drei Ziffern) — die bleiben korrekt.
+
+### Laufzeit-Galerie: `Zahlen ausblenden` (Vorgabe an)
+
+Objekte, die sich als Zahl lesen lassen, verschwinden aus der Galerie. Was dort bleibt, sind
+die **Symbole**: Kong-Portrait, KONG-Buchstaben, Banane. Die Ziffern werden auf der neuen
+Seite einzeln abgehakt, statt sie in hunderten Zählerständen zu suchen.
+
+**→ Beides nach dem ersten Test umgebaut, siehe Nachtrag.** Zählerstände, Greedy-Cover über
+Ziffern und `readNumber()` gibt es nicht mehr.
+
+### Nachtrag nach dem ersten Test (User: Seite sichtbar, Export 13 Bilder ok, Kopf fehlt)
+
+**1. Der Diddy-Kopf war aus der Laufzeit-Galerie verschwunden.** `numberObjectIds()` blendete
+jedes Objekt GANZ aus, in dem sich irgendwo eine Zahl lesen ließ, und der Kopf liegt mit den
+Lebensziffern in **einem** OAM-Block. Dasselbe traf das Bananen- und das Sternsymbol — und,
+gemessen am Testauszug, **4 096 weitere Objekte**, die nur zufällig im selben OAM-Block wie
+ein Zähler lagen (Kong-Sprites u. ä.), darunter **284 Kacheln, die sonst in keinem Objekt
+vorkommen**. Die waren still aus der Galerie und damit aus jedem Export verschwunden.
+**Jetzt** (`rtObjectsWithoutDigits`): die Ziffernkacheln werden aus jedem Objekt
+herausgeschnitten, der Rest bleibt als Objekt `…-rest` stehen. Gleicher Rest aus verschiedenen
+Zählerstrukturen (ein-/zweistellig) wird zu einem Objekt zusammengelegt. Auswahl und Merkliste
+lösen IDs über beide Ansichten auf (`rtFindObjects`), damit das Umschalten der Checkbox nichts
+verliert. Gemessen: 27 396 Objekte → Pool 26 972, **keine** Ziffernkachel mehr darin, der
+Kopf steht als 14×16-Objekt da. Sichtbar (Vorgabefilter): 21 384 gestern → 25 492.
+
+**2. Die Checkbox `Zahlen ausblenden` hatte keinen Listener** — Umschalten zeichnete nicht neu.
+Behoben. **Das Suchfeld `rtSearch` auch nicht, und zwar seit es existiert** (`484e754`):
+Tippen wirkte erst mit der nächsten Änderung eines anderen Filters. Jetzt `input`-Listener,
+250 ms entprellt.
+
+**3. Die Zahlen-Seite exportiert jede Ziffer EINZELN** (Vorschlag des Users). Anders als die
+Kartenschrift, wo die Buchstaben eines Worts einander berühren und das Wort das Motiv ist,
+steht eine Ziffer im Spiel neben jeder anderen. Es gibt also keinen richtigen Nachbarn, gegen
+den man sie hochrechnen könnte — transparenter Rand ist der ehrliche Kontext. Und jeder Hash
+steckt dann in genau einem Bild: in den 13 Zählerständen stand die Fass-`1` siebenmal, also
+sieben HD-Fassungen, von denen erste-gewinnt eine willkürliche behält.
+Ein Bild **je Gruppe**, die Motive nebeneinander mit demselben Rand (2 × `RT_PAD`), den ein
+Einzelexport hätte — der Import schneidet nach Kachelposition, ein Bogen kommt also genauso
+zurück wie Einzeldateien. **5 Dateien** statt 13, 145 Kacheln, keine doppelt.
+
+**4. Die Zählersymbole gehören jetzt zur Zahlen-Seite** (User): Diddy-Kopf (4 Kacheln,
+Palette 1, freie Offsets), Banane und Stern (je 8 Drehphasen). Einen Dixie-Kopf gibt es nicht.
+Ermittelt als häufigster Nicht-Ziffern-Rest eines OAM-Blocks mit Ziffernkacheln, **nur aus
+ungespiegelten Einträgen** (zwei Bananenphasen werden auch gespiegelt gezeichnet).
+**Banane und Stern sind dieselben Kacheln wie die Level-Bananen und die Bonus-Sterne** —
+20 000 bzw. 5 000 Sichtungen außerhalb eines Zählers gegen 5 000 bzw. 400 darin. Ein Upscale
+von dieser Seite deckt die also mit ab. Die leere Kachel `0C8210784D8AF5A5` ist nicht in der
+Tabelle — keine Pixel, und eine leere Zelle darf nie zum Upscaler.
+
+**5. Die Seite braucht keine Aufzeichnung mehr.** `zahlen_groundtruth.js` trägt jetzt auch die
+**Pixel** aller 145 Kacheln (`DKC2_NUMBER_PIXELS`: 32 Byte VRAM + 16 CGRAM-Farben, aus der
+ersten Sichtung in `snes_hd_spritemiss.txt`). Die Menge ist geschlossen, also darf sie mit dem
+Viewer ausgeliefert werden. `rtTilePixels()` fragt erst die Aufzeichnung, dann diese Tabelle —
+Galerie, HD-Vorschau und Export zeichnen damit auch ohne geladene Laufzeitdateien.
+Nebenbei: `sprMissKnowsHash` stürzte ohne geladene Aufzeichnung ab (Cache nie gebaut); bisher
+hat jeder Aufrufer das vorher abgefangen, der Export jetzt nicht mehr.
+
+**Geprüft außerhalb des Browsers:** die Viewer-Funktionen selbst (`parseOam`,
+`buildOamObjects`, `rtObjectsWithoutDigits`, `numGroups`, `numSheet`, …) per Klammerabgleich
+aus `index.html` gezogen und in Node gegen den Testauszug laufen lassen; die fünf Bögen aus den
+eingebetteten Pixeln gerendert und angeschaut. **Im Browser ungetestet.**
+
+### Nachtrag 2: KONG-Buchstaben, Münzen (User: Zahlen-Seite sieht gut aus, Export v3 geprüft)
+
+**Export v3 geprüft:** 5 Bilder, Manifest gegen die Bögen: alle 145 Kacheln an ihrer Stelle,
+keine leere Zelle, **5 403 deckende Pixel gegen die Groundtruth — 0 Abweichungen**.
+
+**KONG-Buchstaben des HUD → auf die Zahlen-Seite.** Die kleinen 16×16-Kacheln `K O N G`, die
+das HUD beim Einsammeln oben aufreiht — NICHT die großen Drehpanels im Level (ROM-Animationen
+`0x02BB`–`0x02BE`). Gefunden im oberen Bildschirmstreifen aller 278 307 OAM-Frames, die
+Reihenfolgen darin (`K`, `K O`, `K O N`, `K · N`, `K · N G` …) sind genau die
+Buchstabenanzeige. Nur Palette 0, im ROM ein fester HUD-Grafikblock bei `$2400–$25FF` wie die
+Ziffern. Ein Symbol mit `char` je Phase wird mit dem Buchstaben beschriftet statt mit einer
+Phasennummer. Jetzt **6 Bögen, 161 Kacheln**.
+
+**Münzen — noch NICHT eingebaut, Entscheidung beim User.** Befund:
+- **Bananenmünze** sauber isoliert: 8 Drehphasen, jede Phase 16×16 plus 8×8-Teile an freien
+  Offsets (bis 24×32). Im HUD steht sie in einem **eigenen** OAM-Block links neben den Ziffern
+  — deshalb fand die Rest-Suche sie nicht; gefunden über „Block direkt links neben einem
+  reinen Ziffernblock". Die User-IDs `G3-16x32-P3-891E` / `G3-19x32-P3-160F-1` sind zwei
+  dieser Phasen.
+- **Sie hat keinen festen Slot**: alle 74 Kacheln unter P3, P4, P5 **und** P6 aufgezeichnet.
+  Laufzeit-Kacheln sind in Mesen slotgebunden (`GetMatchingTile`, S20: slotfrei nur mit
+  Referenzpalette, und die schreibt der Pack-Export bisher nur für ROM-Sprites).
+- Die rote, gepunktete Münze mit „99" ist **dieselbe** Bananenmünze (gleiche Hashes), nur mit
+  verfälschten Farben mitgeschnitten.
+- **Kremkoin und DK-Münze kommen in der Aufzeichnung als Zähler nicht vor** — nicht im
+  Testauszug, nicht in den 278 307 Frames der vollen Datei.
+- Alle drei Münzen sind **ROM-Animationen** (`0x01C1` Banana Coin, `0x01C2` Kremkoin,
+  `0x01C3` DK Coin) und stehen in der Sprite-Galerie. Die Laufzeitkacheln der Bananenmünze
+  liegen **byte-genau** im ROM (zusammenhängend ab `$1C6690`) — die Sprite-Galerie erzeugt
+  also dieselben Hashes, mit Referenzpalette, slotfrei.
+
+**Nebenbefund Slots, betrifft auch Seite und Export von heute:** Diddy-Kopf auch unter **P4**
+(nur in der spritemiss vom 10.08., nicht in der OAM-Aufzeichnung — Ort unbekannt), und die
+HUD-Ziffern unter **P7** im Shop-Münzzähler („99" links oben, Gfxset −1 und G9). Beide
+exportiert die Seite nur unter ihrem Hauptslot; in diesen Fällen bliebe es SD.
+
+**Zur Frage „muss ich die Laufzeitdateien jedes Mal hochladen?"** Nein, und das war schon so:
+`saveRecording()` legt OAM und spritemiss in IndexedDB ab (`recordings`), beim Start holt
+`restoreRuntimeSprFromDb()` sie zurück — der Knopf steht dann grün auf `Laufzeit ✓ N`. Neu
+laden ist nur nötig, wenn eine neue Aufzeichnung kommt (der Testauszug war eine). Die Daten
+liegen im Browserprofil, nicht in einer Datei: anderer Browser, anderes Profil oder
+gelöschte Websitedaten → einmal neu laden.
+
+
+## [2026-09-09] — Laufzeit-Galerie: warum das HUD nicht da war
+
+Nur Viewer (`dkc2-viewer/index.html`).
+
+**Der Bananenzähler des HUD fehlte in der Laufzeit-Galerie — nicht weil das Objekt nicht
+entsteht, sondern weil eine LEERE Kachel als Lücke gezählt wurde.**
+
+Gemessen an `snes_hd_oam.txt` (853 MB, 60 000 Frames ausgewertet) und `snes_hd_spritemiss.txt`:
+das HUD zerfällt in zwei OAM-Gruppen, und nur eine war sichtbar.
+
+| HUD-Objekt | Zellen | Phasen | vollständig ALT | vollständig NEU |
+|---|---|---|---|---|
+| Kopf + Leben (rechts oben) | 8 | 3–6 | alle | alle — war immer sichtbar |
+| Bananensymbol + Zähler (links oben) | 5 | 14–60 | **0** | **alle** |
+
+**Die Ursache.** `obj.missing` zählte jede Kachel, die nicht in `spritemiss` steht. Der
+Mesen-Recorder ist aber PIXEL-getrieben: er schreibt eine Kachel, wenn eines ihrer Pixel ohne
+HD-Kunst gezeichnet wird. Eine **vollständig transparente** Kachel kann damit nie in die Datei
+gelangen — es gibt kein Pixel, das sie auslöst. Genau so eine steckt im Bananensymbol: das
+leere obere linke Viertel von `$1E8`, Hash `0C8210784D8AF5A5`. Es kommt in **jeder** der 60
+Phasen vor, also war `missing ≥ 1` immer wahr, `nur zeichenbare` (Vorgabe: an) hat das Objekt
+in jedem Gfxset ausgeblendet, und der Zähler war im Viewer nie zu sehen.
+
+**Zwei Korrekturen, beide an der Definition von „Lücke".**
+
+1. **Ein Loch ist palettenbezogen, nicht kachelbezogen** (`sprTileIsHole`). Eine Kachel gilt nur
+   dann als Loch, wenn ihr Hash unter EINER ANDEREN Palette erfasst ist, unter dieser aber
+   nicht — dann existiert die Kunst und die Farbvariante fehlt. Ein Hash, den `spritemiss` noch
+   nie gesehen hat, ist eine leere Zelle und kostet nichts.
+2. **Zeichenbarkeit gehört zur PHASE, nicht zum Objekt** (`obj.drawablePhases`). Jede Phase
+   verlässt den Export als eigenes PNG; ein Objekt ist zeigbar, sobald eine Phase vollständig
+   ist. Der Filter blendet nur noch aus, was gar nicht zeichenbar ist.
+
+**Der Export verschickt jetzt keine Löcher mehr.** Eine Phase mit echtem Loch wird
+übersprungen statt mit leerer Zelle exportiert — blank raus heißt blank zurück, und
+Laufzeit-Importe sind *erste-gewinnt*, eine so entstandene leere HD-Kachel wäre nicht mehr zu
+ersetzen. Die Rückfrage vor dem Export spricht deshalb von Animationsbildern, nicht mehr von
+Objekten. Die Konsolenzeile nennt die übersprungenen Bilder.
+
+**Wirkung auf die Galerie, gemessen an 40 000 Frames:** 26 465 Objekte, davon sichtbar
+23 528 → **26 010** (+2 482, +10,5 %). Kein Schwall, und der Bananenzähler ist dabei.
+
+**Nachtrag nach dem ersten HUD-Export (user-getestet: Bananenzähler, Kopf + Leben und die
+KONG-Buchstaben erscheinen, Schrift-Seite unverändert).** Das ZIP hat den nächsten Fehler
+sichtbar gemacht — nicht im Bild, sondern in der Menge:
+
+| ZIP `dkc2_runtime_sd HUD test.zip` | |
+|---|---|
+| PNGs | **1 465** |
+| distinkte Kacheln darin | **101** |
+| Bilder, die alle 101 abdecken (Greedy) | **14** |
+| reine Wiederholung | **99,0 %** |
+
+Ein zweistelliger Zähler zeichnet dieselben zehn Ziffern in immer neuen Kombinationen. Teurer
+als die verschwendete GPU-Zeit ist die Folge für das Ergebnis: **eine Kachel, 700-mal in
+anderer Nachbarschaft hochgerechnet, ergibt 700 verschiedene HD-Fassungen desselben Hashes**,
+und der Import (erste-gewinnt) behält davon eine willkürliche.
+
+- **`nur Abdeckung exportieren`** (neu, Vorgabe an): Greedy-Set-Cover über die distinkten
+  Kacheln der Auswahl, größter Zugewinn zuerst — dasselbe Prinzip wie `fontPickWords()` auf der
+  Schrift-Seite, nur über Kacheln statt über Zeichen. Das gewählte Bild ist zugleich das mit
+  dem meisten Kontext. Der Dateiname behält die ursprüngliche Phasennummer.
+- **Das Manifest listet keine pixellosen Kacheln mehr.** Geprüft am ZIP: 365 vollständig leere
+  Zellen, **alle** derselbe Hash `0C8210784D8AF5A5_P0` — das leere Viertel des Bananensymbols.
+  Als Manifest-Eintrag wäre daraus eine leere HD-Kachel geworden, die erste-gewinnt festnagelt
+  und die die Galerie danach als „vollständig HD" meldet. Sonst **keine** leeren Zellen im
+  Export — die Loch-Definition oben stimmt also.
+
+**Nebenbefund, nicht gebaut.** `oamGroupByRun` vergleicht Y-Werte roh. OAM-Y ist 8 Bit und
+läuft über: das HUD steht in manchen Frames auf Y = 249…251, also − 7…− 5. Damit wird aus
+8 px Abstand einer von 248, die Gruppe bricht auseinander und dasselbe HUD landet als
+11×8- und 14×16-Bruchstücke in der Liste. Ein `y >= 240 ? y - 256 : y` beim Parsen räumt das
+auf (gemessen: von 433 Portrait-Gruppen 369 korrekt → 393 von 417). **Bewusst nicht gemacht:**
+es ändert die Objekt-IDs der betroffenen Objekte, und die stehen auf Merklisten.
+
+
 ## [2026-09-08] — S22–S24: Sprite-Kanten bei Überlappung
 
 Nur Mesen (`SnesPpu.h`, `SnesPpu.cpp`, `SnesHdVideoFilter.cpp`).

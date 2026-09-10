@@ -118,6 +118,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="vram_groundtruth.js"></script>
 <script src="font_groundtruth.js"></script>
+<script src="zahlen_groundtruth.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -370,6 +371,7 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <button class="cat-btn" data-cat="other">Sonstiges</button>
       <button class="cat-btn" data-cat="runtime" title="Laufzeit-Sprites aus den Mesen-Aufzeichnungen — Kacheln OHNE Eintrag in der ROM-Animationsbibliothek (Schädelwagen, Fackeln, Steine). Braucht den Knopf „Laufzeit“ in der Katalog-Toolbar.">⧉ Laufzeit</button>
       <button class="cat-btn" data-cat="font" title="Weltkarten-Schrift: welche Zeichen erfasst sind und welche Wörter für den Upscale exportiert werden.">🔤 Schrift</button>
+      <button class="cat-btn" data-cat="digits" title="Ziffern und HUD-Symbole: die goldenen HUD-Ziffern, die weißen Fass-Ziffern, Diddy-Kopf, Banane, Stern und die KONG-Buchstaben des HUD. Zeigt, was schon in HD ist, und exportiert jedes Motiv genau einmal. Kommt ohne Aufzeichnung aus.">🔢 Zahlen</button>
       <span style="border-left:1px solid #555;margin:0 4px;height:18px;display:inline-block;"></span>
       <label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" id="spriteShowGrey" checked> Grau zeigen</label>
       <button id="spritePipetteBtn" title="Palette von ausgewähltem Sprite kopieren und auf andere anwenden">Pipette</button>
@@ -397,8 +399,10 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <label style="display:flex;align-items:center;gap:4px;" title="ID oder Kachel-Hash suchen">🔎
         <input type="text" id="rtSearch" placeholder="ID / Hash" style="width:120px;background:#222;color:#e0e0e0;border:1px solid #555;">
       </label>
-      <label style="display:flex;align-items:center;gap:4px;" title="Bilder, deren Kacheln alle Pixel in snes_hd_spritemiss.txt haben — nur die lassen sich exportieren"><input type="checkbox" id="rtOnlyDrawable" checked> nur zeichenbare</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Objekte, von denen mindestens ein Animationsbild vollständige Pixel in snes_hd_spritemiss.txt hat. Einzelne unvollständige Bilder werden beim Export übersprungen."><input type="checkbox" id="rtOnlyDrawable" checked> nur zeichenbare</label>
       <label style="display:flex;align-items:center;gap:4px;" title="Objekte aus einer einzelnen 8x8-Kachel — meist Bruchstücke."><input type="checkbox" id="rtHideTiny" checked> 8x8 ausblenden</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Schneidet die Ziffernkacheln (HUD gold, Fass weiß) aus jedem Objekt heraus — die zehn Ziffern je Schrift liegen auf der Seite 🔢 Zahlen. Was vom Zähler übrig bleibt, bleibt hier stehen: Diddy-Kopf, Banane, Stern."><input type="checkbox" id="rtHideNumbers" checked> Zahlen ausblenden</label>
+      <label style="display:flex;align-items:center;gap:4px;color:#8bc34a;" title="Beim Export nur die wenigsten Animationsbilder schicken, die zusammen jede Kachel enthalten. Der Pack ist kachelbasiert — ein Bild, das keine neue Kachel bringt, kostet Rechenzeit und erzeugt eine zweite HD-Fassung derselben Kachel, von der der Import (erste-gewinnt) willkürlich eine behält."><input type="checkbox" id="rtCoverOnly" checked> nur Abdeckung exportieren</label>
       <label style="display:flex;align-items:center;gap:4px;" title="Nur Objekte mit mehr als einem Animationsbild — Fackeln, Flagge, Wespen, Rauch."><input type="checkbox" id="rtOnlyAnimated"> nur animierte</label>
       <label style="display:flex;align-items:center;gap:4px;color:#ffc107;" title="Nur die per Stern gemerkten Objekte. Die Merkliste bleibt über Reloads erhalten."><input type="checkbox" id="rtOnlyKeep"> ★ nur Merkliste</label>
       <label style="display:flex;align-items:center;gap:4px;" title="Zeigt die HD-Kunst aus dem Container statt der aufgezeichneten SD-Kacheln. Wo noch keine HD-Kachel existiert, bleibt die SD-Version stehen — so sieht man je Objekt sofort, was fertig ist (Karten mit Lücken bekommen einen orangen Rand)."><input type="checkbox" id="rtShowHd" checked> HD zeigen</label>
@@ -423,6 +427,14 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <button id="fontExportBtn" style="padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;font-weight:bold;" title="Genau die unten gezeigten Wörter als SD-ZIP für den Upscaler exportieren">Wörter exportieren</button>
     </div>
     <div id="fontPage" style="display:none;overflow-y:auto;padding:12px;color:#ddd;"></div>
+    <div class="sprite-gallery-toolbar" id="digitsToolbar" style="display:none;">
+      <span style="font-size:11px;color:#888;">Zahlen:</span>
+      <span id="digitsSummary" style="font-size:12px;color:#ddd;"></span>
+      <span style="border-left:1px solid #555;margin:0 4px;height:18px;display:inline-block;"></span>
+      <label style="display:flex;align-items:center;gap:4px;" title="Zeigt die HD-Kunst aus dem Container statt der aufgezeichneten SD-Kacheln. Wo noch keine HD-Kachel existiert, bleibt die SD-Version stehen."><input type="checkbox" id="digitsShowHd" checked> HD zeigen</label>
+      <button id="digitsExportBtn" style="padding:3px 10px;background:#4caf50;color:#fff;border:1px solid #4caf50;font-weight:bold;" title="Alles, was unten noch SD ist, als SD-ZIP für den Upscaler: jede Ziffer und jede Symbolphase genau einmal, freigestellt. Ein Bild je Gruppe (Schrift bzw. Symbol), die Motive nebeneinander mit Rand. Braucht keine Aufzeichnung.">Zahlen exportieren</button>
+    </div>
+    <div id="digitsPage" style="display:none;overflow-y:auto;padding:12px;color:#ddd;"></div>
     <div id="rtReportPanel" style="display:none;background:#1a1a1a;border:1px solid #555;border-radius:4px;margin:6px;padding:10px 14px;max-height:340px;overflow-y:auto;font-size:12px;color:#ddd;"></div>
     <div class="sprite-gallery-grid" id="runtimeGalleryGrid" style="display:none;"></div>
   </div>
@@ -8149,8 +8161,10 @@ async function exportSpritesAsZip() {
           const frame = frames[fi];
           let rendered;
           if (frame.canvas) {
-            // Pre-rendered frame (map icons etc.) — use canvas directly
-            rendered = { canvas: frame.canvas, width: frame.width, height: frame.height };
+            // Pre-rendered frame (map icons etc.) — use canvas directly. The tile
+            // mapping travels with it: without tiles[] the pack export drops the frame.
+            rendered = { canvas: frame.canvas, width: frame.width, height: frame.height,
+                         tiles: frame.tiles || null };
           } else {
             gfxRefRenderCache.clear(); // clear cache to ensure fresh render with this palette
             const secPalKey = entry.secondaryPaletteSetId !== null ? String(entry.secondaryPaletteSetId) : null;
@@ -8493,6 +8507,55 @@ function parseBgCap(text) {
 
 let spriteMissEntries = null;  // Array<{slot, pal, overlap, gfx, hash, bytes:Uint8Array, cgram:Uint16Array}>
 let spriteMissByHash = null;   // Map<hash16 → entry>
+
+// Every hash spritemiss has EVER seen, under any palette.
+//
+// The recorder is PIXEL-driven: it writes a tile the first time one of its pixels
+// is drawn without HD art. An ALL-TRANSPARENT tile therefore can never enter the
+// file -- there is no pixel to trigger it. The HUD's banana icon has such a
+// quadrant (0C8210784D8AF5A5, the empty top-left of $1E8), and treating it as a
+// gap marked the whole banana counter undrawable, in every phase and every
+// gfxset, so the default filter hid the counter from the gallery entirely.
+//
+// A hash that is known under SOME palette but not this one is a different case
+// and stays a real hole: there the art exists and this colour variant is missing.
+let spriteMissHashes = null, spriteMissHashesFor = null;
+function sprMissKnowsHash(hash) {
+  if (spriteMissHashesFor !== spriteMissByHash) {
+    spriteMissHashesFor = spriteMissByHash;
+    spriteMissHashes = new Set();
+    if (spriteMissByHash) for (const k of spriteMissByHash.keys()) spriteMissHashes.add(k.split('_')[0]);
+  }
+  // Without any recording loaded the cache was never built — nothing is known.
+  return !!spriteMissHashes && spriteMissHashes.has(hash);
+}
+// A tile is a HOLE only when its art was captured under another palette but not
+// under this one. A hash nobody has ever seen is a blank cell and costs nothing.
+function sprTileIsHole(t) {
+  return !rtTilePixels(`${t.hash}_P${t.pal}`) && sprMissKnowsHash(t.hash);
+}
+
+// The pixels of one runtime tile: the recording first, then the digits and
+// counter symbols that ship WITH the viewer in zahlen_groundtruth.js. That set is
+// closed, so the Zahlen page draws and exports without any recording loaded.
+let _numPixels = null;
+function numTilePixels(key) {
+  if (!_numPixels) {
+    _numPixels = new Map();
+    if (typeof DKC2_NUMBER_PIXELS !== 'undefined') {
+      for (const [k, s] of Object.entries(DKC2_NUMBER_PIXELS)) {
+        const bytes = new Uint8Array(32), cgram = new Uint16Array(16);
+        for (let i = 0; i < 32; i++) bytes[i] = parseInt(s.substr(i * 2, 2), 16);
+        for (let i = 0; i < 16; i++) cgram[i] = parseInt(s.substr(64 + i * 4, 4), 16);
+        _numPixels.set(k, { bytes, cgram });
+      }
+    }
+  }
+  return _numPixels.get(key) || null;
+}
+function rtTilePixels(key) {
+  return (spriteMissByHash && spriteMissByHash.get(key)) || numTilePixels(key);
+}
 let sprPosEntries = null;      // Array<{gfx, sig, frame, x, y, pal, slot, hash}>
 
 // SPRMISS <M|S> P<pal> O<overlap> G<gfx> H<hash16> T<64 hex> C<64 hex>
@@ -8788,8 +8851,18 @@ function buildOamObjects() {
     };
     obj.phaseCount = obj.phases.length;
     obj.allTiles = [...new Set(obj.phases.flatMap(ph => ph.map(t => `${t.hash}_P${t.pal}`)))];
-    obj.missing = spriteMissByHash
-      ? obj.allTiles.filter(k => !spriteMissByHash.has(k)).length : obj.allTiles.length;
+    const uniqTiles = [...new Map(obj.phases.flatMap(ph =>
+      ph.map(t => [`${t.hash}_P${t.pal}`, t]))).values()];
+    obj.missing = spriteMissByHash ? uniqTiles.filter(sprTileIsHole).length : obj.allTiles.length;
+    // Drawability belongs to a PHASE, not to the object. `missing` folds every
+    // phase together, so ONE uncaptured tile in ONE phase marked the whole object
+    // undrawable and the default filter hid it. That is why the banana counter was
+    // missing from the gallery: a single digit glyph (0C8210784D8AF5A5_P0) never
+    // reached spritemiss, while 59 of its 60 phases were complete. Every phase
+    // leaves as its own PNG, so counting them one by one is also what the export
+    // does — an object is worth showing as soon as one phase can be drawn.
+    obj.drawablePhases = spriteMissByHash
+      ? obj.phases.filter(ph => !ph.some(sprTileIsHole)).length : 0;
     oamObjects.push(obj);
   }
   const byId = new Map();
@@ -8971,7 +9044,8 @@ function fontObjects() {
       pals: [6],
       phases: [tiles], phaseCount: 1,
       allTiles,
-      missing: spriteMissByHash ? allTiles.filter(k => !spriteMissByHash.has(k)).length : allTiles.length,
+      missing: spriteMissByHash ? tiles.filter(sprTileIsHole).length : allTiles.length,
+      drawablePhases: spriteMissByHash ? (tiles.some(sprTileIsHole) ? 0 : 1) : 0,
     });
   }
   fontObjectsCache = out;
@@ -9099,7 +9173,7 @@ function renderRuntimeObject(obj) {
   const ctx = c.getContext('2d');
   const img = ctx.createImageData(obj.w, obj.h);
   for (const t of obj.tiles) {
-    const e = spriteMissByHash && spriteMissByHash.get(`${t.hash}_P${t.pal}`);
+    const e = rtTilePixels(`${t.hash}_P${t.pal}`);
     if (!e) continue;
     drawTile8x8(img, e.cgram, 0, t.x, t.y, e.bytes, false, false);
   }
@@ -9117,7 +9191,7 @@ function renderRuntimeObject(obj) {
 function rtSuggestCover(pool) {
   const keyOf = (o) => new Set(o.tiles.map(t => `${t.hash}_P${t.pal}`));
   const done = rtCoveredKeys();
-  const candidates = pool.filter(o => o.missing === 0 && !o.stacked);
+  const candidates = pool.filter(o => o.drawablePhases > 0 && !o.stacked);
   const need = new Set();
   for (const o of candidates) for (const k of keyOf(o)) if (!done.has(k)) need.add(k);
   const openTotal = need.size;
@@ -9160,16 +9234,20 @@ async function exportRuntimeObjectsAsZip(explicitList, btnId, zipName) {
   // An explicit list (the font page hands one over) wins; then the selection;
   // then everything the filter currently shows.
   let list = explicitList || (runtimeSelection.size > 0
-    ? (oamObjects || []).filter(o => runtimeSelection.has(o.id))
+    ? rtFindObjects(runtimeSelection)
     : rtFilteredObjects());
-  const withGaps = list.filter(o => o.missing > 0);
+  const phasesOf = (o) => o.phaseCount || 1;
+  const withGaps = list.filter(o => o.drawablePhases < phasesOf(o));
   if (withGaps.length) {
-    // A gap means the pixels were never captured, so that cell would be exported
-    // blank and come back blank. Better to say so than to ship holes.
-    const go = confirm(`${withGaps.length} von ${list.length} Objekten haben Kacheln ohne Pixel ` +
-                       `in snes_hd_spritemiss.txt — die bleiben im Export leer.\n\n` +
-                       `Trotzdem exportieren? (Abbrechen = nur die vollständigen ${list.length - withGaps.length})`);
-    if (!go) list = list.filter(o => o.missing === 0);
+    // A gap is a phase whose pixels were never captured. Those phases are skipped
+    // below instead of being shipped blank, so this asks about losing SINGLE
+    // ANIMATION FRAMES -- not, as it used to, about dropping the whole object.
+    const lost = withGaps.reduce((n, o) => n + (phasesOf(o) - o.drawablePhases), 0);
+    const go = confirm(`${withGaps.length} von ${list.length} Objekten haben Animationsbilder mit ` +
+                       `Kacheln ohne Pixel in snes_hd_spritemiss.txt.\n\n` +
+                       `${lost} solcher Bilder werden übersprungen, die vollständigen gehen mit.\n\n` +
+                       `Weiter? (Abbrechen = nur Objekte, deren Bilder alle vollständig sind)`);
+    if (!go) list = list.filter(o => o.drawablePhases === phasesOf(o));
   }
   if (list.length === 0) { alert('Nichts zu exportieren.'); return; }
 
@@ -9189,7 +9267,10 @@ async function exportRuntimeObjectsAsZip(explicitList, btnId, zipName) {
       stats: { objects: 0, tiles: 0, distinctTiles: 0 },
     };
     const distinct = new Set();
+    let skippedPhases = 0;
 
+    // Build the job list FIRST, so a coverage pass can run over it.
+    const jobs = [];
     for (const obj of list) {
       // Every phase is its own artwork and needs its own upscale — the same way
       // the sprite gallery ships every frame of a character. Phases share the
@@ -9198,33 +9279,82 @@ async function exportRuntimeObjectsAsZip(explicitList, btnId, zipName) {
       const phases = obj.phases || [obj.tiles];
       for (let p = 0; p < phases.length; p++) {
         const tiles = phases[p];
-        const cv = document.createElement('canvas');
-        cv.width = obj.w + RT_PAD * 2;
-        cv.height = obj.h + RT_PAD * 2;
-        const ctx = cv.getContext('2d');
-        ctx.imageSmoothingEnabled = false;
-        let drew = 0;
-        for (const t of tiles) {
-          const e = spriteMissByHash && spriteMissByHash.get(`${t.hash}_P${t.pal}`);
-          if (!e) continue;
-          ctx.drawImage(renderSpriteMissTile(e, 1), t.x + RT_PAD, t.y + RT_PAD);
-          distinct.add(`${t.hash}_P${t.pal}`);
-          drew++;
-        }
-        if (!drew) continue;
-        const name = phases.length > 1
-          ? `${obj.id}_f${String(p).padStart(2, '0')}.png` : `${obj.id}.png`;
-        folder.file(name, await new Promise(res => cv.toBlob(res, 'image/png')));
-        manifest.objects.push({
-          id: name.replace(/\.png$/, ''), file: `runtime/${name}`, gfx: obj.gfx,
-          width: cv.width, height: cv.height,
-          offsetX: RT_PAD, offsetY: RT_PAD,
-          object: obj.id, frame: p, frameCount: phases.length,
-          tiles: tiles.map(t => ({ hash: t.hash, x: t.x, y: t.y, pal: t.pal })),
-        });
-        manifest.stats.objects++;
-        manifest.stats.tiles += tiles.length;
+        // A phase with a hole would ship a blank cell, come back blank from the
+        // upscaler and land in the container as EMPTY HD art -- and runtime
+        // imports are first-wins, so that empty tile could never be replaced
+        // afterwards. Skip the phase; its complete siblings still go.
+        if (tiles.some(sprTileIsHole)) { skippedPhases++; continue; }
+        jobs.push({ obj, p, phaseCount: phases.length, tiles,
+                    keys: new Set(tiles.map(t => `${t.hash}_P${t.pal}`)) });
       }
+    }
+
+    // COVERAGE. The pack is keyed by TILE, so a phase that brings no new tile is
+    // pure repetition. The first HUD export showed what that costs: 1465 images
+    // for 101 distinct tiles, because a two-digit counter draws the same ten
+    // glyphs in ever new combinations. Worse than the wasted GPU time is what it
+    // does to the result -- one tile upscaled in 700 different neighbourhoods
+    // yields 700 different HD versions of the SAME hash, and the first-wins
+    // import then keeps an arbitrary one. Greedy set cover, biggest gain first;
+    // it picks the phase that carries the most unseen tiles, which is also the
+    // one with the most context. Measured on that export: 1465 -> 14.
+    let repeats = 0;
+    if (document.getElementById('rtCoverOnly')?.checked !== false && jobs.length > 1) {
+      const need = new Set();
+      for (const j of jobs) for (const k of j.keys) need.add(k);
+      const rest = jobs.slice(), picked = [];
+      while (need.size) {
+        let best = null, gain = 0;
+        for (const j of rest) {
+          let g = 0;
+          for (const k of j.keys) if (need.has(k)) g++;
+          if (g > gain) { gain = g; best = j; }
+        }
+        if (!best) break;
+        picked.push(best);
+        for (const k of best.keys) need.delete(k);
+        rest.splice(rest.indexOf(best), 1);
+      }
+      repeats = jobs.length - picked.length;
+      jobs.length = 0;
+      for (const j of picked) jobs.push(j);
+    }
+
+    for (const { obj, p, phaseCount, tiles } of jobs) {
+      const cv = document.createElement('canvas');
+      cv.width = obj.w + RT_PAD * 2;
+      cv.height = obj.h + RT_PAD * 2;
+      const ctx = cv.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      let drew = 0;
+      for (const t of tiles) {
+        const e = rtTilePixels(`${t.hash}_P${t.pal}`);
+        if (!e) continue;
+        ctx.drawImage(renderSpriteMissTile(e, 1), t.x + RT_PAD, t.y + RT_PAD);
+        distinct.add(`${t.hash}_P${t.pal}`);
+        drew++;
+      }
+      if (!drew) continue;
+      // The name still carries the ORIGINAL phase number, not a position in the
+      // covered set -- so a file can be traced back to the frame it came from
+      // even after the coverage pass dropped its neighbours.
+      const name = phaseCount > 1
+        ? `${obj.id}_f${String(p).padStart(2, '0')}.png` : `${obj.id}.png`;
+      folder.file(name, await new Promise(res => cv.toBlob(res, 'image/png')));
+      manifest.objects.push({
+        id: name.replace(/\.png$/, ''), file: `runtime/${name}`, gfx: obj.gfx,
+        width: cv.width, height: cv.height,
+        offsetX: RT_PAD, offsetY: RT_PAD,
+        object: obj.id, frame: p, frameCount: phaseCount,
+        // Only tiles that actually carry pixels. A blank cell listed here would
+        // come back from the upscaler as an EMPTY HD tile under that hash, the
+        // first-wins import would lock it in, and the gallery would then report
+        // the object as "fully HD". The banana icon has such a cell.
+        tiles: tiles.filter(t => rtTilePixels(`${t.hash}_P${t.pal}`))
+                    .map(t => ({ hash: t.hash, x: t.x, y: t.y, pal: t.pal })),
+      });
+      manifest.stats.objects++;
+      manifest.stats.tiles += tiles.length;
     }
     manifest.stats.distinctTiles = distinct.size;
     zip.file('manifest.json', JSON.stringify(manifest, null, 2));
@@ -9235,7 +9365,9 @@ async function exportRuntimeObjectsAsZip(explicitList, btnId, zipName) {
     a.href = url; a.download = zipName || 'dkc2_runtime_sd.zip'; a.click();
     URL.revokeObjectURL(url);
     console.log(`[laufzeit] exportiert: ${manifest.stats.objects} Objekte, ` +
-                `${manifest.stats.distinctTiles} distinkte Kacheln`);
+                `${manifest.stats.distinctTiles} distinkte Kacheln` +
+                (repeats ? `, ${repeats} Wiederholungen weggelassen` : '') +
+                (skippedPhases ? `, ${skippedPhases} unvollständige Animationsbilder übersprungen` : ''));
     btn.textContent = `${manifest.stats.objects} exportiert`;
   } catch (err) {
     console.error('[laufzeit] Export fehlgeschlagen:', err);
@@ -9730,7 +9862,7 @@ async function importHDPack(file) {
         const scale = ol.widthPx ? (img.width / ol.widthPx) : 1;
         if (scale <= 1) {
           console.warn(`[overworld] ${ol.file} is ${img.width}px for a ${ol.widthPx}px source ` +
-            `— that is not an upscale, it will look like SD in the pack`);
+            ` — that is not an upscale, it will look like SD in the pack`);
         }
         hdOwLayers[ol.layer] = { img, meta: ol, scale };
         console.log(`[overworld] imported ${ol.file}: ${img.width}x${img.height} (${scale}x)`);
@@ -13090,12 +13222,26 @@ async function exportAsTexturePack(containerName) {
               console.warn(`[sprpal] ${spriteKey}: Palette nicht auflösbar:`, e.message);
             }
           }
+          // Map icons carry synthetic ids from 0xF000 that the cascade above cannot
+          // resolve; their palette is the one buildMapIconEntries() draws them with.
+          if (sprPool.length === 0 && spr.animId >= 0xF000) {
+            const mp = mapIconPalette(spr.animId);
+            if (mp) sprPool.push(toRgbTable(mp));
+          }
           if (sprPool.length === 0) refStats.noPalette++;
           else if (sprPool.length > 1) refStats.composite++;
 
           for (const fr of spr.frames) {
             const fi = fr.idx;
-            const meta = spr.metaMap.get(fi);
+            let meta = spr.metaMap.get(fi);
+            // Map icons (synthetic ids from 0xF000) imported before their SD export
+            // carried tiles[]: rebuild the mapping from the ROM instead of dropping
+            // the frame — otherwise their HD art could only be rescued by upscaling
+            // all of it again.
+            if ((!meta || !meta.tiles) && spr.animId >= 0xF000) {
+              const tiles = mapIconFrameTiles(spr.animId, fi);
+              if (tiles) meta = { offsetX: meta?.offsetX || 0, offsetY: meta?.offsetY || 0, tiles };
+            }
             if (!meta || !meta.tiles) { noMetaFrames++; continue; }
 
             // Decide BEFORE decoding whether this frame can still contribute anything.
@@ -13246,17 +13392,25 @@ async function exportAsTexturePack(containerName) {
       showMesenExportProgress('Laufzeit-Kacheln exportieren…', 0.85);
       await _yieldToBrowser();
       const spritesFolder = root.folder('sprites');
-      let skippedScale = 0, overwritten = 0, droppedDimmed = 0;
+      let skippedScale = 0, overwritten = 0, droppedDimmed = 0, runtimeCuratedRefs = 0;
       for (const t of rtTiles) {
         if ((t.scaleFactor || 4) !== 4) { skippedScale++; continue; }
         if (!/^[0-9A-F]{16}_P\d$/.test(t.key)) {
           console.warn(`[laufzeit] Schlüssel "${t.key}" passt nicht auf {hash16}_P{pal} — übersprungen`);
           continue;
         }
-        // Runtime art never keeps a reference (see below), so a tile the game
-        // also draws dimmed cannot follow that palette and would stay bright.
+        // The digits and HUD symbols are the one runtime set whose palette is known
+        // for certain: zahlen_groundtruth.js carries it, and it equals the live CGRAM
+        // row in spritecap for all 161 tiles. They get it as their reference — which
+        // is what switches Mesen's sprite edge mechanisms on for them at all (every
+        // one of them is gated on a reference), makes them slot-free (HUD digits in
+        // the shop's P7) and lets a dimmed draw follow its row instead of costing the
+        // tile (the Diddy head used to be dropped here).
+        const curatedRef = numTilePixels(t.key);
+        // Runtime art never keeps a reference otherwise (see below), so a tile the
+        // game also draws dimmed cannot follow that palette and would stay bright.
         // Same call as in the gallery export: native beats wrong.
-        if (spriteCapDimmed.has(t.key.split('_P')[0])) { droppedDimmed++; continue; }
+        if (!curatedRef && spriteCapDimmed.has(t.key.split('_P')[0])) { droppedDimmed++; continue; }
         // Runtime art WINS over a gallery sprite of the same hash: it was captured
         // from the exact tile the game drew, while a gallery frame is a ROM
         // reconstruction that may differ in palette handling.
@@ -13267,13 +13421,22 @@ async function exportAsTexturePack(containerName) {
         // gallery sprite was rendered with, so any reference recorded for this hash
         // now describes art that is no longer in the file. Drop it — Mesen leaves
         // tiles without a reference untouched, which is the correct outcome here.
+        // Except for the curated set: its reference is the palette THIS art was
+        // baked under, so it describes exactly the file that ships.
         const rtHash = t.key.split('_P')[0];
-        spriteRefVetoed.add(rtHash);
-        spriteRefPalettes.delete(rtHash);
+        if (curatedRef) {
+          spriteRefVetoed.delete(rtHash);
+          spriteRefPalettes.set(rtHash, curatedRef.cgram);
+          runtimeCuratedRefs++;
+        } else {
+          spriteRefVetoed.add(rtHash);
+          spriteRefPalettes.delete(rtHash);
+        }
         runtimeExportedTiles++;
       }
       console.log(`[laufzeit] ${runtimeExportedTiles} Laufzeit-Kachel-PNGs exportiert` +
                   (overwritten ? `, davon ${overwritten} über gleichnamige Sprite-Kacheln` : '') +
+                  (runtimeCuratedRefs ? `; ${runtimeCuratedRefs} mit Referenzpalette (Zahlen/HUD)` : '') +
                   (droppedDimmed ? `; ${droppedDimmed} verworfen (werden auch gedimmt gezeichnet)` : '') +
                   (skippedScale ? `; ${skippedScale} mit Skalierung != 4x übersprungen` : ''));
     }
@@ -15910,6 +16073,16 @@ function buildMapIconEntries() {
 
   const entries = [];
 
+  // The frame→tile mapping the pack export slices HD frames by. Map icons are
+  // drawn straight from ROM bytes into a canvas, so unlike renderCompositeFrame
+  // this path produced none — and the pack export drops every frame without one
+  // ("no tiles[]"). That is why not one of the 242 icon tiles ever reached the
+  // pack. hash = FNV-1a over the tile's 32 ROM bytes, the content hash Mesen
+  // matches on. places: [[x, y, byteOffset], …] inside `data`.
+  function frameTiles(data, places) {
+    return places.map(([x, y, off]) => ({ x, y, hash: fnv1a_64(data, off, TILE_BYTES) }));
+  }
+
   // Helper: render a 16×16 icon from frame tile data using VRAM tile layout
   function renderIcon16x16(frameData, vramTile, palette, hFlip) {
     // VRAM row = 16 tiles wide. Linear data has tiles 0..31 sequentially.
@@ -15974,11 +16147,17 @@ function buildMapIconEntries() {
 
     // Build animation frames
     const frames = [];
+    const v = def.vramTile;
     for (const fData of allFrames) {
       const fImg = renderIcon16x16(fData, def.vramTile, palette, def.hFlip);
       const fc = new OffscreenCanvas(16, 16);
       fc.getContext('2d').putImageData(fImg, 0, 0);
-      frames.push({ canvas: fc, width: 16, height: 16, offsetX: 0, offsetY: 0, delay: 4 });
+      // A mirrored icon would be sliced mirrored under the unmirrored hash — ship
+      // no mapping rather than wrong art. (No icon is mirrored today.)
+      const tiles = def.hFlip ? null : frameTiles(fData, [
+        [0, 0, v * TILE_BYTES], [8, 0, (v + 1) * TILE_BYTES],
+        [0, 8, (v + 16) * TILE_BYTES], [8, 8, (v + 17) * TILE_BYTES]]);
+      frames.push({ canvas: fc, width: 16, height: 16, offsetX: 0, offsetY: 0, delay: 4, tiles });
     }
 
     entries.push({
@@ -16041,7 +16220,12 @@ function buildMapIconEntries() {
         drawTile8x8(sfImg, skullPalette, 0, 8, 8, sfData.slice(96, 128), false, false);
         const fc = new OffscreenCanvas(16, 16);
         fc.getContext('2d').putImageData(sfImg, 0, 0);
-        skullFrames.push({ canvas: fc, width: 16, height: 16, offsetX: 0, offsetY: 0, delay: 4 });
+        // UNVERIFIED against a recording: no skull was ever on screen in one (no
+        // tile $80 on OBJ palette 2 in 278 307 OAM frames). If this layout is
+        // wrong the hashes simply never match — spritecap does not know them and
+        // the pack export skips them.
+        const tiles = frameTiles(sfData, [[0, 0, 0], [8, 0, 32], [0, 8, 64], [8, 8, 96]]);
+        skullFrames.push({ canvas: fc, width: 16, height: 16, offsetX: 0, offsetY: 0, delay: 4, tiles });
       }
 
       entries.push({
@@ -16062,7 +16246,80 @@ function buildMapIconEntries() {
     }
   }
 
+  // Direction arrows — the white arrows around the Kong on the map. Two 8x8
+  // tiles in the 64 bytes right before the icon block: up ($3C14A0, VRAM tile
+  // $20) and right ($3C14C0, tile $21); down and left are the same tiles
+  // mirrored by OAM. Static, OBJ palette 6 like DD/DX (spritecap also saw slot 7).
+  // They were the last two entries on the missing-world-map list.
+  {
+    const ARROWS_ADDR = 0x3C14A0;
+    const arrowPalette = loadSpritePalette(rom, 0xAA, true);
+    if (arrowPalette && ARROWS_ADDR + 2 * TILE_BYTES <= rom.size) {
+      const aData = new Uint8Array(2 * TILE_BYTES);
+      rom.seek(ARROWS_ADDR);
+      for (let i = 0; i < aData.length; i++) aData[i] = rom.readByte();
+      const arrowFrames = [0, 1].map(n => {
+        const img = new ImageData(8, 8);
+        drawTile8x8(img, arrowPalette, 0, 0, 0, aData.slice(n * TILE_BYTES, (n + 1) * TILE_BYTES), false, false);
+        const fc = new OffscreenCanvas(8, 8);
+        fc.getContext('2d').putImageData(img, 0, 0);
+        return { canvas: fc, width: 8, height: 8, offsetX: 0, offsetY: 0, delay: 30,
+                 tiles: frameTiles(aData, [[0, 0, n * TILE_BYTES]]) };
+      });
+      const scale = 4;
+      const canvas = document.createElement('canvas');
+      canvas.width = 8 * scale; canvas.height = 8 * scale;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(arrowFrames[0].canvas, 0, 0, 8 * scale, 8 * scale);
+      entries.push({
+        animId: 0xF008,
+        name: 'Map Icon Arrows (Pfeile)',
+        canvas,
+        isGrey: false,
+        paletteSetId: 0xAA,
+        paletteAddr: null,
+        palette: arrowPalette,
+        spriteType: null,
+        frames: arrowFrames,
+        animFrame: 0,
+        animTick: 0,
+        displayScale: scale,
+        activeCanvas: null,
+      });
+    }
+  }
+
   return entries;
+}
+
+// The tile mapping of one map icon frame, rebuilt from the ROM — for HD sets in a
+// container that were imported from a manifest written before map icons carried
+// tiles[] (every one of them, until 2026-09-10). The mapping is fixed ROM data,
+// so there is nothing to guess.
+let _mapIconInfo = null;   // animId -> { tiles: per-frame tiles[], palette }
+function mapIconInfo(animId) {
+  if (!_mapIconInfo && rom) {
+    _mapIconInfo = new Map();
+    for (const e of buildMapIconEntries()) {
+      _mapIconInfo.set(e.animId, { tiles: e.frames.map(f => f.tiles || null), palette: e.palette });
+    }
+  }
+  return _mapIconInfo ? _mapIconInfo.get(animId) || null : null;
+}
+function mapIconFrameTiles(animId, frameIdx) {
+  const tiles = mapIconInfo(animId)?.tiles[frameIdx];
+  return tiles ? tiles.map(t => ({ x: t.x, y: t.y, hash: t.hash.toString(16).padStart(16, '0').toUpperCase() }))
+               : null;
+}
+// The palette a map icon is drawn with — the reference its HD art needs. The name
+// cascade in resolveSpritePalettes() cannot find it (every icon resolves to the key
+// "Map"), and without a reference Mesen switches off every sprite edge mechanism
+// (SnesHdVideoFilter.cpp, S28 note): the icons came out HD but hard-edged. Checked
+// against spritecap: each of these ROM palettes equals the live CGRAM row on the
+// map in all 15 entries, so the recolour is the exact identity.
+function mapIconPalette(animId) {
+  return mapIconInfo(animId)?.palette || null;
 }
 
 // ---- Gallery build ----
@@ -16505,6 +16762,78 @@ function rtWantHd() {
          && hdRuntimeBitmaps && hdRuntimeBitmaps.size > 0;
 }
 
+// The OAM objects with the DIGITS cut out. What remains of a counter stays as
+// its own object: the Diddy head, the banana, the star. The first version hid
+// every object that read as a number, and that took the head with it — it shares
+// one OAM run with the lives digits. Cutting by tile is safe because a digit
+// tile belongs to its digit alone; the ten glyphs live on the Zahlen page.
+let _rtNoDigits = null, _rtNoDigitsFor = null;
+function rtObjectsWithoutDigits() {
+  if (!oamObjects) return [];
+  if (_rtNoDigitsFor === oamObjects && _rtNoDigits) return _rtNoDigits;
+  _rtNoDigitsFor = oamObjects;
+  const digit = numDigitKeys();
+  const out = [], byContent = new Map();
+  for (const o of oamObjects) {
+    if (!o.allTiles.some(k => digit.has(k))) { out.push(o); continue; }
+    const r = rtCutDigits(o, digit);
+    if (!r) continue;                     // a counter without symbol: nothing left
+    // A one- and a two-digit counter are different OAM structures with the same
+    // symbol beside them. After the cut they are the same object.
+    const twin = byContent.get(r.contentKey);
+    if (twin) { twin.seen += r.seen; continue; }
+    byContent.set(r.contentKey, r);
+    out.push(r);
+  }
+  _rtNoDigits = out;
+  return out;
+}
+
+function rtCutDigits(o, digit) {
+  const kept = [];
+  for (const ph of o.phases) {
+    const rest = ph.filter(t => !digit.has(`${t.hash}_P${t.pal}`));
+    if (rest.length) kept.push(rest);
+  }
+  if (!kept.length) return null;
+  // One shift for every phase, so an animation stays in register.
+  const minX = Math.min(...kept.flatMap(ph => ph.map(t => t.x)));
+  const minY = Math.min(...kept.flatMap(ph => ph.map(t => t.y)));
+  const phaseKeys = new Set(), phases = [];
+  for (const ph of kept) {
+    const moved = ph.map(t => ({ ...t, x: t.x - minX, y: t.y - minY }));
+    // Sixty counter readings beside one head are sixty phases before the cut
+    // and one after it.
+    const k = moved.map(t => `${t.x},${t.y},${t.hash},${t.pal}`).sort().join(';');
+    if (phaseKeys.has(k)) continue;
+    phaseKeys.add(k);
+    phases.push(moved);
+  }
+  const all = phases.flat();
+  const uniq = [...new Map(all.map(t => [`${t.hash}_P${t.pal}`, t])).values()];
+  return {
+    ...o,
+    id: `${o.id}-rest`,
+    phases, tiles: phases[0], phaseCount: phases.length,
+    w: Math.max(...all.map(t => t.x + 8)),
+    h: Math.max(...all.map(t => t.y + 8)),
+    pals: [...new Set(all.map(t => t.pal))].sort(),
+    allTiles: uniq.map(t => `${t.hash}_P${t.pal}`),
+    missing: spriteMissByHash ? uniq.filter(sprTileIsHole).length : uniq.length,
+    drawablePhases: spriteMissByHash ? phases.filter(ph => !ph.some(sprTileIsHole)).length : 0,
+    contentKey: `${o.gfx}|${[...phaseKeys].sort().join('|')}`,
+  };
+}
+
+// Objects by id across both views, so a selection or keep-list entry made with
+// "Zahlen ausblenden" on still resolves after it is switched off, and back.
+function rtFindObjects(ids) {
+  const byId = new Map();
+  for (const o of rtObjectsWithoutDigits()) byId.set(o.id, o);
+  for (const o of oamObjects || []) byId.set(o.id, o);
+  return [...ids].map(id => byId.get(id)).filter(Boolean);
+}
+
 function rtFilteredObjects() {
   if (!oamObjects) return [];
   const gfxSel = document.getElementById('rtGfxFilter')?.value ?? 'all';
@@ -16513,10 +16842,12 @@ function rtFilteredObjects() {
   const hideTiny = document.getElementById('rtHideTiny')?.checked === true;
   const searchRaw = (document.getElementById('rtSearch')?.value || '').trim().toUpperCase();
   const onlyAnimated = document.getElementById('rtOnlyAnimated')?.checked === true;
-  return oamObjects.filter(o => {
+  const pool = document.getElementById('rtHideNumbers')?.checked !== false
+    ? rtObjectsWithoutDigits() : oamObjects;
+  return pool.filter(o => {
     if (gfxSel !== 'all' && String(o.gfx) !== gfxSel) return false;
     if (palSel !== 'all' && !o.pals.includes(Number(palSel))) return false;
-    if (onlyDrawable && o.missing > 0) return false;
+    if (onlyDrawable && o.drawablePhases === 0) return false;
     if (hideTiny && o.w <= 8 && o.h <= 8) return false;
     if (onlyAnimated && o.phaseCount < 2) return false;
     if (document.getElementById('rtOnlyKeep')?.checked === true && !oamKeepList.has(o.id)) return false;
@@ -16556,7 +16887,8 @@ function buildRuntimeCard(obj, doneKeys) {
   card.title = `${obj.id}\nGfxset ${obj.gfx} | ${obj.w}x${obj.h}px, ${obj.cellCount} OAM-Eintrag/-Einträge | ` +
                `Palette ${obj.pals.join(',')} | ${obj.seen}x gezeichnet` +
                (obj.phaseCount > 1 ? `\n${obj.phaseCount} Animationsbilder — alle werden exportiert` : '') +
-               (obj.missing ? `\n⚠ ${obj.missing} Kacheln ohne Pixel in spritemiss` : '') +
+               (obj.missing ? `\n⚠ ${obj.missing} Kacheln ohne Pixel in spritemiss` +
+                 ` — ${obj.drawablePhases}/${obj.phaseCount} Animationsbilder vollständig` : '') +
                (allHd ? `\n✓ liegt vollständig als HD im Container` : '') +
                `\nKlick: alle Hashes in die Konsole`;
   card._runtimeObj = obj;
@@ -16912,6 +17244,153 @@ function renderFontPage() {
                         `${chosen.length} Wörter decken alle ab`;
 }
 
+// ============================================================
+// Zahlen — the two digit fonts and the counter symbols
+// ============================================================
+// Built like the Schrift page, and for the same reason: a digit font is a CLOSED
+// set of ten glyphs that the game draws over and over in ever new combinations.
+// The first HUD export showed what ignoring that costs — 1465 images for 101
+// distinct tiles, because a two-digit counter draws the same ten glyphs in sixty
+// pairings.
+//
+// Every glyph leaves ONCE and ALONE, not as part of a counter reading. Unlike the
+// map font, where the letters of a word touch and the word is the artwork, a digit
+// stands beside every other digit in the game, so there is no one right neighbour
+// to upscale it against — a transparent margin is the honest context. And each
+// hash then sits in exactly one image, so the first-wins import has nothing to
+// choose between. (The version before shipped 13 readings, and the barrel '1' was
+// in seven of them.)
+//
+// One image per GROUP — a font, a symbol — with its members side by side and the
+// same margin between them that a standalone export gets. The import cuts by tile
+// position, so a sheet comes back exactly as separate files would.
+//
+// The symbols are the art that shares an OAM run with the digits (Diddy head,
+// banana, star). Banana and star are the same tiles as the level bananas and the
+// bonus stars, so an upscale from here covers those too. The KONG letters of the
+// HUD join them: a closed set of four, fixed on palette 0, like the digits.
+//
+// Everything comes from zahlen_groundtruth.js, pixels included — the page needs no
+// recording.
+
+function numFonts() { return typeof DKC2_NUMBER_FONTS !== 'undefined' ? DKC2_NUMBER_FONTS : []; }
+function numSymbols() { return typeof DKC2_COUNTER_SYMBOLS !== 'undefined' ? DKC2_COUNTER_SYMBOLS : []; }
+
+// Every (hash,pal) that is part of a digit — what the Laufzeit gallery cuts out.
+let _numDigitKeys = null;
+function numDigitKeys() {
+  if (!_numDigitKeys) {
+    _numDigitKeys = new Set();
+    for (const f of numFonts()) for (const g of f.glyphs) for (const t of g.tiles) _numDigitKeys.add(`${t.hash}_P${f.pal}`);
+  }
+  return _numDigitKeys;
+}
+
+// The page's content: one group per font and per symbol, one item per glyph or
+// symbol phase. Tiles carry their palette like every other runtime tile.
+function numGroups() {
+  const groups = [];
+  for (const f of numFonts()) {
+    groups.push({ id: `ziffern_${f.id}`, name: `${f.name} — ${f.w}×${f.h}`,
+                  items: f.glyphs.map(g => ({ label: g.char, tiles: g.tiles.map(t => ({ ...t, pal: f.pal })) })) });
+  }
+  for (const s of numSymbols()) {
+    // A set of named members (the KONG letters) is labelled by name, a spinning
+    // symbol by phase number.
+    const named = s.phases.every(ph => ph.char);
+    groups.push({ id: `symbol_${s.id}`,
+                  name: !named && s.phases.length > 1 ? `${s.name} — ${s.phases.length} Drehphasen` : s.name,
+                  items: s.phases.map((ph, i) => ({ label: named ? ph.char : s.phases.length > 1 ? String(i + 1) : '',
+                                                    tiles: ph.tiles.map(t => ({ ...t, pal: s.pal })) })) });
+  }
+  for (const g of groups) {
+    for (const it of g.items) {
+      it.w = Math.max(...it.tiles.map(t => t.x + 8));
+      it.h = Math.max(...it.tiles.map(t => t.y + 8));
+    }
+  }
+  return groups;
+}
+
+// One export object per group: the items that still need HD, side by side.
+function numSheet(group, items) {
+  const gap = RT_PAD * 2;
+  const tiles = [];
+  let x = 0;
+  for (const it of items) {
+    for (const t of it.tiles) tiles.push({ ...t, x: t.x + x });
+    x += it.w + gap;
+  }
+  return {
+    id: group.id, gfx: -1, w: x - gap, h: Math.max(...items.map(it => it.h)),
+    pals: [...new Set(tiles.map(t => t.pal))], tiles, phases: [tiles], phaseCount: 1,
+    allTiles: [...new Set(tiles.map(t => `${t.hash}_P${t.pal}`))],
+    missing: 0, drawablePhases: 1, seen: 0, cellCount: tiles.length,
+  };
+}
+
+let digitsPageObjects = [];   // what "Zahlen exportieren" will ship: one sheet per group
+
+function renderDigitsPage() {
+  const page = document.getElementById('digitsPage');
+  const summary = document.getElementById('digitsSummary');
+  if (!page) return;
+  if (!numFonts().length) {
+    page.innerHTML = '<p style="color:#f44336;">zahlen_groundtruth.js nicht geladen.</p>';
+    return;
+  }
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const done = rtCoveredKeys();
+  const wantHd = document.getElementById('digitsShowHd')?.checked !== false
+                 && hdRuntimeBitmaps && hdRuntimeBitmaps.size > 0;
+
+  const groups = numGroups();
+  const sheets = [];
+  let html = '', total = 0, hdN = 0, noPix = 0;
+  groups.forEach((grp, gi) => {
+    const open = [];
+    let cells = '';
+    grp.items.forEach((it, ii) => {
+      total++;
+      const hasPix = it.tiles.every(t => rtTilePixels(`${t.hash}_P${t.pal}`));
+      const isHd = it.tiles.every(t => done.has(`${t.hash}_P${t.pal}`));
+      if (isHd) hdN++;
+      else if (hasPix) open.push(it);
+      else noPix++;
+      const border = isHd ? '#4caf50' : hasPix ? '#ff9800' : '#f44336';
+      const note = isHd ? 'HD' : hasPix ? 'noch SD' : 'keine Pixel';
+      cells += `<div style="border:1px solid ${border};border-radius:3px;padding:4px;text-align:center;background:#222;">
+          <div class="digitCellSlot" data-g="${gi}" data-i="${ii}" style="height:${it.h * 3}px;"></div>
+          <div style="font-size:13px;color:#fff;margin-top:2px;min-height:16px;">${esc(it.label)}</div>
+          <div style="font-size:9px;color:${border};">${note}</div></div>`;
+    });
+    if (open.length) sheets.push(numSheet(grp, open));
+    html += `<h3 style="color:#fff;margin:14px 0 6px;font-size:15px;">${esc(grp.name)}</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(70px,1fr));gap:6px;">${cells}</div>`;
+  });
+  page.innerHTML = html;
+  digitsPageObjects = sheets;
+
+  // Canvases after the markup, same as the Schrift page.
+  for (const slot of page.querySelectorAll('.digitCellSlot')) {
+    const it = groups[+slot.dataset.g].items[+slot.dataset.i];
+    const view = { w: it.w, h: it.h, tiles: it.tiles };
+    let cv;
+    if (wantHd) {
+      cv = renderRuntimeObjectHd(view, 4).canvas;
+      cv.style.cssText = `width:${it.w * 3}px;height:${it.h * 3}px;`;
+    } else {
+      cv = renderRuntimeObject(view);
+      cv.style.cssText = `image-rendering:pixelated;width:${it.w * 3}px;height:${it.h * 3}px;`;
+    }
+    slot.appendChild(cv);
+  }
+  const nDigits = numFonts().reduce((n, f) => n + f.glyphs.length, 0);
+  summary.textContent = `${nDigits} Ziffern + ${total - nDigits} Symbolbilder · ${hdN} in HD · ` +
+                        `Export: ${sheets.length} Bilder mit ${total - hdN - noPix} Motiven` +
+                        (noPix ? ` · ${noPix} ohne Pixel` : '');
+}
+
 function renderRuntimeGallery() {
   const grid = document.getElementById('runtimeGalleryGrid');
   if (!grid) return;
@@ -17234,9 +17713,17 @@ document.getElementById('spriteShowGrey').addEventListener('change', renderSprit
 // All of these are pure DISPLAY filters now. The grouping itself has no knobs
 // left — OAM says what an object is, so there is nothing to tune.
 for (const id of ['rtGfxFilter', 'rtPalSel', 'rtOnlyDrawable', 'rtHideTiny',
-                  'rtOnlyAnimated', 'rtOnlyKeep', 'rtShowHd']) {
+                  'rtHideNumbers', 'rtOnlyAnimated', 'rtOnlyKeep', 'rtShowHd']) {
   document.getElementById(id).addEventListener('change', renderRuntimeGallery);
 }
+// The search field had no listener since it was added — typing only took effect
+// with the next change of some other filter. Debounced: one pass over ~27 000
+// objects per keystroke is wasted work while a hash is still being typed.
+let rtSearchTimer = null;
+document.getElementById('rtSearch').addEventListener('input', () => {
+  clearTimeout(rtSearchTimer);
+  rtSearchTimer = setTimeout(renderRuntimeGallery, 250);
+});
 document.getElementById('rtSuggestBtn').addEventListener('click', () => {
   // With pictures there is nothing to solve: everything that is not already HD
   // has to be produced. Select exactly that.
@@ -17272,7 +17759,7 @@ document.getElementById('rtSuggestBtn').addEventListener('click', () => {
 document.getElementById('rtPruneBtn').addEventListener('click', () => applyRuntimePrune());
 document.getElementById('rtKeepExportBtn').addEventListener('click', () => {
   if (!oamKeepList.size) { alert('Merkliste ist leer — Objekte mit dem Stern markieren.'); return; }
-  const list = (oamObjects || []).filter(o => oamKeepList.has(o.id));
+  const list = rtFindObjects(oamKeepList);
   const gone = oamKeepList.size - list.length;
   if (gone) {
     console.warn(`[merkliste] ${gone} gemerkte IDs kommen in dieser Aufzeichnung nicht vor.`);
@@ -17296,6 +17783,16 @@ document.getElementById('fontExportBtn').addEventListener('click', () => {
   if (!fontPageWords.length) { alert('Keine Wörter zu exportieren.'); return; }
   exportRuntimeObjectsAsZip(fontPageWords.map(t => t.obj), 'fontExportBtn', 'dkc2_worldmap_font_sd.zip');
 });
+document.getElementById('digitsShowHd').addEventListener('change', () => {
+  ensureRuntimeHdBitmaps().then(() => renderDigitsPage());
+});
+document.getElementById('digitsExportBtn').addEventListener('click', () => {
+  if (!digitsPageObjects.length) {
+    alert('Nichts offen — alle Ziffern und Symbole liegen schon als HD im Container.');
+    return;
+  }
+  exportRuntimeObjectsAsZip(digitsPageObjects, 'digitsExportBtn', 'dkc2_zahlen_sd.zip');
+});
 
 // Category filter buttons.
 // The class is also used for plain toolbar buttons ("Sichtbare wählen", "Leeren",
@@ -17311,12 +17808,15 @@ document.querySelectorAll('.cat-btn[data-cat]').forEach(btn => {
     // the ROM animation library and share none of its filters.
     const isRuntime = activeCatFilter === 'runtime';
     const isFont = activeCatFilter === 'font';
+    const isDigits = activeCatFilter === 'digits';
     document.getElementById('runtimeToolbar').style.display = isRuntime ? '' : 'none';
     document.getElementById('runtimeGalleryGrid').style.display = isRuntime ? '' : 'none';
     document.getElementById('fontToolbar').style.display = isFont ? '' : 'none';
     document.getElementById('fontPage').style.display = isFont ? '' : 'none';
+    document.getElementById('digitsToolbar').style.display = isDigits ? '' : 'none';
+    document.getElementById('digitsPage').style.display = isDigits ? '' : 'none';
     document.getElementById('rtReportPanel').style.display = 'none';
-    document.getElementById('spriteGalleryGrid').style.display = (isRuntime || isFont) ? 'none' : '';
+    document.getElementById('spriteGalleryGrid').style.display = (isRuntime || isFont || isDigits) ? 'none' : '';
     if (isFont) {
       // Runs on OAM since 2026-08-05, like the gallery. The objects are already
       // built by then (or are built here), so the seconds-long grouping pause the
@@ -17330,6 +17830,9 @@ document.querySelectorAll('.cat-btn[data-cat]').forEach(btn => {
         if (!oamObjects && oamFrames) buildOamObjects();
         ensureRuntimeHdBitmaps().then(() => renderFontPage());
       }
+    } else if (isDigits) {
+      // Everything it shows ships in zahlen_groundtruth.js — no objects to build.
+      ensureRuntimeHdBitmaps().then(() => renderDigitsPage());
     } else if (isRuntime) {
       const target = document.getElementById('runtimeGalleryGrid');
       if (!oamObjects && oamFrames && oamFrames.length > 500) {
@@ -17536,7 +18039,7 @@ document.getElementById('runtimeSprInput').addEventListener('change', async (e) 
   }
   if (gotMiss || gotPos || gotOam) {
     console.log(`[laufzeit] geladen: ${gotMiss} Kacheln, ${gotOam} OAM-Frames, ${gotPos} Positionen ` +
-                `— bleibt über Reloads erhalten`);
+                ` — bleibt über Reloads erhalten`);
     // Drop any grouping built from the previous files; the new one is computed
     // when a tab that needs it is opened, not here (it takes seconds).
       fontObjectsCache = null;
