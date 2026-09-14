@@ -10278,6 +10278,27 @@ async function hdGetContainerSets(containerName) {
   });
 }
 
+// List only {type, setId} for a container. getAll() materialises every record
+// WITH all its blobs at once -- for a 499-set container that alone is enough to
+// exhaust the tab before the ZIP is even started ("Array buffer allocation
+// failed"). A cursor hands them over one at a time and only the two strings are
+// kept, so each record is collectable immediately.
+async function hdListContainerSetIds(containerName) {
+  const db = await getHDDB();
+  return new Promise((resolve, reject) => {
+    const out = [];
+    const tx = db.transaction('sets', 'readonly');
+    const req = tx.objectStore('sets').index('container').openCursor(IDBKeyRange.only(containerName));
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur) { resolve(out); return; }
+      out.push({ type: cur.value.type, setId: cur.value.setId });
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
 // --- Asset Save/Load ---
 
 // Sum 16 VRAM words (32 bytes = one 4bpp tile) — matches C++ ComputeVramTileChecksum()
@@ -11259,33 +11280,71 @@ async function ensureGfxSetHDLoaded(gfxIdx) {
 
 // --- Export container as ZIP ---
 
-async function exportContainerAsZip(containerName) {
-  if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
 
-  const sets = await hdGetContainerSets(containerName);
-  if (sets.length === 0) { alert('Container ist leer.'); return; }
-
-  const zip = new JSZip();
-  const root = zip.folder(containerName);
-
-  const summary = { levels: 0, sprites: 0, mapicons: 0, runtimeTiles: 0, totalFiles: 0 };
-
-  for (const set of sets) {
-    const folder = root.folder(`${set.type}/${set.setId}`);
+// One set into an open archive. Shared by both export routes below so the two
+// cannot drift apart -- that is how the id/manifest mismatch survived so long.
+function addSetToZip(root, set, summary) {
+  const folder = root.folder(`${set.type}/${set.setId}`);
 
     if (set.type === 'level') {
       summary.levels++;
-      const manifest = {
-        type: 'level', setId: set.setId, scaleFactor: set.scaleFactor,
-        tileCount: (set.tiles || []).length, hasBg2: !!set.bg2Blob, hasBg3: !!set.bg3Blob,
-        tileArrangementTileCount: set.tileArrangementTileCount || 0,
-        gfxCount: set.gfxCount || 0
-      };
-      folder.file('manifest.json', JSON.stringify(manifest, null, 2));
+      // The id travels in the manifest; the filename is only a label. The old
+      // scheme pushed the id through padStart and the import read it back with a
+      // digits-only regex -- but a real id is "7_0", which becomes
+      // "tile_07_0.png" and never matches. Every level tile was written into the
+      // ZIP and then silently dropped on import, so a restored container came
+      // back with no level art at all. No filename is load-bearing any more.
+      const tileEntries = [];
       for (const t of (set.tiles || [])) {
-        folder.file(`tile_${String(t.id).padStart(4, '0')}.png`, t.blob);
+        const file = `tiles/tile_${String(t.id)}.png`;
+        folder.file(file, t.blob);
+        tileEntries.push({ id: t.id, file });
         summary.totalFiles++;
       }
+      // Records that carry a blob: the image becomes a file, the rest stays in
+      // the manifest. All three were absent entirely before, and the pack export
+      // reads animTiles and owBlobs.
+      const animEntries = [];
+      for (let i = 0; i < (set.animTiles || []).length; i++) {
+        const a = set.animTiles[i];
+        const file = `animtiles/${String(i).padStart(4, '0')}.png`;
+        if (a.blob) { folder.file(file, a.blob); summary.totalFiles++; }
+        animEntries.push({ key: a.key, hash: a.hash, pal: a.pal, layer: a.layer,
+                           layers: a.layers || null, srcPx: a.srcPx || null,
+                           file: a.blob ? file : null });
+      }
+      const owEntries = {};
+      for (const [layer, ow] of Object.entries(set.owBlobs || {})) {
+        const file = `overworld/${layer}.png`;
+        if (ow && ow.blob) { folder.file(file, ow.blob); summary.totalFiles++; }
+        owEntries[layer] = { file: (ow && ow.blob) ? file : null,
+                             meta: ow ? ow.meta : null, scale: ow ? ow.scale : null };
+      }
+      const clusterEntries = [];
+      for (let i = 0; i < (set.clusters || []).length; i++) {
+        const c = set.clusters[i];
+        const file = `clusters/${String(i).padStart(4, '0')}.png`;
+        if (c.blob) { folder.file(file, c.blob); summary.totalFiles++; }
+        clusterEntries.push({ ids: c.ids, flips: c.flips || [], w: c.w, h: c.h,
+                              file: c.blob ? file : null });
+      }
+      folder.file('manifest.json', JSON.stringify({
+        formatVersion: 2,
+        type: 'level', setId: set.setId, scaleFactor: set.scaleFactor,
+        tileCount: tileEntries.length, hasBg2: !!set.bg2Blob, hasBg3: !!set.bg3Blob,
+        tileArrangementTileCount: set.tileArrangementTileCount || 0,
+        gfxCount: set.gfxCount || 0,
+        // Without this the pack export falls back to gfxset 0, so every level
+        // lands in bg/bg1/gfxset_00 and overwrites the one before it.
+        gfxSetIndex: set.gfxSetIndex != null ? set.gfxSetIndex : null,
+        // R3 reference BG palette -> palettes.bin. Without it Mesen cannot diff
+        // live CGRAM: underwater darkening, sunset HDMA, colour cycling.
+        paletteSnapshot: set.paletteSnapshot || null,
+        tileChecksums: set.tileChecksums || null,
+        tiles: tileEntries, animTiles: animEntries,
+        owBlobs: Object.keys(owEntries).length ? owEntries : null,
+        clusters: clusterEntries
+      }, null, 2));
       if (set.bg2Blob) { folder.file('bg2.png', set.bg2Blob); summary.totalFiles++; }
       if (set.bg3Blob) { folder.file('bg3.png', set.bg3Blob); summary.totalFiles++; }
       if (set.wallBlob) { folder.file('wall.png', set.wallBlob); summary.totalFiles++; }
@@ -11360,21 +11419,225 @@ async function exportContainerAsZip(containerName) {
         summary.totalFiles++;
       }
     }
-  }
 
-  // Root manifest
+}
+
+// Bytes a set contributes, for the part budget of the fallback route.
+function setPayloadBytes(set) {
+  const sz = (b) => (b && (b.size || b.byteLength || b.length)) || 0;
+  let n = 0;
+  for (const t of (set.tiles || [])) n += sz(t.blob);
+  for (const f of (set.frames || [])) n += sz(f.blob);
+  for (const a of (set.animTiles || [])) n += sz(a.blob);
+  for (const c of (set.clusters || [])) n += sz(c.blob);
+  for (const k of Object.keys(set.owBlobs || {})) n += sz((set.owBlobs[k] || {}).blob);
+  n += sz(set.bg2Blob) + sz(set.bg3Blob) + sz(set.wallBlob) + sz(set.cmFgBlob);
+  n += sz(set.vramSnapshot) + sz(set.chrRawData);
+  return n;
+}
+
+// ONE file, written straight to disk. generateAsync({type:'blob'}) assembles the
+// whole archive in memory first -- that is what threw "Array buffer allocation
+// failed" on a 499-set container. generateInternalStream hands out chunks
+// instead, and the File System Access API writes each one to the chosen file, so
+// peak memory is one chunk regardless of how big the container is. The stored
+// blobs themselves stay where they are: the browser keeps Blob data outside the
+// JS heap, so holding references to all of them costs nothing.
+//
+// (Why the Mesen pack export never needed this: its output is the sliced,
+// content-hash-deduplicated 8x8 art -- about 100 MB. The container holds the
+// SOURCE it is derived from: whole tile images, whole sprite frames, composited
+// clusters, a 64 KB VRAM snapshot per level set. Same sets, a different order of
+// magnitude of output.)
+async function exportContainerStreamed(containerName, ids, writable, summary) {
+  const zip = new JSZip();
+  const root = zip.folder(containerName);
+
+  let i = 0;
+  for (const ref of ids) {
+    i++;
+    showMesenExportProgress(`Set ${i}/${ids.length}: ${ref.type}/${ref.setId}`, 0.5 * (i / ids.length));
+    await new Promise(r => setTimeout(r, 0));
+    const set = await hdGetSet(containerName, ref.type, ref.setId);
+    if (!set) { console.warn(`[container] Set fehlt: ${ref.type}/${ref.setId}`); continue; }
+    addSetToZip(root, set, summary);
+  }
+  // parts is known now; bytes only after the stream has run, so it is left out of
+  // the manifest rather than written as a misleading 0.
+  summary.parts = 1;
+  const { bytes: _unknownYet, ...manifestSummary } = summary;
   root.file('container_manifest.json', JSON.stringify({
     containerName, exportDate: new Date().toISOString(),
-    sets: sets.map(s => ({ type: s.type, setId: s.setId })),
-    summary
+    sets: ids.map(r => ({ type: r.type, setId: r.setId })), summary: manifestSummary
   }, null, 2));
 
-  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url;
-  a.download = `${containerName}_container.zip`;
-  a.click(); URL.revokeObjectURL(url);
+  let written = 0;
+  await new Promise((resolve, reject) => {
+    // STORE: the payload is PNG, already deflate-compressed. Deflating it again
+    // costs minutes and buys about a percent.
+    const stream = zip.generateInternalStream({ type: 'uint8array', compression: 'STORE', streamFiles: true });
+    let chain = Promise.resolve();
+    stream.on('data', (chunk, meta) => {
+      stream.pause();                       // backpressure: one chunk in flight
+      written += chunk.length;
+      chain = chain
+        .then(() => writable.write(chunk))
+        .then(() => {
+          showMesenExportProgress(
+            `Schreibe… ${Math.round(meta.percent)} % (${(written / 1048576).toFixed(0)} MB)`,
+            0.5 + 0.5 * (meta.percent / 100));
+          stream.resume();
+        })
+        .catch(reject);
+    });
+    stream.on('error', reject);
+    stream.on('end', () => chain.then(resolve, reject));
+    stream.resume();
+  });
+  await writable.close();
+  summary.bytes = written;
   return summary;
+}
+
+// The export ran with no progress display and no catch. An exception inside an
+// async function nobody awaits becomes an unhandled rejection that shows up only
+// in the console, and packing tens of thousands of PNGs takes minutes either way
+// -- so from the outside the button did nothing at all, whether it had crashed or
+// was still working. Both cases now say so.
+async function exportContainerAsZip(containerName) {
+  if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
+  try {
+    return await exportContainerAsZipInner(containerName);
+  } catch (err) {
+    hideMesenExportProgress();
+    console.error('[container] Export fehlgeschlagen:', err);
+    alert('Container-Export fehlgeschlagen:' + String.fromCharCode(10, 10)
+      + (err && err.message ? err.message : String(err))
+      + String.fromCharCode(10, 10) + 'Einzelheiten stehen in der Browser-Konsole (F12).');
+    return null;
+  }
+}
+
+async function exportContainerAsZipInner(containerName) {
+  showMesenExportProgress('Container wird gelesen…', 0);
+  const ids = await hdListContainerSetIds(containerName);
+  if (ids.length === 0) { hideMesenExportProgress(); alert('Container ist leer.'); return; }
+  console.log(`[container] Export "${containerName}": ${ids.length} Sets`);
+
+  const summary = { levels: 0, sprites: 0, mapicons: 0, runtimeTiles: 0, totalFiles: 0,
+                    parts: 0, bytes: 0 };
+
+  // Preferred route: ONE file, streamed to disk. The picker has to be opened
+  // before the first long await -- it needs the user activation from the click,
+  // and that is gone once the sets have been read.
+  if (window.showSaveFilePicker) {
+    let writable = null;
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: `${containerName}_container.zip`,
+        types: [{ description: 'ZIP-Archiv', accept: { 'application/zip': ['.zip'] } }]
+      });
+      writable = await handle.createWritable();
+    } catch (err) {
+      if (err && err.name === 'AbortError') {   // user closed the dialog
+        hideMesenExportProgress();
+        return null;
+      }
+      console.warn('[container] Kein Dateiziel verfügbar — Export in Teilen:', err);
+    }
+    if (writable) {
+      await exportContainerStreamed(containerName, ids, writable, summary);
+      hideMesenExportProgress();
+      const mb = (summary.bytes / 1048576).toFixed(1);
+      console.log(`[container] Export fertig: eine Datei, ${mb} MB`, summary);
+      alert(`Container "${containerName}" exportiert: eine Datei, ${mb} MB.`);
+      return summary;
+    }
+  }
+
+  // Fallback (no File System Access API): several part files, each a complete
+  // container ZIP. The import merges whatever it is handed, so it needs no
+  // notion of parts.
+
+  // "Array buffer allocation failed" on a 499-set container. Two causes, both
+  // fixed here: every set was held in memory at once (getAll), and JSZip builds
+  // the archive as ONE in-memory blob. Sets are now read one at a time, and the
+  // archive is written in PARTS. Each part is a complete container ZIP with its
+  // own container_manifest.json listing only its own sets -- the import merges
+  // whatever it is handed, so it needs no notion of parts at all.
+  const PART_BUDGET = 250 * 1024 * 1024;
+  // The payload is PNG, already deflate-compressed: STORE costs about a percent
+  // of size and saves minutes of CPU plus a second copy of everything.
+  const ZIP_OPTS = { type: 'blob', compression: 'STORE' };
+
+  let zip = null, root = null, partBytes = 0, partSets = [], partNo = 0;
+  const newPart = () => {
+    zip = new JSZip(); root = zip.folder(containerName);
+    partBytes = 0; partSets = []; partNo++;
+  };
+  const flushPart = async () => {
+    if (!zip || partSets.length === 0) return;
+    root.file('container_manifest.json', JSON.stringify({
+      containerName, exportDate: new Date().toISOString(),
+      part: partNo, sets: partSets, summary
+    }, null, 2));
+    showMesenExportProgress(`Teil ${partNo} wird gepackt…`, null);
+    const blob = await zip.generateAsync(ZIP_OPTS, (m) =>
+      showMesenExportProgress(`Teil ${partNo} wird gepackt… ${Math.round(m.percent)} %`,
+                              m.percent / 100));
+    const mb = (blob.size / 1048576).toFixed(1);
+    summary.parts = partNo;
+    summary.bytes += blob.size;
+    downloadBlob(blob, `${containerName}_container_part${String(partNo).padStart(2, '0')}.zip`);
+    console.log(`[container] Teil ${partNo}: ${mb} MB, ${partSets.length} Sets`);
+    zip = null; root = null;   // drop the archive before the next part is built
+    // Give the download a moment to start and the collector a moment to run.
+    await new Promise(r => setTimeout(r, 1500));
+  };
+
+  newPart();
+  let setIdx = 0;
+  for (const ref of ids) {
+    setIdx++;
+    showMesenExportProgress(`Set ${setIdx}/${ids.length}: ${ref.type}/${ref.setId}`,
+                            setIdx / ids.length);
+    await new Promise(r => setTimeout(r, 0));   // let the bar actually paint
+    const set = await hdGetSet(containerName, ref.type, ref.setId);
+    if (!set) { console.warn(`[container] Set fehlt: ${ref.type}/${ref.setId}`); continue; }
+    addSetToZip(root, set, summary);
+    partSets.push({ type: set.type, setId: set.setId });
+    partBytes += setPayloadBytes(set);
+    if (partBytes >= PART_BUDGET) { await flushPart(); newPart(); }
+  }
+
+  await flushPart();
+  hideMesenExportProgress();
+  const totalMB = (summary.bytes / 1048576).toFixed(1);
+  console.log(`[container] Export fertig: ${summary.parts} Teil(e), ${totalMB} MB`, summary);
+  alert(`Container "${containerName}" exportiert:`
+    + String.fromCharCode(10) + `${summary.parts} Datei(en), zusammen ${totalMB} MB.`
+    + String.fromCharCode(10, 10)
+    + 'Zum Wiederherstellen ALLE Teile nacheinander importieren — jeder Teil ist ein '
+    + 'vollständiges Container-ZIP, der Import führt sie zusammen.');
+  return summary;
+}
+
+// Chrome drops a click() on a detached <a download>, and revoking the object URL
+// on the next line cancels a download that has not started yet. That is exactly
+// how this export differed from the Texture Pack one that works, and both fail
+// silently: the progress bar runs to the end and no file appears.
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    if (a.parentNode) a.parentNode.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 120000);
 }
 
 // --- VRAM-based BG1 chrBase Auto-Detection ---
@@ -14233,34 +14496,194 @@ async function exportAsTexturePack(containerName) {
 
 // --- Import container from ZIP ---
 
-async function importContainerFromZip(file) {
-  if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
 
-  const zip = await JSZip.loadAsync(file);
+// ===========================================================================
+// ZIP-Leser fuer grosse Archive
+// ===========================================================================
+// JSZip.loadAsync() pulls the entire archive into memory before anything can be
+// read from it. On a 2.7 GB container backup that is the same wall the export hit
+// from the other side, and it failed just as silently.
+//
+// This reader never holds more than one entry. It parses the central directory
+// from the tail of the File, then hands out Blob slices: the browser keeps those
+// backed by the file on disk, so a 2.7 GB archive costs no more memory than a
+// small one. The backup is written with STORE, so an entry's bytes ARE the file
+// and a slice is the PNG itself; deflated entries (older ZIPs) go through
+// DecompressionStream.
+async function readBytes(file, start, length) {
+  return new Uint8Array(await file.slice(start, start + length).arrayBuffer());
+}
+
+async function openZipFromFile(file) {
+  const SIG_EOCD = 0x06054b50, SIG_EOCD64 = 0x06064b50, SIG_LOC64 = 0x07064b50;
+  const tailLen = Math.min(file.size, 66560);          // 64 KB comment + record
+  const tail = await readBytes(file, file.size - tailLen, tailLen);
+  const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (tv.getUint32(i, true) === SIG_EOCD) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('Kein ZIP-Archiv: End-of-Central-Directory nicht gefunden.');
+
+  let entryCount = tv.getUint16(eocd + 10, true);
+  let cdSize = tv.getUint32(eocd + 12, true);
+  let cdOffset = tv.getUint32(eocd + 16, true);
+
+  // ZIP64 kicks in above 4 GB or 65535 entries.
+  if (cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF || entryCount === 0xFFFF) {
+    let loc = -1;
+    for (let i = eocd - 20; i >= 0; i--) {
+      if (tv.getUint32(i, true) === SIG_LOC64) { loc = i; break; }
+    }
+    if (loc < 0) throw new Error('ZIP64 angezeigt, aber der Locator fehlt.');
+    const rec64Off = Number(tv.getBigUint64(loc + 8, true));
+    const rec = await readBytes(file, rec64Off, 56);
+    const rv = new DataView(rec.buffer, rec.byteOffset, rec.byteLength);
+    if (rv.getUint32(0, true) !== SIG_EOCD64) throw new Error('ZIP64-Record nicht lesbar.');
+    entryCount = Number(rv.getBigUint64(32, true));
+    cdSize = Number(rv.getBigUint64(40, true));
+    cdOffset = Number(rv.getBigUint64(48, true));
+  }
+
+  const cd = await readBytes(file, cdOffset, cdSize);
+  const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+  const dec = new TextDecoder();
+  const entries = new Map();
+  let o = 0;
+  for (let n = 0; n < entryCount && o + 46 <= cd.length; n++) {
+    if (cv.getUint32(o, true) !== 0x02014b50) break;
+    const method = cv.getUint16(o + 10, true);
+    let compSize = cv.getUint32(o + 20, true);
+    let uncompSize = cv.getUint32(o + 24, true);
+    const nameLen = cv.getUint16(o + 28, true);
+    const extraLen = cv.getUint16(o + 30, true);
+    const commentLen = cv.getUint16(o + 32, true);
+    let localOff = cv.getUint32(o + 42, true);
+    const name = dec.decode(cd.subarray(o + 46, o + 46 + nameLen));
+
+    // ZIP64 extra field: only the fields that were 0xFFFFFFFF are present, in
+    // this order.
+    if (uncompSize === 0xFFFFFFFF || compSize === 0xFFFFFFFF || localOff === 0xFFFFFFFF) {
+      let e = o + 46 + nameLen;
+      const end = e + extraLen;
+      while (e + 4 <= end) {
+        const id = cv.getUint16(e, true), sz = cv.getUint16(e + 2, true);
+        if (id === 0x0001) {
+          let q = e + 4;
+          if (uncompSize === 0xFFFFFFFF) { uncompSize = Number(cv.getBigUint64(q, true)); q += 8; }
+          if (compSize === 0xFFFFFFFF) { compSize = Number(cv.getBigUint64(q, true)); q += 8; }
+          if (localOff === 0xFFFFFFFF) { localOff = Number(cv.getBigUint64(q, true)); q += 8; }
+          break;
+        }
+        e += 4 + sz;
+      }
+    }
+    if (!name.endsWith('/')) entries.set(name, { name, method, compSize, uncompSize, localOff });
+    o += 46 + nameLen + extraLen + commentLen;
+  }
+
+  async function entryBlob(en) {
+    // The local header repeats the name and may carry a DIFFERENT extra length
+    // than the central directory -- reading past it is the classic way to get
+    // garbage out of an otherwise fine archive.
+    const lh = await readBytes(file, en.localOff, 30);
+    const lv = new DataView(lh.buffer, lh.byteOffset, lh.byteLength);
+    if (lv.getUint32(0, true) !== 0x04034b50) throw new Error(`Lokaler Header defekt: ${en.name}`);
+    const dataStart = en.localOff + 30 + lv.getUint16(26, true) + lv.getUint16(28, true);
+    const raw = file.slice(dataStart, dataStart + en.compSize);   // lazy, no copy
+    if (en.method === 0) return raw;
+    if (en.method === 8) {
+      if (typeof DecompressionStream === 'undefined') {
+        throw new Error(`Eintrag ist deflate-komprimiert, DecompressionStream fehlt: ${en.name}`);
+      }
+      return await new Response(raw.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
+    }
+    throw new Error(`Unbekanntes Kompressionsverfahren ${en.method}: ${en.name}`);
+  }
+
+  const wrap = (en) => ({
+    name: en.name,
+    async: async (type) => {
+      const b = await entryBlob(en);
+      if (type === 'text') return await b.text();
+      if (type === 'arraybuffer') return await b.arrayBuffer();
+      return b;
+    }
+  });
+
+  return {
+    entryCount: entries.size,
+    file: (path) => entries.has(path) ? wrap(entries.get(path)) : null,
+    forEach: (cb) => { for (const en of entries.values()) cb(en.name, wrap(en)); }
+  };
+}
+
+// Same two omissions as the export had: no catch and no progress, on a job that
+// runs for minutes. A throw became an unhandled rejection visible only in the
+// console -- from the outside the file dialog closed and nothing happened.
+async function importContainerFromZip(file) {
+  try {
+    return await importContainerFromZipInner(file);
+  } catch (err) {
+    hideMesenExportProgress();
+    console.error('[container] Import fehlgeschlagen:', err);
+    alert('Container-Import fehlgeschlagen:' + String.fromCharCode(10, 10)
+      + (err && err.message ? err.message : String(err))
+      + String.fromCharCode(10, 10) + 'Einzelheiten stehen in der Browser-Konsole (F12).');
+    return null;
+  }
+}
+
+async function importContainerFromZipInner(file) {
+  showMesenExportProgress('Archiv wird gelesen…', 0);
+  const zip = await openZipFromFile(file);
+  console.log(`[container] Import "${file.name}": ${zip.entryCount} Eintraege`);
 
   // Find container_manifest.json
   let manifestFile = null, rootPrefix = '';
   zip.forEach((path, entry) => {
-    if (path.endsWith('container_manifest.json') && !entry.dir) {
+    if (path.endsWith('container_manifest.json')) {
       manifestFile = entry;
       rootPrefix = path.replace('container_manifest.json', '');
     }
   });
 
-  if (!manifestFile) { alert('Keine container_manifest.json gefunden. Dies ist kein Container-Export.'); return null; }
+  if (!manifestFile) {
+    hideMesenExportProgress();
+    alert('Keine container_manifest.json gefunden. Dies ist kein Container-Export.');
+    return null;
+  }
 
   const manifest = JSON.parse(await manifestFile.async('text'));
-  const containerName = manifest.containerName;
+
+  // Ask where it should go. The old code silently wrote into the container named
+  // in the backup, which is the one thing you must not do when the point of the
+  // import is to check the backup against the container it came from.
+  const suggested = manifest.containerName;
+  const answer = prompt(
+    'In welchen Container importieren?' + String.fromCharCode(10, 10)
+    + `Aus dem Backup: "${suggested}"` + String.fromCharCode(10)
+    + 'Ein anderer Name legt einen neuen Container an.',
+    suggested);
+  if (answer === null) { hideMesenExportProgress(); return null; }   // abgebrochen
+  const containerName = answer.trim() || suggested;
 
   // Create container if not exists
   const existing = await hdListContainers();
   if (!existing.find(c => c.name === containerName)) {
     await hdCreateContainer(containerName);
   }
+  console.log(`[container] Ziel: "${containerName}" (${manifest.sets.length} Sets)`);
 
   // Import each set
   let imported = 0;
+  let setNo = 0;
   for (const setInfo of manifest.sets) {
+    setNo++;
+    showMesenExportProgress(`Set ${setNo}/${manifest.sets.length}: ${setInfo.type}/${setInfo.setId}`,
+                            setNo / manifest.sets.length);
+    await new Promise(r => setTimeout(r, 0));
     const setPath = `${rootPrefix}${setInfo.type}/${setInfo.setId}/`;
     const setManifestFile = zip.file(`${setPath}manifest.json`);
     if (!setManifestFile) continue;
@@ -14268,17 +14691,50 @@ async function importContainerFromZip(file) {
     const setManifest = JSON.parse(await setManifestFile.async('text'));
 
     if (setInfo.type === 'level') {
+      // formatVersion 2 carries id -> file in the manifest. Older ZIPs named a
+      // tile "tile_07_0.png" for id "7_0" and were read back with a digits-only
+      // regex that never matched: their level tiles are in the ZIP but have no
+      // recoverable id. Say so rather than import a set that looks complete.
       const tiles = [];
-      // Load all tile PNGs
-      const tileFiles = [];
-      zip.forEach((path, entry) => {
-        if (path.startsWith(setPath) && path.endsWith('.png') && path.includes('tile_')) {
-          const match = path.match(/tile_(\d+)\.png$/);
-          if (match) tileFiles.push({ id: parseInt(match[1]), entry });
+      if (Array.isArray(setManifest.tiles)) {
+        for (const te of setManifest.tiles) {
+          const f = zip.file(`${setPath}${te.file}`);
+          if (f) tiles.push({ id: te.id, blob: await f.async('blob') });
         }
-      });
-      for (const tf of tileFiles) {
-        tiles.push({ id: tf.id, blob: await tf.entry.async('blob') });
+      } else {
+        let legacy = 0;
+        zip.forEach((path) => {
+          if (path.startsWith(setPath) && path.endsWith('.png') && path.includes('tile_')) legacy++;
+        });
+        const msg = `Level-Set "${setInfo.setId}": dieses ZIP stammt von vor dem `
+          + `Container-Fix (kein formatVersion 2). Die ${legacy} Kachel-PNGs liegen zwar `
+          + `im ZIP, sind ohne id-Zuordnung aber nicht wiederherstellbar. Im Viewer neu `
+          + `speichern und neu exportieren.`;
+        console.warn(`[container] ${msg}`);
+        alert(msg);
+      }
+
+      const animTiles = [];
+      for (const ae of (setManifest.animTiles || [])) {
+        const f = ae.file ? zip.file(`${setPath}${ae.file}`) : null;
+        animTiles.push({ key: ae.key, hash: ae.hash, pal: ae.pal, layer: ae.layer,
+                         layers: ae.layers || [ae.layer], srcPx: ae.srcPx || null,
+                         blob: f ? await f.async('blob') : null });
+      }
+      let owBlobs = null;
+      if (setManifest.owBlobs) {
+        owBlobs = {};
+        for (const [layer, oe] of Object.entries(setManifest.owBlobs)) {
+          const f = oe.file ? zip.file(`${setPath}${oe.file}`) : null;
+          owBlobs[layer] = { blob: f ? await f.async('blob') : null,
+                             meta: oe.meta, scale: oe.scale };
+        }
+      }
+      const clusters = [];
+      for (const ce of (setManifest.clusters || [])) {
+        const f = ce.file ? zip.file(`${setPath}${ce.file}`) : null;
+        clusters.push({ ids: ce.ids, flips: ce.flips || [], w: ce.w, h: ce.h,
+                        blob: f ? await f.async('blob') : null });
       }
 
       let bg2Blob = null, bg3Blob = null, wallBlob = null, cmFgBlob = null;
@@ -14342,6 +14798,13 @@ async function importContainerFromZip(file) {
         chrRawData, vramSnapshot,
         tileArrangementTileCount: setManifest.tileArrangementTileCount || 0,
         gfxCount: setManifest.gfxCount || 0,
+        // The six the ZIP used to drop. gfxSetIndex is the tag the pack export
+        // builds bg/bg1/gfxset_NN from and that loadContainerToHDPack() stamps
+        // reloaded tiles with -- a wrong one here is the 2026-07 regression again.
+        gfxSetIndex: setManifest.gfxSetIndex != null ? setManifest.gfxSetIndex : null,
+        paletteSnapshot: setManifest.paletteSnapshot || null,
+        tileChecksums: setManifest.tileChecksums || null,
+        animTiles, owBlobs, clusters,
         savedAt: Date.now()
       });
       imported++;
@@ -14402,6 +14865,10 @@ async function importContainerFromZip(file) {
     }
   }
 
+  hideMesenExportProgress();
+  console.log(`[container] Import fertig: ${imported}/${manifest.sets.length} Sets -> "${containerName}"`);
+  alert(`Import fertig: ${imported} von ${manifest.sets.length} Sets`
+    + String.fromCharCode(10) + `in Container "${containerName}".`);
   return { containerName, imported };
 }
 

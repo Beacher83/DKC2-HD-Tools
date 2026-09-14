@@ -1,5 +1,286 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-14] — Das Container-Backup war kein Backup
+
+Nur Viewer (`dkc2-viewer/index.html`, `exportContainerAsZip()` / `importContainerFromZip()`).
+Kein C++.
+
+**Anlass:** Die HD-Kunst liegt nur in der Browser-Datenbank; vor dem ersten echten Backup
+sollte der Rundlauf geprüft werden. Er war für **Level-Sets** kaputt. Sprites, Map-Icons und
+`spritemiss` liefen schon immer sauber durch.
+
+### Befund 1 — alle Level-Kacheln gingen beim Import verloren
+
+Tile-IDs sind Strings `"{gfxSetIndex}_{partId}"` (`"7_0"`, `"37_0"` — der Pack-Export sagt das
+selbst und filtert danach). Der Export schrieb
+``tile_${String(t.id).padStart(4,'0')}.png`` → `tile_07_0.png`, der Import las mit
+`/tile_(\d+)\.png$/` zurück. Das trifft nie:
+
+| ID | Dateiname | Regex | Ergebnis |
+|---|---|---|---|
+| `7_0` | `tile_07_0.png` | kein Treffer | verworfen |
+| `7_12` | `tile_7_12.png` | kein Treffer | verworfen |
+| `37_0` | `tile_37_0.png` | kein Treffer | verworfen |
+| `5` (alt, unpräfixt) | `tile_0005.png` | Treffer | kam durch |
+
+Die PNGs lagen physisch im ZIP — nur lesen konnte der Viewer sie nicht. Ein
+wiederhergestellter Container kam ohne Level-Kunst zurück, ohne eine einzige Fehlermeldung.
+
+### Befund 2 — sechs Felder standen gar nicht erst im ZIP
+
+`hdSaveSet()` legt sie ab, der ZIP-Export kannte sie nicht:
+
+- **`gfxSetIndex`** — der Pack-Export fällt auf `0` zurück, also landet **jedes** Level in
+  `bg/bg1/gfxset_00/` und überschreibt das vorige; zusätzlich wirft der Präfix-Filter dann
+  Kacheln weg. Das ist dieselbe Falle wie die 2026-07-Regression.
+- **`paletteSnapshot`** — die R3-Referenzpalette → `palettes.bin`. Ohne sie kann Mesen die
+  Live-CGRAM-Differenz nicht bilden: Unterwasser-Verdunklung, Sunset-HDMA, Farbcycling.
+- **`animTiles`**, **`tileChecksums`**, **`owBlobs`** — alle drei liest der Pack-Export.
+- **`clusters`** — vom Pack-Export nicht gebraucht, aber für die Viewer-Darstellung.
+
+### Fix
+
+**Kein Dateiname ist mehr tragend.** Das Manifest führt `tiles: [{id, file}]`; der Import
+liest die Zuordnung von dort statt sie aus dem Namen zu raten. Blob-tragende Datensätze
+(`animTiles`, `owBlobs`, `clusters`) legen ihr Bild als Datei ab und den Rest ins Manifest.
+Die JSON-Felder (`gfxSetIndex`, `paletteSnapshot`, `tileChecksums`) reisen im Manifest mit.
+Set-Manifeste tragen `formatVersion: 2`.
+
+**Keine Kompatibilitätsschicht für alte ZIPs** — es existiert keins (mit dem User geklärt).
+Trifft der Import auf ein Set-Manifest ohne `tiles[]`, sagt er es per `alert` und Konsole,
+statt still ein Set zu importieren, das vollständig aussieht und keins ist.
+
+### Nachweis
+
+Die **echten** Funktionen wurden aus `index.html` extrahiert und in Node gegen ein
+JSZip-Stub laufen gelassen, mit einem Level-Set wie `hdSaveSet()` es ablegt (IDs `37_0`,
+`37_1`, `37_255`, plus alle sechs Felder):
+
+| Code | Ergebnis |
+|---|---|
+| vorher | `tiles` kommt als `[]` zurück, `gfxSetIndex`/`paletteSnapshot`/`tileChecksums`/`animTiles`/`owBlobs`/`clusters` alle `undefined` — **7 Felder verloren** |
+| nachher | alle zwölf geprüften Felder byte-gleich — **0 verloren** |
+
+Die Gegenprobe gegen den alten Code war nötig: ohne sie hätte der Test auch dann bestanden,
+wenn er nichts misst.
+
+### Nachtrag: der Knopf sah tot aus
+
+**User-Meldung beim ersten Versuch:** Klick auf „Export ZIP“ — nichts passiert.
+
+Die Funktion hatte **weder eine Fortschrittsanzeige noch ein `catch`**. Sie wird per inline
+`onclick` gestartet, also wartet niemand auf ihr Promise: eine Ausnahme darin wird zur
+unbehandelten Rejection und steht nur in der Konsole. Und selbst im Erfolgsfall packt sie
+zehntausende PNGs — das dauert Minuten. **Von außen sieht beides gleich aus: nichts.**
+
+Jetzt:
+- Der Rumpf liegt in `exportContainerAsZipInner()`, `exportContainerAsZip()` umschließt ihn mit
+  `try/catch` und zeigt den Fehler als Dialog plus `console.error`.
+- Fortschrittsbalken über die vorhandene `showMesenExportProgress()`-Anzeige: pro Set, dann
+  `generateAsync`-Prozent über dessen `onUpdate`-Callback.
+- `console.log` der Set-Zahl beim Start und der Zusammenfassung am Ende.
+
+Das **behebt die Ursache nicht** — es macht sie sichtbar. Beim nächsten Klick zeigt sich
+entweder ein laufender Balken (dann war es nur die Dauer) oder eine Fehlermeldung mit Text.
+
+### Und damit war die Ursache sichtbar: der Download-Anker hängt nicht in der Seite
+
+**User nach dem Umbau:** `[container] Export "Anim Tiles v2": 499 Sets`, Fortschrittsbalken
+läuft durch — aber im Download-Ordner erscheint nichts.
+
+Der Vergleich mit dem Texture-Pack-Export, der beim User funktioniert, zeigt den Unterschied:
+
+| | Container-ZIP (tot) | Texture Pack (funktioniert) |
+|---|---|---|
+| `document.body.appendChild(a)` | **fehlte** | vorhanden |
+| `a.click()` | auf losgelöstem Element | auf eingehängtem Element |
+| `URL.revokeObjectURL(url)` | sofort in derselben Zeile | sofort danach |
+
+Chrome verwirft ein `click()` auf einen nicht eingehängten `<a download>`, und das sofortige
+`revokeObjectURL` zieht dem Download die Quelle weg, bevor er begonnen hat — bei dieser
+Größenordnung hat er nie begonnen. Beides schlägt lautlos fehl, deshalb lief der Balken sauber
+durch und es kam trotzdem keine Datei.
+
+Jetzt: Anker wird eingehängt, geklickt, und erst nach zwei Minuten wieder entfernt und die URL
+freigegeben. Die ZIP-Größe steht in der Fortschrittszeile und im `console.log`.
+
+**Der Testharness hat das zuerst nicht gemerkt**, weil sein `document`-Stub zu dünn war: er
+ließ den Download-Pfad in den neuen `catch` laufen, und der Rundlauf galt trotzdem als
+bestanden, weil das ZIP zu dem Zeitpunkt schon vollständig war. Mit einem Stub, der
+`appendChild`/`style`/`parentNode` kennt, prüft er jetzt auch, dass der Anker eingehängt und
+geklickt wird.
+
+### Der eigentliche Blocker: `Array buffer allocation failed`
+
+**User:** Beim nächsten Versuch kam — auch schon mit der alten Version — die Meldung
+„Container export failed. Array buffer allocation failed“. Der Container hat **499 Sets**.
+
+Das ist kein Logikfehler, sondern Speichermangel, und er hat zwei Quellen:
+
+1. `hdGetContainerSets()` benutzt `getAll()` — **jedes** Set wird mit allen Blobs auf einmal
+   materialisiert. Allein das reicht bei 499 Sets, um den Tab zu erledigen, noch bevor das ZIP
+   beginnt.
+2. JSZip baut das Archiv als **einen** Blob im Speicher. Der passt hier nicht.
+
+Beides behoben:
+
+- **Neu `hdListContainerSetIds()`** — liest per Cursor nur `{type, setId}`. Jeder Datensatz wird
+  einzeln übergeben und sofort wieder einsammelbar; der Export holt sich danach jedes Set
+  einzeln per `hdGetSet()`.
+- **Export in Teilen.** Budget 250 MB; jeder Teil ist ein **vollständiges** Container-ZIP mit
+  eigener `container_manifest.json`, die nur seine Sets aufführt. **Der Import bleibt
+  unverändert** — er führt zusammen, was man ihm gibt, und braucht keinen Begriff von Teilen.
+  Dateiname `<Container>_container_partNN.zip`.
+- **`STORE` statt `DEFLATE`.** Die Nutzlast sind PNGs, also bereits deflate-komprimiert. STORE
+  kostet rund ein Prozent Größe und spart Minuten Rechenzeit und eine zweite Kopie im Speicher.
+- Am Ende eine Zusammenfassung per Dialog, samt Hinweis, dass zum Wiederherstellen **alle**
+  Teile importiert werden müssen.
+
+**Test:** `roundtrip2.js` — zwei Level-Sets mit je 200-MB-Blobs, also über dem Budget. Ergebnis:
+2 Teile, 2 Downloads mit korrekten Namen, Anker eingehängt und geklickt, und nach dem Import
+**beider** Teile in einen leeren Container sind beide Sets in allen elf geprüften Feldern
+vollständig.
+
+### Doch wieder EINE Datei — und eine Korrektur an der Begründung
+
+**Rückfrage des Users:** Warum geht der Mesen-Pack-Export in einem Rutsch und dieser nicht?
+
+**Die Frage hat einen Teil meiner Begründung widerlegt.** Ich hatte `getAll()` als Mitursache
+genannt — aber `exportAsTexturePack()` benutzt `hdGetContainerSets()` genauso (Zeile 11892),
+lädt also ebenfalls alle 499 Sets auf einmal, und funktioniert. Daran lag es nicht.
+Blob-Inhalte liegen ohnehin außerhalb des JS-Heaps, Referenzen darauf kosten fast nichts.
+
+**Der Unterschied ist die AUSGABE, nicht die Eingabe:**
+
+| | Pack-Export | Container-Export |
+|---|---|---|
+| Inhalt | geschnittene 8×8-Subtiles als 32×32 px, **dedupliziert** per Content-Hash | die **Quelle**: ganze Kachelbilder, ganze Sprite-Frames, komponierte Cluster, 64 KB VRAM-Snapshot je Level-Set, `chrRawData` |
+| Größe | ~100 MB (gemessen am installierten Pack: 49.694 Dateien) | ein Vielfaches davon |
+
+Beide bauen mit `generateAsync({type:'blob'})` **ein** Archiv im Speicher. Bei 100 MB fällt das
+nicht auf, beim Container schlägt es fehl. Der Weg war also nicht falsch — die Datenmenge ist
+eine andere.
+
+**Damit geht es auch in einem Rutsch:** `generateInternalStream()` liefert das Archiv in Blöcken
+statt am Stück, und die File System Access API (`showSaveFilePicker` → `createWritable`) schreibt
+jeden Block direkt in die gewählte Datei. Spitzenspeicher ist **ein Block**, unabhängig von der
+Gesamtgröße. Mit Gegendruck: nach jedem Block `pause()`, nach dem `write()` wieder `resume()`.
+
+- Der Dateidialog wird **vor** dem ersten langen `await` geöffnet — `showSaveFilePicker` braucht
+  die Nutzeraktivierung aus dem Klick, und die ist nach dem Einlesen der Sets verfallen.
+- Abbruch im Dialog (`AbortError`) beendet still, ohne Fehlermeldung.
+- **Sichtbare Änderung:** es erscheint ein „Speichern unter“-Dialog statt eines stillen Downloads.
+- Der Teil-Export bleibt als **Rückfall**, falls die API fehlt (anderer Browser, andere Herkunft).
+- `addSetToZip()` wird von beiden Wegen benutzt, damit sie nicht auseinanderlaufen — genau so
+  hat der id/Manifest-Fehler oben so lange überlebt.
+
+**Test** (`roundtrip3.js`, beide Wege):
+- *Streaming:* 12 Blöcke geschrieben, `close()` aufgerufen, 0 Downloads, 1 Archiv, beide Sets
+  nach dem Import in allen elf Feldern vollständig.
+- *Rückfall:* 2 Teile mit korrekten Namen, beide Sets vollständig.
+
+### Am echten Archiv geprüft
+
+Der User hat exportiert: **2,7 GB in einer Datei**, in einem Durchlauf. Damit ist auch belegt,
+warum der eine Blob scheiterte — Chrome deckelt einen einzelnen ArrayBuffer bei rund 2 GB.
+
+Das Archiv von der Platte gegengeprüft (`zipfile`, Zentralverzeichnis + Stichprobe):
+
+| | |
+|---|---|
+| Einträge | 16.445 |
+| Sets | **499** — 22 level, 476 sprite, 1 spritemiss, alle mit `manifest.json` |
+| Referenzierte Dateien | 2.568 tiles + 2.616 animTiles + 24 owBlobs + 3.868 clusters |
+| **Fehlende referenzierte Dateien** | **0** |
+| Level ohne `formatVersion 2` / `gfxSetIndex` / `paletteSnapshot` / `tiles[]` | **0 / 0 / 0 / 0** |
+| PNG-Stichprobe (40 Dateien, 5,9 MB) | 0 defekte Signaturen |
+| `vram_snapshot.bin` | 22 Stück à exakt 65.536 Bytes |
+
+Der direkte Beleg auf echten Daten: die Tile-IDs im Archiv lauten `3_22`, `3_49`, `3_51` —
+genau die präfixten Strings, die der alte Import kommentarlos verworfen hätte.
+
+**Kosmetik nachgezogen:** das Wurzelmanifest trug `parts: 0, bytes: 0`, weil es geschrieben wird,
+bevor der Strom gelaufen ist. `parts` wird jetzt vorher gesetzt, `bytes` aus dem Manifest
+weggelassen statt als irreführende 0 gespeichert. **Das vorhandene Backup ist davon unberührt
+und muss nicht neu erzeugt werden** — der Import liest dieses Feld nicht.
+
+### Import: dieselben zwei Lücken, plus dieselbe Speicherwand von der anderen Seite
+
+**User:** Knopf „Container ZIP Import“, Datei wählen, bestätigen — nichts passiert.
+
+`importContainerFromZip()` hatte **weder `try/catch` noch Fortschrittsanzeige**, genau wie der
+Export vorher. Und `JSZip.loadAsync(file)` zieht das **ganze** Archiv in den Speicher, bevor
+irgendetwas gelesen werden kann — bei 2,7 GB dieselbe Wand, an der der Export gescheitert ist,
+nur von der anderen Seite. Beides lautlos.
+
+**Neu: `openZipFromFile()`** — ein eigener ZIP-Leser, der nie mehr als einen Eintrag hält:
+- Zentralverzeichnis vom Ende der Datei lesen (inkl. ZIP64, falls es über 4 GB geht)
+- Pro Eintrag den lokalen Header lesen (dessen `extraLen` darf vom Zentralverzeichnis abweichen —
+  das ist der klassische Weg, aus einem intakten Archiv Datenmüll zu lesen)
+- Nutzdaten als `file.slice()` — ein Blob, den der Browser weiterhin von der Platte bedient,
+  also ohne Kopie im Speicher. Das Backup ist mit STORE geschrieben, ein Slice **ist** das PNG;
+  deflate-Einträge (ältere ZIPs) laufen durch `DecompressionStream`.
+- Schnittstelle wie JSZip (`.file(path)`, `.forEach`), der Importrumpf blieb unverändert.
+
+Dazu `try/catch` mit Fehlerdialog, Fortschritt pro Set, und eine **Abfrage des Zielcontainers**
+(Vorschlag aus dem Backup, anderer Name legt einen neuen an). Das alte Verhalten schrieb
+stillschweigend in den im Backup genannten Container — das eine, was man nicht tun darf, wenn
+der Zweck des Imports ist, das Backup gegen genau diesen Container zu prüfen.
+
+**Gegen das echte Archiv geprüft** (`zipread.js`, Node mit Datei-Handles statt Browser-File):
+2,64 GB, Zentralverzeichnis in **27 ms** mit **2 Leseoperationen** gelesen, 15.891 Dateieinträge
+(16.445 minus 554 Ordnereinträge — stimmt mit `zipfile` überein), alle 499 Set-Manifeste da,
+2.568 Kachelverweise geprüft, **0 fehlend**, Stichprobe dekodiert ohne Defekt.
+**Spitzenspeicher 54 MB bei 2,64 GB Archiv.**
+
+### Import im Browser bestätigt — und eine zurückgezogene Warnung
+
+**User 14.09.:** Import durchgelaufen. Beide Container zeigen **identisch**
+22 Level-Sets (2568 Tiles) | 476 Sprite-Sets | 347 Laufzeit-Kacheln; optisch kein Unterschied.
+
+Beim Prüfen des Archivs war mir aufgefallen, dass nur **6** der 22 Level-Sets überhaupt
+`tiles[]` haben, während der installierte Pack BG1-Ordner für **alle 22** Gfxsets besitzt.
+Ich hatte daraus Datenverlust gefolgert. **Das war falsch.**
+
+- Die 16 Sets ohne eigene Kacheln stehen alle in `OVERWORLD_SETS` (22 Einträge: 0x08–0x0C,
+  0x35–0x45). Sie bekommen ihre Kunst im **Cross-Gfxset-Reuse-Pass** des Pack-Exports
+  (Zeile ~13713), gekeyt über (ContentHash, Palettensignatur, Layer). Der Kommentar dort sagt
+  es selbst: ein Set hat legitim keine eigene Kunst, weil Pirate Panics Kacheln schon existieren.
+- Die Zeitstempel im Pack belegen **einen einzigen Export** am 10.09. 21:21–21:24 — nichts ist
+  über mehrere Installationen angesammelt.
+
+**Der Fehler in meiner Prüfung:** der Regex, mit dem ich `OVERWORLD_SETS` ausgelesen habe,
+akzeptierte nur zwei Leerzeichen Einrückung und fand deshalb 15 statt 22 Schlüsseln — genau die
+6 fehlenden waren die, die ich dann als ungeklärt gemeldet habe. Der Zeitstempel-Gegencheck hat
+die falsche Spur aufgedeckt, bevor daraus eine Aufgabe wurde.
+
+**Merksatz für künftige Prüfungen:** `bg/bg1/gfxset_NN` im Pack und `tiles[]` im Container
+**müssen** auseinanderlaufen. Set-IDs im Container sind hex, Pack-Ordner dezimal.
+
+### Endabnahme: der Pack aus dem Backup ist byte-gleich
+
+Der User hat aus dem importierten Container („Backup import test“) einen Mesen-Pack exportiert.
+Gegen den am 10.09. installierten Pack gestellt, Datei für Datei mit CRC32:
+
+| | |
+|---|---|
+| Dateien neu / alt | **49.694 / 49.694** |
+| Nur im neuen Pack | **0** |
+| Nur im alten Pack | **0** |
+| **Byte-gleich** | **49.693** |
+| Verschieden | **1** — `manifest.json`, und dort nur das Feld `notes`, das den Containernamen führt |
+
+Alle Zählwerte im Manifest stimmen exakt überein: 4.716 BG1-, 1.111 BG2-, 943 BG3-,
+13.328 Overworld-, 25.337 Sprite-, 3.225 Anim- und 336 cmFg-Kacheln, 25.414
+Sprite-Paletteneinträge, `has_palettes: true`, `has_fingerprints: true`.
+
+`has_palettes` ist dabei der Beleg, auf den es ankam: `palettes.bin` entsteht aus
+`paletteSnapshot`, und genau das Feld hat der alte Container-Export gar nicht erst
+mitgeschrieben. Der Rundlauf **Container → ZIP → neuer Container → Pack** ist damit
+vollständig belegt, nicht nur plausibel.
+
+---
+
 ## [2026-09-10, Abend] — Weltkarten-Köpfe und Zahlen: HD, aber hart — die fehlende Referenzpalette
 
 Nur Viewer (`dkc2-viewer/index.html`, Pack-Export). Kein C++.
