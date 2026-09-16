@@ -3156,6 +3156,8 @@ function parseAnimFramesUncached(rom, animId) {
   // Referenzpaletten.
   const _orph = orphanSeqInfo(animId);
   if (_orph) return _orph.frames;
+  const _ugfx = unusedGfxInfo(animId);
+  if (_ugfx) return _ugfx.frames;
   const ptrOff = ANIM_BANK + animId * 4;
   if (ptrOff + 4 > rom.size) return [];
   const animOffset = rom.readWordAt(ptrOff);
@@ -3380,6 +3382,137 @@ function findOrphanAnimSequences(rom) {
               `${tiles} Bilder zusammen. Beispiele: ` +
               out.slice(0, 3).map(o => `$${o.offset.toString(16).toUpperCase()} (bei ${o.neighbourName})`).join(', '));
   return out;
+}
+
+// ============================================================
+// Kunst, die zu GAR KEINER Animation gehoert.
+//
+// Eine Stufe unter den verwaisten Sequenzen: dort gibt es eine Bildfolge ohne
+// Tabellenzeile, hier gibt es nicht einmal eine Bildfolge. Das Spiel setzt den
+// gfxRef direkt aus dem Code. Die Galerie baut sich aber ueber
+// Tabellenzeile -> Sequenz -> gfxRef -> Deskriptor auf und kann solche Kunst
+// deshalb nirgends zeigen.
+//
+// Gefunden ueber die Aufzeichnung: ein Deskriptor, den keine Animation benutzt,
+// dessen Kacheln aber in snes_hd_spritecap.txt stehen, war im Spiel zu sehen.
+// Belegt am 2026-09-16: der Schaedelwagen ($14A0-$14E8), das Bonus-Fass mit dem
+// B ($3170), die rollenden Faesser ($08AC-$08E8), die KONG-Buchstaben
+// ($319C-$31B8) und die weissen Ziffern ($2D40-$2D64).
+//
+// Gruppiert wird nach zusammenhaengenden gfxRefs MIT gleicher aufgezeichneter
+// CGRAM-Zeile. Die Kunst liegt figurenweise beieinander, aber ohne das
+// Palettenkriterium waere z.B. $1458-$1534 ein einziger Block aus Diddy,
+// Schaedelwagen und Dixie.
+// ============================================================
+// Alle 8x8-Kacheln, die ein gfxRef ins VRAM bringt, als Content-Hashes. Gleiche
+// Rechnung wie die Kachelliste in renderSpriteFromDescriptor (FNV-1a ueber die
+// 32 rohen 4bpp-Bytes) und damit gleich dem Hash, auf den Mesen zur Laufzeit
+// matcht — nur so laesst sich ein Deskriptor gegen die Aufzeichnung halten.
+// Block 1 + Block 2 ist, was der DMA kopiert.
+const gfxRefTileHashCache = new Map();
+function gfxRefTileHashes(rom, gfxRef) {
+  if (gfxRefTileHashCache.has(gfxRef)) return gfxRefTileHashCache.get(gfxRef);
+  const out = [];
+  const desc = loadSpriteDescriptor(rom, gfxRef);
+  if (desc) {
+    for (const blk of [desc.chrBlock1, desc.chrBlock2]) {
+      if (!blk) continue;
+      for (let off = 0; off + 32 <= blk.length; off += 32) {
+        out.push(fnv1a_64(blk, off, 32).toString(16).padStart(16, '0').toUpperCase());
+      }
+    }
+  }
+  gfxRefTileHashCache.set(gfxRef, out);
+  return out;
+}
+
+const UNUSED_GFX_ID_BASE = 0xD000;   // unter den verwaisten Sequenzen (0xE000)
+let _unusedGfx = null;
+let _unusedGfxById = null;
+
+function findUnusedGfxRefs(rom) {
+  if (_unusedGfx) return _unusedGfx;
+  if (!spriteCapPairs || spriteCapPairs.size === 0) {
+    _unusedGfx = []; _unusedGfxById = new Map();
+    console.warn('[gfx] Ohne Spritecap laesst sich nicht sagen, welche Kunst im Spiel vorkommt — ' +
+                 'Gruppe uebersprungen.');
+    return _unusedGfx;
+  }
+  const used = new Set();
+  for (let aid = 1; aid <= 0x030B; aid++) {
+    for (const f of parseAnimFrames(rom, aid)) {
+      if (f.gfxRef) used.add(f.gfxRef);
+      for (const er of (f.extraRefs || [])) if (er.gfxRef) used.add(er.gfxRef);
+    }
+  }
+  for (const o of findOrphanAnimSequences(rom)) {
+    for (const f of o.frames) {
+      if (f.gfxRef) used.add(f.gfxRef);
+      for (const er of (f.extraRefs || [])) if (er.gfxRef) used.add(er.gfxRef);
+    }
+  }
+
+  const seen = [];
+  for (let g = 0; g < 0x8000; g += 4) {
+    if (used.has(g)) continue;
+    const hashes = gfxRefTileHashes(rom, g);
+    if (hashes.length === 0) continue;
+    let n = 0;
+    for (const h of hashes) if (spriteCapPairs.has(h)) n++;
+    // Mindestens drei Kacheln und die Haelfte: einzelne Treffer sind Kacheln,
+    // die sich zufaellig mit anderer Kunst decken (eine leere oder einfarbige
+    // Kachel kommt ueberall vor).
+    if (n >= 3 && n * 2 >= hashes.length) seen.push({ g, hashes });
+  }
+
+  const domRow = (hashes) => {
+    if (!spriteCapHashRow) return -1;
+    const votes = new Map();
+    for (const h of hashes) {
+      const rid = spriteCapHashRow.get(h);
+      if (rid === undefined) continue;
+      votes.set(rid, (votes.get(rid) || 0) + 1);
+    }
+    let best = -1, bestN = 0;
+    for (const [rid, k] of votes) if (k > bestN) { bestN = k; best = rid; }
+    return best;
+  };
+
+  const out = [];
+  let cur = null, curRow = null;
+  for (const it of seen) {
+    const row = domRow(it.hashes);
+    if (cur && it.g - cur.refs[cur.refs.length - 1] <= 8 && row === curRow) {
+      cur.refs.push(it.g);
+      for (const h of it.hashes) cur.tiles.add(h);
+    } else {
+      if (cur) out.push(cur);
+      cur = { refs: [it.g], tiles: new Set(it.hashes) };
+      curRow = row;
+    }
+  }
+  if (cur) out.push(cur);
+
+  out.forEach((o, i) => {
+    o.id = UNUSED_GFX_ID_BASE + i;
+    o.frames = o.refs.map(g => ({ duration: 6, gfxRef: g }));
+  });
+  _unusedGfx = out;
+  _unusedGfxById = new Map(out.map(o => [o.id, o]));
+  console.log(`[gfx] ${out.length} Gruppen ohne Animationseintrag, ` +
+              `${out.reduce((n, o) => n + o.refs.length, 0)} Bilder, ` +
+              `${out.reduce((n, o) => n + o.tiles.size, 0)} Kacheln.`);
+  return out;
+}
+
+function unusedGfxName(o) {
+  return `Gfx ${o.refs[0].toString(16).toUpperCase().padStart(4, '0')}`;
+}
+
+function unusedGfxInfo(animId) {
+  if (animId < UNUSED_GFX_ID_BASE || animId >= ORPHAN_SEQ_ID_BASE) return null;
+  if (!_unusedGfxById && rom) findUnusedGfxRefs(rom);
+  return _unusedGfxById ? (_unusedGfxById.get(animId) || null) : null;
 }
 
 // Name einer verwaisten Sequenz. Traegt den Bank-Offset, NICHT die laufende
@@ -8585,6 +8718,12 @@ function parseSpriteCap(text) {
   const map = new Map();
   const rowId = new Map();      // CGRAM row (64 hex) → dense index
   const hashRows = new Map();   // hash → Set(row index)
+  // S40: wie oft eine Kachel unter welcher CGRAM-Zeile gesehen wurde. Bis jetzt
+  // wurden die FARBEN nach findDimmedHashes() weggeworfen und nur der
+  // Palettenslot behalten. Fuer Kunst, die zu keiner Animation gehoert (siehe
+  // findUnusedGfxRefs), ist die aufgezeichnete Zeile aber die einzige Quelle
+  // einer Palette — es gibt kein Initscript, aus dem sich eine ableiten liesse.
+  const hashRowCount = new Map();
   let lines = 0, bad = 0;
   for (const line of text.split('\n')) {
     if (line.startsWith('===')) continue;   // Sitzungs-Kopfzeile (Mesen S18)
@@ -8602,11 +8741,62 @@ function parseSpriteCap(text) {
     let rid = rowId.get(m[4]);
     if (rid === undefined) { rid = rowId.size; rowId.set(m[4], rid); }
     hashRows.get(m[1]).add(rid);
+    let cnt = hashRowCount.get(m[1]);
+    if (!cnt) { cnt = new Map(); hashRowCount.set(m[1], cnt); }
+    cnt.set(rid, (cnt.get(rid) || 0) + 1);
   }
   const pairs = [...map.values()].reduce((a, s) => a + s.size, 0);
   console.log(`[spritecap] ${lines} Zeilen gelesen, ${map.size} distinkte Hashes, ${pairs} (hash,pal)-Paare, ${bad} verworfen`);
   const dimmed = findDimmedHashes([...rowId.keys()], hashRows);
-  return { map, dimmed, lines, pairs, bad };
+  // Je Kachel die HAEUFIGSTE Zeile, nicht die erste. Erstsichtungen sind
+  // unzuverlaessig — eine Kachel, die beim ersten Auftauchen in eine Blende oder
+  // eine fremde Szene faellt, traegt dann dauerhaft die falschen Farben (der
+  // Fall der roten Muenze).
+  const rows = [...rowId.keys()];
+  const hashRow = new Map();
+  for (const [h, cnt] of hashRowCount) {
+    let bestRid = -1, bestN = -1;
+    for (const [rid, n] of cnt) if (n > bestN) { bestN = n; bestRid = rid; }
+    if (bestRid >= 0) hashRow.set(h, bestRid);
+  }
+  return { map, dimmed, lines, pairs, bad, rows, hashRow };
+}
+
+// Die aufgezeichnete OBJ-Palette einer Kachel als 16 BGR555-Farben, oder null.
+// Index 0 ist immer durchsichtig, genau wie ueberall sonst im Viewer.
+let spriteCapRows = null;      // Array der CGRAM-Zeilen (64 Hex je Zeile)
+let spriteCapHashRow = null;   // hash → Index in spriteCapRows
+function spriteCapPalette(hashHex) {
+  if (!spriteCapRows || !spriteCapHashRow) return null;
+  const rid = spriteCapHashRow.get(String(hashHex).toUpperCase());
+  if (rid === undefined) return null;
+  const hex = spriteCapRows[rid];
+  if (!hex || hex.length < 64) return null;
+  const pal = new Uint16Array(16);
+  pal[0] = 0;
+  for (let i = 1; i < 16; i++) pal[i] = parseInt(hex.substr(i * 4, 4), 16) & 0x7FFF;
+  return pal;
+}
+
+// Die Palette, unter der die MEISTEN Kacheln einer Menge aufgezeichnet wurden.
+// Einzelne Kacheln koennen aus einer fremden Szene stammen; die Mehrheit nicht.
+function spriteCapPaletteForTiles(hashes) {
+  if (!spriteCapRows || !spriteCapHashRow) return null;
+  const votes = new Map();
+  for (const h of hashes) {
+    const rid = spriteCapHashRow.get(String(h).toUpperCase());
+    if (rid === undefined) continue;
+    votes.set(rid, (votes.get(rid) || 0) + 1);
+  }
+  let bestRid = -1, bestN = 0;
+  for (const [rid, n] of votes) if (n > bestN) { bestN = n; bestRid = rid; }
+  if (bestRid < 0) return null;
+  const hex = spriteCapRows[bestRid];
+  if (!hex || hex.length < 64) return null;
+  const pal = new Uint16Array(16);
+  pal[0] = 0;
+  for (let i = 1; i < 16; i++) pal[i] = parseInt(hex.substr(i * 4, 4), 16) & 0x7FFF;
+  return pal;
 }
 
 // S6b: runtime BG-miss capture (snes_hd_bgcap.txt from Mesen build S6a+).
@@ -10372,7 +10562,14 @@ async function restoreSpriteCapFromDb() {
     if (!rec || !rec.entries || rec.entries.length === 0) return;
     spriteCapPairs = new Map(rec.entries);
     spriteCapDimmed = new Set(rec.dimmed || []);
+    spriteCapRows = rec.rows || null;
+    spriteCapHashRow = rec.hashRow ? new Map(rec.hashRow) : null;
     updateSpriteCapButton(spriteCapPairs.size, rec.pairs, rec.savedAt);
+    if (!rec.rows) {
+      console.warn('[spritecap] Diese Aufzeichnung kennt die CGRAM-Zeilen noch nicht — Kunst ohne ' +
+                   'Animationseintrag (Schaedelwagen, Bonus-Fass, rollende Faesser) bleibt dadurch grau. ' +
+                   'Spritecap einmal neu laden.');
+    }
     console.log(`[spritecap] ${spriteCapPairs.size} Hashes aus der Datenbank wiederhergestellt ` +
                 `(gespeichert am ${rec.savedAt}) — kein erneutes Hochladen nötig`);
     if (!rec.dimmed) {
@@ -13515,6 +13712,21 @@ async function exportAsTexturePack(containerName) {
       }
       console.log(`[sprites] ${sprSources.length} Sprite-Sets aus dem Speicher (im Container liegen keine).`);
     }
+    // S40: die beiden NEUEN Kategorien (verwaiste Sequenzen ab 0xE000, Kunst ohne
+    // Animationseintrag ab 0xD000) laufen zuletzt. Ihre Kacheln ueberschneiden
+    // sich teilweise mit denen echter Animationen — gemessen 232 Stueck, 194
+    // davon unter mehreren aufgezeichneten CGRAM-Zeilen. Schriebe ein neuer
+    // Eintrag zuerst und braechte fuer eine geteilte Kachel nur eine unpassende
+    // Palette mit, bliebe sie ohne Referenz; und eine Kachel ohne Referenz, die
+    // auch gedimmt gezeichnet wird, verwirft der Zweig weiter unten GANZ. So
+    // koennte Kunst wegfallen, die heute ausgeliefert wird. Laufen die
+    // Animationen zuerst, greift writtenKeys und sie behalten ihre Referenz
+    // unveraendert; die neuen Eintraege steuern nur bei, was sonst niemand
+    // beansprucht. Stabil sortiert, die bisherige Reihenfolge bleibt sonst.
+    sprSources.forEach((s, i) => { s._ord = i; });
+    const isNewKind = (s) => s.animId != null && s.animId >= 0xD000 && s.animId < 0xF000;
+    sprSources.sort((a, b) => (isNewKind(a) ? 1 : 0) - (isNewKind(b) ? 1 : 0) || a._ord - b._ord);
+
     if (sprSources.length === 0) {
       console.warn('[sprites] Weder im Container noch im Speicher HD-Sprites gefunden — sprites/ bleibt leer. ' +
                    'Sprite-ZIP per "Import HD" einspielen.');
@@ -16521,6 +16733,29 @@ function resolveSpritePalettes(animId, name, palInfo, hasCompositeFrames) {
   // (SnesHdVideoFilter.cpp, S28). Der Nachbar im Bank ist dieselbe Figur, also
   // wird dessen Antwort uebernommen. Die Ersetzung steht HIER und nicht an den
   // zwei Aufrufstellen — sonst laufen Galerie und Pack-Export auseinander.
+  // Kunst ohne Animationseintrag hat keinen Nachbarn, von dem sie erben koennte.
+  // Ihre Palette ist die, unter der sie im Spiel aufgezeichnet wurde — die
+  // einzige belegte Quelle, die es fuer sie gibt.
+  const _ugfx = unusedGfxInfo(animId);
+  if (_ugfx) {
+    let pal = null;
+    if (spriteOverrides.has(animId)) pal = loadSpritePalette(rom, spriteOverrides.get(animId));
+    const setId = pal ? spriteOverrides.get(animId) : null;
+    if (!pal) pal = spriteCapPaletteForTiles(_ugfx.tiles);
+    const grey = !pal;
+    if (grey) {
+      pal = new Uint16Array(16);
+      for (let i = 0; i < 16; i++) { const v = Math.round(i * 31 / 15); pal[i] = v | (v << 5) | (v << 10); }
+    }
+    return {
+      palette: pal,
+      isGrey: grey,
+      paletteSetId: setId,
+      paletteAddr: null,
+      secondaryPalette: null, secondaryPaletteSetId: null,
+      block2Palette: null, block2PaletteSetId: null,
+    };
+  }
   const _orph = orphanSeqInfo(animId);
   if (_orph && _orph.neighbourAnimId !== null) {
     const res = resolveSpritePalettes(_orph.neighbourAnimId, _orph.neighbourName,
@@ -17204,6 +17439,57 @@ function buildOrphanSeqEntries() {
   return out;
 }
 
+// Galerie-Eintraege fuer die Kunst ohne Animationseintrag. Gleicher Weg wie bei
+// den verwaisten Sequenzen; nur die Palette kommt aus der Aufzeichnung statt von
+// einem Nachbarn, weil es hier keinen gibt.
+function buildUnusedGfxEntries() {
+  if (!rom) return [];
+  const out = [];
+  for (const o of findUnusedGfxRefs(rom)) {
+    const name = unusedGfxName(o);
+    const desc = loadSpriteDescriptor(rom, o.refs[0]);
+    if (!desc) continue;
+    const palRes = resolveSpritePalettes(o.id, name, null, false);
+    const paletteKey = palRes.paletteSetId !== null ? String(palRes.paletteSetId) : `cap${o.id}`;
+    const rendered = renderSpriteFromDescriptor(desc, palRes.palette, null);
+    const alignBox = framesAlignBox(o.frames);
+    let displayCanvas = null, displayScale = 1;
+    if (rendered && rendered.canvas && alignBox.w > 0) {
+      displayScale = Math.min(4, Math.floor(80 / alignBox.w)) || 1;
+      displayCanvas = document.createElement('canvas');
+      displayCanvas.width = alignBox.w * displayScale;
+      displayCanvas.height = alignBox.h * displayScale;
+      const dc = displayCanvas.getContext('2d');
+      dc.imageSmoothingEnabled = false;
+      dc.drawImage(rendered.canvas,
+        ((rendered.offsetX || 0) - alignBox.minX) * displayScale,
+        ((rendered.offsetY || 0) - alignBox.minY) * displayScale,
+        rendered.width * displayScale, rendered.height * displayScale);
+    }
+    out.push({
+      animId: o.id,
+      name,
+      _align: alignBox,
+      unusedGfxFirst: o.refs[0],
+      canvas: displayCanvas,
+      isGrey: palRes.isGrey,
+      paletteSetId: palRes.paletteSetId,
+      paletteAddr: null,
+      palette: palRes.palette,
+      secondaryPalette: null, secondaryPaletteSetId: null,
+      block2Palette: null, block2PaletteSetId: null,
+      spriteType: null,
+      frames: o.frames,
+      animFrame: 0, animTick: 0,
+      displayScale,
+      activeCanvas: null,
+    });
+  }
+  console.log(`[gfx] ${out.length} Gruppen in die Galerie aufgenommen ` +
+              `(${out.filter(e => e.isGrey).length} ohne aufgezeichnete Palette).`);
+  return out;
+}
+
 // ---- Gallery build ----
 
 function buildSpriteGallery() {
@@ -17215,8 +17501,10 @@ function buildSpriteGallery() {
   setTimeout(() => {
     gfxRefRenderCache.clear();
     gfxRefBoxCache.clear();
+    gfxRefTileHashCache.clear();
     animFramesCache.clear();
     _orphanSeqs = null; _orphanSeqById = null;   // bei neuem ROM neu scannen
+    _unusedGfx = null; _unusedGfxById = null;
     // Step 1: build palette reverse-map from all sprite types (cached — the pack
     // export asks for the same map and must not repeat the 2048-type scan)
     const paletteMap = getAnimPaletteMap();
@@ -17317,6 +17605,10 @@ function buildSpriteGallery() {
     // Sequenzen ohne Tabellenzeile — bis hierher konnte die Galerie sie nicht
     // zeigen (Dixies langer Fall, Lockjaws Zuschnappen und 37 weitere).
     entries.push(...buildOrphanSeqEntries());
+
+    // Kunst, die zu gar keiner Animation gehoert (Schaedelwagen, Bonus-Fass,
+    // rollende Faesser, KONG-Buchstaben).
+    entries.push(...buildUnusedGfxEntries());
 
     // Append map icon entries (separate GFX system, not in sprite initscripts)
     const mapIconEntries = buildMapIconEntries();
@@ -18823,10 +19115,13 @@ document.getElementById('spriteCapInput').addEventListener('change', async (e) =
   }
   spriteCapPairs = res.map;
   spriteCapDimmed = res.dimmed;
+  spriteCapRows = res.rows;
+  spriteCapHashRow = res.hashRow;
   updateSpriteCapButton(res.map.size, res.pairs, null);
   // Persist so it survives reloads — re-picking a file just overwrites it.
   try {
-    await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs, dimmed: [...res.dimmed] });
+    await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs, dimmed: [...res.dimmed],
+                                       rows: res.rows, hashRow: [...res.hashRow] });
     console.log(`[spritecap] ${res.map.size} Hashes gespeichert — bleibt über Reloads erhalten`);
   } catch (err) {
     console.warn('[spritecap] konnte nicht gespeichert werden:', err);

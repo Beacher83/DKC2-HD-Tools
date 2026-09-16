@@ -1,5 +1,79 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-16] — Kunst, die zu gar keiner Animation gehört
+
+Viewer (`dkc2-viewer/index.html`). Eine Stufe unter den verwaisten Sequenzen.
+
+**Anlass:** Der User vermisste das Bonus-Fass mit dem B, das Abschussfass und den
+Schädelwagen. Das Abschussfass war da (`0x015B Auto Barrel Cannon Rotation`, nur ohne HD).
+Die beiden anderen nicht — und der Grund ist ein dritter Fall.
+
+### Der Befund
+
+Die Galerie baut sich über **Tabellenzeile → Sequenz → gfxRef → Deskriptor** auf. Bei den
+39 verwaisten Sequenzen fehlt die Tabellenzeile. Hier fehlt auch die Sequenz: das Spiel setzt
+den gfxRef direkt aus dem Code.
+
+Gefunden über die Aufzeichnung — ein Deskriptor, den keine Animation benutzt, dessen Kacheln
+aber in `snes_hd_spritecap.txt` stehen, war im Spiel zu sehen:
+
+**36 Gruppen, 153 Bilder, 2318 Kacheln.**
+
+| | |
+|---|---|
+| `Gfx 14A0` + `Gfx 14A8` | **Schädelwagen**, 19 Bilder, 550 Kacheln |
+| `Gfx 3170` | **Bonus-Fass „B"** |
+| `Gfx 08AC` | **rollende Fässer**, 16 Bilder, 419 Kacheln |
+| `Gfx 1458` / `Gfx 14F0` | weitere Diddy- und Dixie-Bilder |
+| `Gfx 319C`, `Gfx 2D40` | KONG-Buchstaben, weiße Ziffern |
+| `Gfx 0C38` | Piratenflaggen |
+
+### Die Palette — der eigentliche Aufwand
+
+Ein verwaister Eintrag konnte seine Palette vom Tabellennachbarn erben. Hier gibt es keinen
+Nachbarn. Die einzige belegte Quelle ist die **CGRAM-Zeile, unter der die Kunst im Spiel
+aufgezeichnet wurde** — und die warf `parseSpriteCap()` bisher weg: nach `findDimmedHashes()`
+blieb nur der Palettenslot übrig, die Farben nicht.
+
+- `parseSpriteCap()` liefert jetzt `rows` (die distinkten CGRAM-Zeilen, 188 in dieser
+  Aufzeichnung) und `hashRow` (Kachel → Zeile), beides wird mitgespeichert.
+- Je Kachel die **häufigste** Zeile, nicht die erste. Erstsichtungen sind unzuverlässig — eine
+  Kachel, die beim ersten Auftauchen in eine Blende fällt, trüge sonst dauerhaft die falschen
+  Farben (der Fall der roten Münze).
+- `spriteCapPaletteForTiles()` nimmt die Zeile, unter der die **meisten** Kacheln einer Gruppe
+  aufgezeichnet wurden.
+
+Eine ältere gespeicherte Aufzeichnung kennt `rows` nicht; dann bleiben diese Einträge grau und
+die Konsole sagt, dass Spritecap einmal neu zu laden ist.
+
+### Gruppierung
+
+Zusammenhängende gfxRefs **mit gleicher aufgezeichneter CGRAM-Zeile**. Ohne das
+Palettenkriterium wäre `$1458-$1534` ein einziger Block aus Diddy, Schädelwagen und Dixie —
+die Kunst liegt figurenweise beieinander, aber ohne Trennzeichen.
+
+### Absicherung gegen Kunstverlust
+
+Gemessen teilen sich die neuen Einträge **232 Kacheln** mit echten Animationen, **194 davon**
+unter mehreren aufgezeichneten CGRAM-Zeilen. Falsche Farben kann das nicht geben — HD-Kunst
+ist nach Hash verschlüsselt, und `bestRefFor()` prüft, ob eine Palette die Pixel erklärt.
+Aber: eine Kachel ohne Referenz, die auch gedimmt gezeichnet wird, verwirft der Export **ganz**.
+Schriebe ein neuer Eintrag zuerst und brächte nur eine unpassende Palette mit, fiele Kunst weg,
+die heute ausgeliefert wird.
+
+Deshalb laufen beide neuen Kategorien (`0xD000`–`0xEFFF`) im Pack-Export **zuletzt**, stabil
+sortiert. Dann greift `writtenKeys` für jede geteilte Kachel, die Animationen behalten ihre
+Referenz unverändert, und die neuen Einträge steuern nur bei, was sonst niemand beansprucht.
+
+### Beim Bauen gefunden
+
+`findUnusedGfxRefs()` rief `gfxRefTileHashes()` — eine Funktion aus dem am selben Tag
+**zurückgenommenen** Deckungsregister. Sie war nicht mehr da, der Code hätte zur Laufzeit
+geworfen. Aufgefallen erst, als der Scanner gegen das echte ROM lief, nicht bei der
+Syntaxprüfung. Wieder ergänzt.
+
+---
+
 ## [2026-09-16] — Bilder am gemeinsamen Ursprung ausrichten
 
 Viewer (`dkc2-viewer/index.html`), SD-Export und Galerie-Vorschau.
