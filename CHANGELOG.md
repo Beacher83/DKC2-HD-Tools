@@ -1,5 +1,113 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-16] — 39 Animationen, die die Galerie nie zeigen konnte
+
+Viewer (`dkc2-viewer/index.html`) + Mesen (`S39`, Commit `1954cc80`).
+
+### Der Weg dahin
+
+Der User meldete fehlende HD-Kunst, die er benennen konnte: Dixies langer Fall, Ducken bei
+beiden Kongs, ein Gegner beim Zuschnappen. Ein erster Versuch — ein Deckungsregister, das ROM
+gegen Container vergleicht — fand **keinen einzigen** dieser Fälle und wurde zurückgenommen.
+Es misst den Bestand, nicht das Bild: `0x00AA DX Fall` ist mit 5/5 Bildern vollständig, weil
+das Spiel beim langen Fall etwas völlig anderes abspielt.
+
+Was funktioniert hat: **`snes_hd_spritemiss.txt` gegen einen ROM-Kachelindex joinen.** Nach
+dem `S39`-Fix stimmten beide Instrumente **auf die Kachel genau** überein: DD Ducking 94/94,
+DX Ducking 9/9, DX Begin Ducking 9/9, DX Idle 2/2.
+
+### Der Befund
+
+272 der 635 Miss-Hashes kannte der Index nicht — alle unkomprimiert im ROM, keine
+Laufzeit-Kunst. Sie gehören zu Sequenzen im Animationsbank `$F9`, **auf die keine Zeile der
+780er-Tabelle zeigt**. Das Spiel springt sie aus dem Code an (`$81`/`$83`/`$84` tragen
+65816-Adressen, keine Sequenzzeiger).
+
+| Sequenz | Lage | Bilder | Kacheln | fehlen |
+|---|---|---|---|---|
+| `$39CC` **Dixies langer Fall** | zwischen `DX Jump` und `DX Fall` | 10 | 137 | **137** |
+| `$57AA` **Lockjaws Zuschnappen** | zwischen `Lockjaw Mouth Movement` und `Lockjaw Flip Over` | 21 | 244 | **62** |
+
+Beide über drei unabhängige Wege bestätigt: Lage im ROM, aufgezeichnete CGRAM-Palette
+(identisch zur Nachbaranimation derselben Figur) und die Beobachtung im Spiel.
+
+**Insgesamt 39 verwaiste Sequenzen, 532 Bilder, 3475 Kacheln ohne HD.** Neun sind bereits
+vollständig in HD. Die Galerie zählte nur Tabellenzeilen auf, also waren alle 39 hier
+unsichtbar, nicht exportierbar und damit nicht upscalebar.
+
+Im Spiel identifiziert und vom User bestätigt:
+
+| Sequenz | Was |
+|---|---|
+| `Seq 39CC` | Dixie, langer Fall |
+| `Seq 57AA` | Lockjaw, Maul auf/zu (Zuschnappen) |
+| `Seq 4C88` / `4C8B` / `4C8E` | Dixie auf dem Schädelwagen (`4C8E` = fährt runter) |
+| `Seq 4D1F` / `4D22` / `4D25` | Diddy auf dem Schädelwagen |
+
+Die Schädelwagen-Zuordnung steht nicht auf Vermutung: `4D1F`/`4D22`/`4D25` teilen sich je
+fünf gfxRefs mit `0x004E DD Ride Skull Cart`, `4C88`/`4C8B` je fünf mit
+`0x00F1 DX Ride Skull Cart`. Nur `4C8E` teilt sich mit keiner von beiden etwas und wurde
+allein durch Hinsehen zugeordnet.
+
+### Umsetzung
+
+- **`walkAnimSequence(rom, offset, covered, strict)`** — der Sequenzparser, jetzt über den
+  Bank-Offset adressiert statt über die animId. `parseAnimFramesUncached` ruft ihn auf, also
+  gibt es weiterhin **einen** Parser; eine zweite Kopie der Befehlstabelle würde driften.
+- **`findOrphanAnimSequences`** — markiert alle Bytes, die Tabellensequenzen belegen, und
+  parst in den Lücken ab jeder Position. Was sauber endet und ≥3 Bilder hat, zählt.
+- **Synthetische IDs ab `0xE000`** (unter den Map-Icons bei `0xF000`). `parseAnimFrames`
+  fängt sie an der Wurzel ab — sonst läse `0xE000*4` mitten in die Deskriptortabelle.
+  Dadurch funktioniert **jeder** vorhandene Aufrufer unverändert.
+- **Name trägt den Offset** (`Seq 39CC`), nicht die laufende Nummer: der Container
+  schlüsselt Sprites über den Namen, der Offset kommt aus dem ROM und wandert nicht.
+- **Palette vom Tabellennachbarn geerbt.** Ohne Referenzpalette schaltet Mesen jede
+  Kantenglättung ab (S28). Das ROM gruppiert Animationen pro Figur, der nächste Nachbar ist
+  dieselbe Figur. Die Ersetzung steht **in `resolveSpritePalettes`**, nicht an den
+  Aufrufstellen — sonst laufen Galerie und Pack-Export auseinander. Im Spiel geprüft:
+  **0 von 43 blieben grau.** Eine eigene Pipetten-Zuweisung schlägt den Nachbarn weiterhin.
+- **`getCategoryForEntry`** — verwaiste Sequenzen erben die Kategorie des Nachbarn und
+  stehen bei ihrer Figur statt unter „Sonstiges".
+
+### Drei Fehler im Scanner, die erst der Abgleich gezeigt hat
+
+Ein Python-Vorabwerkzeug und der ausgelieferte Scanner kamen auf verschiedene Listen. Der
+Abgleich hat auf beiden Seiten Fehler gefunden — das Werkzeug zählte `$86`-Verbundbilder
+nicht als Bild und brach bei ungewöhnlichen gfxRefs ab. Im Viewer:
+
+1. **Vorrücken nach `max(own)`** übersprang echte Sequenzen: `own` enthält auch Bytes, die
+   ein `$82`-Sprung ganz woanders markiert hat.
+2. **Vorrücken nach `max(own` in der Lücke`)`** fand denselben Körper drei Bytes später
+   erneut, wenn die Sequenz aus der Lücke herausspringt. Jetzt: Byte für Byte ab `k` über
+   den Körper laufen.
+3. **Kandidaten, deren Bytes vollständig in einem früheren liegen**, sind dessen Schwanz und
+   werden verworfen.
+4. **Versatzfehler vor einer Tabellensequenz.** `Seq 3A23` setzte drei Bytes vor
+   `0x00E2 DX Follower DD Glide` an, las dort ein Scheinbild (`dur=78 gfxRef=$0080`) und lief
+   dann in fremdes Gebiet — im Viewer als unkenntlicher Eintrag sichtbar. Gefordert sind
+   jetzt **drei Bilder im eigenen Gebiet**. Die naheliegende Regel „berührt nie fremdes
+   Gebiet" war zu streng: damit fielen die Schädelwagen-Sequenzen und Snapjaw heraus, die
+   sich legitim einen Schwanz mit einer Tabellenanimation teilen.
+
+Geblieben sind Einträge wie `Seq 4C88` / `4C8B` / `4C8E` — **keine** Dubletten, sie haben
+verschiedene Kachelmengen (134/119/124) und teilen sich nur einen Schwanz. Das ROM macht das
+auch bei Tabellenanimationen (`DX Land` steht dreimal unter verschiedenen IDs).
+
+### `strict` — und warum es NUR für verwaiste Sequenzen gilt
+
+Der Parser merkt sich sonst nur `$82`-Sprünge. Eine Sequenz, die auf ihren eigenen Anfang
+zurückspringt (Dixies Fall tut das), würde deshalb **zweimal** eingesammelt — 20 Bilder statt
+10. `strict` bricht beim ersten doppelt besuchten Byte ab und wird für Erkennung und
+Bildliste der verwaisten Sequenzen benutzt.
+
+Für Tabellenanimationen wäre das eine stille Regression: gemessen an diesem ROM fällt
+`DD Roll` von 33 auf 19 Bilder, und die Bildnummer ist der Schlüssel, unter dem der Container
+bereits upgescalte Kunst hält. Die Byte-Abdeckung läuft deshalb weiter mit dem unveränderten
+Walker. Gegengeprüft gegen das echte ROM: `DD Idle` 201, `DD Roll` 33, `DX Fall` 5 —
+unverändert.
+
+---
+
 ## [2026-09-14] — Das Container-Backup war kein Backup
 
 Nur Viewer (`dkc2-viewer/index.html`, `exportContainerAsZip()` / `importContainerFromZip()`).

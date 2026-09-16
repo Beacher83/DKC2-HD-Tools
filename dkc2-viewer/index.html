@@ -3148,38 +3148,86 @@ function parseAnimFrames(rom, animId) {
 }
 function parseAnimFramesUncached(rom, animId) {
   const ANIM_BANK = 0x390000;
+  // Eine verwaiste Sequenz hat keine Tabellenzeile; ihre Bilder kommen aus dem
+  // Scanner. Ohne diesen Zweig wuerde die Zeile darunter mit einer synthetischen
+  // ID weit hinter der Tabelle lesen (0xE000*4 landet mitten in der
+  // Deskriptortabelle) und Muell zurueckgeben. Der Zweig sitzt hier, damit JEDER
+  // vorhandene Aufrufer unveraendert funktioniert — Galerie, Pack-Export,
+  // Referenzpaletten.
+  const _orph = orphanSeqInfo(animId);
+  if (_orph) return _orph.frames;
   const ptrOff = ANIM_BANK + animId * 4;
   if (ptrOff + 4 > rom.size) return [];
   const animOffset = rom.readWordAt(ptrOff);
   if (animOffset === 0 || animOffset === 0xFFFF) return [];
+  return walkAnimSequence(rom, animOffset).frames;
+}
 
+// The sequence walker, addressed by BANK OFFSET instead of by animId.
+// Split out because 39 sequences in the bank have no table row at all (see
+// findOrphanAnimSequences) and can only be reached by their offset. Both uses
+// share this one function on purpose: a second copy of the command table would
+// drift, and the orphan scan would then report the tail of a known sequence as
+// a find of its own.
+//
+// `covered`, when given, collects every byte the sequence occupies — that is
+// what the scan subtracts to find the gaps.
+// `ok` is false when the walk stopped on a command this table does not know;
+// parseAnimFrames ignores that (it keeps whatever it collected, the behaviour
+// it always had), the orphan scan requires it.
+//
+// `strict` stops at the first byte visited twice instead of only at a $82 taken
+// twice. It exists for the orphan sequences and MUST NOT be turned on for the
+// table animations: measured on this ROM it takes DD Roll from 33 frames to 19,
+// and the frame INDEX is the key the container stores upscaled art under — a
+// changed count would silently misalign art that already exists. The orphans
+// have no art yet, so their numbering is being fixed now, and without strict a
+// sequence that loops back to its own start (Dixie's long fall does) is
+// collected twice.
+// `blocked`, wenn angegeben, beendet den Lauf, sobald er in fremdes Gebiet
+// laeuft — gebraucht von der Erkennung: ein Kandidat, der nach ein, zwei
+// Scheinbildern in eine Tabellensequenz hineinlaeuft, ist ein Versatzfehler und
+// keine eigene Animation (gemessen: $3A23 las ein Scheinbild dur=78 gfxRef=$0080
+// und lief dann in 0x00E2 DX Follower DD Glide ab $3A26 hinein).
+function walkAnimSequence(rom, startOffset, covered, strict, blocked) {
+  const ANIM_BANK = 0x390000;
   const frames = [];
-  let pos = ANIM_BANK + animOffset;
+  let pos = ANIM_BANK + startOffset;
   const visited = new Set();
+  let ok = false;
+  const mark = (n) => { if (covered) for (let k = 0; k < n; k++) covered.add(pos - ANIM_BANK + k); };
 
   for (let iter = 0; iter < 512; iter++) {
-    if (pos >= rom.size || visited.has(pos)) break;
+    if (pos >= rom.size) break;
+    // Back at a goto we have already taken: the sequence loops, which is a
+    // proper end, not a parse failure.
+    if (visited.has(pos)) { ok = true; break; }
+    if (blocked && blocked.has(pos - ANIM_BANK)) break;   // fremdes Gebiet: ungueltig
+    if (strict) visited.add(pos);
     const cmd = rom.readByteAt(pos);
 
-    if (cmd === 0x80 || cmd === 0x94) break; // end
+    if (cmd === 0x80 || cmd === 0x94) { mark(1); ok = true; break; } // end
 
     if (cmd >= 0x01 && cmd <= 0x7f) {
       // Display frame: duration=cmd, 2-byte LE gfxRef follows
       if (pos + 3 > rom.size) break;
       const gfxRef = rom.readWordAt(pos + 1);
       if (gfxRef > 0 && gfxRef < 0x8000) frames.push({ duration: cmd, gfxRef });
+      mark(3);
       pos += 3;
     } else if (cmd === 0x82) {
       // Goto offset in bank $F9
       if (pos + 3 > rom.size) break;
       visited.add(pos);
+      mark(3);
       pos = ANIM_BANK + rom.readWordAt(pos + 1);
-    } else if (cmd === 0x81 || cmd === 0x83 || cmd === 0x84) { pos += 3;
+    } else if (cmd === 0x81 || cmd === 0x83 || cmd === 0x84) { mark(3); pos += 3;
     } else if (cmd === 0x85 || cmd === 0x89) {
       // 2 images, no offsets: dur + ref1(2) + ref2(2)
       if (pos + 6 > rom.size) break;
       const dur = rom.readByteAt(pos + 1), r1 = rom.readWordAt(pos + 2), r2 = rom.readWordAt(pos + 4);
       frames.push({ duration: dur, gfxRef: r1, extraRefs: [{ gfxRef: r2, x: 0, y: 0 }] });
+      mark(6);
       pos += 6;
     } else if (cmd === 0x86 || cmd === 0x8a) {
       // 2 images + signed pixel offsets: dur + ref1(2) + ref2(2) + x(2) + y(2)
@@ -3187,6 +3235,7 @@ function parseAnimFramesUncached(rom, animId) {
       const dur = rom.readByteAt(pos + 1), r1 = rom.readWordAt(pos + 2), r2 = rom.readWordAt(pos + 4);
       const x = (rom.readWordAt(pos + 6) << 16) >> 16, y = (rom.readWordAt(pos + 8) << 16) >> 16;
       frames.push({ duration: dur, gfxRef: r1, extraRefs: [{ gfxRef: r2, x, y }] });
+      mark(10);
       pos += 10;
     } else if (cmd === 0x87 || cmd === 0x8b) {
       // Single image + offset: dur + ref(2) + x(2) + y(2)
@@ -3194,21 +3243,157 @@ function parseAnimFramesUncached(rom, animId) {
       const dur = rom.readByteAt(pos + 1), ref = rom.readWordAt(pos + 2);
       const x = (rom.readWordAt(pos + 4) << 16) >> 16, y = (rom.readWordAt(pos + 6) << 16) >> 16;
       frames.push({ duration: dur, gfxRef: ref, primaryOffset: { x, y } });
+      mark(8);
       pos += 8;
-    } else if (cmd === 0x88 || cmd === 0x8c) { pos += 5;
+    } else if (cmd === 0x88 || cmd === 0x8c) { mark(5); pos += 5;
     } else if (cmd === 0x8d) {
       // 2 images + control param: dur + ref1(2) + ref2(2) + param(2)
       if (pos + 8 > rom.size) break;
       const dur = rom.readByteAt(pos + 1), r1 = rom.readWordAt(pos + 2), r2 = rom.readWordAt(pos + 4);
       frames.push({ duration: dur, gfxRef: r1, extraRefs: [{ gfxRef: r2, x: 0, y: 0 }] });
+      mark(8);
       pos += 8;
-    } else if (cmd === 0x8e || cmd === 0x93) { pos += 3;
-    } else if (cmd === 0x8f || cmd === 0x90) { pos += 5;
-    } else if (cmd === 0x91) { pos += 4;
-    } else if (cmd === 0x92) { pos += 3;
+    } else if (cmd === 0x8e || cmd === 0x93) { mark(3); pos += 3;
+    } else if (cmd === 0x8f || cmd === 0x90) { mark(5); pos += 5;
+    } else if (cmd === 0x91) { mark(4); pos += 4;
+    } else if (cmd === 0x92) { mark(3); pos += 3;
     } else { break; }
   }
-  return frames;
+  return { frames, ok };
+}
+
+// ============================================================
+// Verwaiste Animationssequenzen — Kunst, die es im ROM gibt und die diese
+// Galerie bis jetzt nicht zeigen konnte.
+//
+// Die Tabelle in Bank $F9 hat 780 Zeilen (0x0000-0x030B). Im selben Bank liegen
+// aber weitere vollstaendig gueltige Sequenzen, auf die KEINE Zeile zeigt — das
+// Spiel springt sie aus dem Code an (die Befehle $81/$83/$84 tragen
+// 65816-Adressen, keine Sequenzzeiger). Weil die Galerie nur Tabellenzeilen
+// aufzaehlt, waren sie hier unsichtbar, nicht exportierbar und damit auch nicht
+// upscalebar.
+//
+// Belegt am 2026-09-16: Dixies langer Fall ist die Sequenz $39CC (10 Bilder,
+// 137 Kacheln, keine davon im Pack) und Lockjaws Zuschnappen ist $57AA
+// (21 Bilder, 62 fehlende Kacheln). Beide wurden im Spiel beobachtet und von
+// snes_hd_spritemiss.txt bestaetigt.
+//
+// Verfahren: alle Bytes markieren, die von Tabellensequenzen belegt sind, und
+// in den Luecken ab jeder Position zu parsen versuchen. Was sauber endet und
+// mindestens drei Bilder hat, gilt als eigene Sequenz.
+// ============================================================
+const ORPHAN_SEQ_ID_BASE = 0xE000;   // unter den Map-Icons (0xF000+), ueber jeder echten animId
+let _orphanSeqs = null;
+let _orphanSeqById = null;
+
+function findOrphanAnimSequences(rom) {
+  if (_orphanSeqs) return _orphanSeqs;
+  const ANIM_BANK = 0x390000;
+  const TABLE_BYTES = 0x030C * 4;
+  const covered = new Set();
+  const table = [];
+  for (let aid = 1; aid <= 0x030B; aid++) {
+    const off = rom.readWordAt(ANIM_BANK + aid * 4);
+    if (off === 0 || off === 0xFFFF) continue;
+    table.push([off, aid]);
+    walkAnimSequence(rom, off, covered);
+  }
+  table.sort((a, b) => a[0] - b[0]);
+  let end = 0;
+  for (const o of covered) if (o > end) end = o;
+  end++;
+  for (let i = 0; i < TABLE_BYTES; i++) covered.add(i);
+
+  const out = [];
+  let i = TABLE_BYTES;
+  while (i < end) {
+    if (covered.has(i)) { i++; continue; }
+    let j = i;
+    while (j < end && !covered.has(j)) j++;
+    let k = i;
+    while (k < j) {
+      // Erkennung mit `strict`: hier gibt es kein Altverhalten zu schonen, und
+      // die strengere Pruefung ist die konservativere — sie laesst einen
+      // Kandidaten nicht durch weiterlaufende, laengst belegte Bytes gueltig
+      // werden. Nur die Byte-Abdeckung oben bleibt beim unveraenderten Walker,
+      // weil die das erprobte Ergebnis fuer die Tabellensequenzen ist.
+      // Zwei Laeufe: `probe` stoppt an fremdem Gebiet und sagt, wie viel
+      // EIGENEN Inhalt der Kandidat hat; `full` ist die ganze Sequenz. Gefordert
+      // sind drei eigene Bilder — nicht "beruehrt nie Fremdes": mehrere echte
+      // Sequenzen teilen sich legitim einen Schwanz mit einer Tabellenanimation
+      // (die Schaedelwagen-Varianten und Snapjaw tun das). Ohne die
+      // Eigenanteil-Schwelle rutschen dagegen Versatzfehler durch, die nach ein,
+      // zwei Scheinbildern in eine Tabellensequenz laufen ($3A23).
+      const probe = walkAnimSequence(rom, k, null, true, covered);
+      const r = walkAnimSequence(rom, k, null, true);
+      if (r.ok && probe.frames.length >= 3) {
+        const own = new Set();
+        walkAnimSequence(rom, k, own);
+        // Vorruecken ueber den Koerper dieser Sequenz, Byte fuer Byte ab k.
+        // Nicht nach `max(own)`: dort steht auch, was ein $82-Sprung anderswo
+        // markiert hat, und danach zu suchen ueberliest echte Sequenzen
+        // dahinter. Nicht nach `max(own` in der Luecke`)`: bei einem Sprung aus
+        // der Luecke heraus endet die Abdeckung zu frueh, und man findet
+        // denselben Koerper gleich nochmal drei Bytes weiter.
+        let next = k;
+        while (own.has(next)) next++;
+        // The nearest preceding table row names the character: the ROM keeps a
+        // character's animations together, so the neighbour is what the palette
+        // is borrowed from below.
+        let nb = null;
+        for (const [off, aid] of table) { if (off < k) nb = aid; else break; }
+        out.push({
+          id: ORPHAN_SEQ_ID_BASE + out.length,
+          offset: k,
+          neighbourAnimId: nb,
+          neighbourName: nb !== null ? (SPRITE_ANIM_NAMES[nb] || `anim#${nb}`) : '',
+          frames: r.frames,
+          bytes: own,
+        });
+        k = Math.max(next, k + 1);
+      } else {
+        k++;
+      }
+    }
+    i = j;
+  }
+  // Ein Kandidat, dessen Bytes vollstaendig in einem frueheren liegen, ist
+  // dessen Schwanz und keine eigene Animation. Das faellt an Stellen an, wo eine
+  // Sequenz aus der Luecke herausspringt: die Abdeckung reisst ab, und derselbe
+  // Koerper wird ein paar Bytes spaeter erneut gefunden (gemessen: Seq 4C88 kam
+  // zusaetzlich als 4C8B und 4C8E).
+  const kept = [];
+  for (const cand of out) {
+    const dup = kept.some(prev => {
+      for (const byteOff of cand.bytes) if (!prev.bytes.has(byteOff)) return false;
+      return true;
+    });
+    if (!dup) kept.push(cand);
+  }
+  kept.forEach((o, n) => { o.id = ORPHAN_SEQ_ID_BASE + n; delete o.bytes; });
+  out.length = 0; out.push(...kept);
+
+  _orphanSeqs = out;
+  _orphanSeqById = new Map(out.map(o => [o.id, o]));
+  const tiles = out.reduce((n, o) => n + o.frames.length, 0);
+  console.log(`[verwaist] ${out.length} Animationssequenzen ohne Tabellenzeile, ` +
+              `${tiles} Bilder zusammen. Beispiele: ` +
+              out.slice(0, 3).map(o => `$${o.offset.toString(16).toUpperCase()} (bei ${o.neighbourName})`).join(', '));
+  return out;
+}
+
+// Name einer verwaisten Sequenz. Traegt den Bank-Offset, NICHT die laufende
+// Nummer: der Container schluesselt Sprites ueber den Namen, und der Offset
+// kommt aus dem ROM und wandert nicht, waehrend sich die Nummerierung bei jeder
+// Aenderung am Scanner verschieben wuerde.
+function orphanSeqName(o) {
+  return `Seq ${o.offset.toString(16).toUpperCase().padStart(4, '0')}`;
+}
+
+function orphanSeqInfo(animId) {
+  if (animId < ORPHAN_SEQ_ID_BASE || animId >= 0xF000) return null;
+  if (!_orphanSeqById && rom) findOrphanAnimSequences(rom);
+  return _orphanSeqById ? (_orphanSeqById.get(animId) || null) : null;
 }
 
 // Check if an animation ID leads to valid data
@@ -8101,9 +8286,9 @@ async function exportSpritesAsZip() {
       entries = spriteGalleryData.filter(e => {
         if (!showGrey && e.isGrey && !spriteOverrides.has(e.animId)) return false;
         // Map Icons: controlled by dedicated checkbox, independent of category filter
-        const isMapIcon = getCategoryForAnimName(e.name) === 'mapicons';
+        const isMapIcon = getCategoryForEntry(e) === 'mapicons';
         if (isMapIcon && !expMapIcons) return false;
-        if (!isMapIcon && activeCatFilter !== 'all' && getCategoryForAnimName(e.name) !== activeCatFilter) return false;
+        if (!isMapIcon && activeCatFilter !== 'all' && getCategoryForEntry(e) !== activeCatFilter) return false;
         if (filterRaw) {
           const f = filterRaw.replace(/^\$|^0x/, '');
           if (!e.name.toLowerCase().includes(filterRaw) &&
@@ -8141,7 +8326,7 @@ async function exportSpritesAsZip() {
         animId: entry.animId,
         animIdHex: `0x${animHex}`,
         spriteType: entry.spriteType,
-        category: getCategoryForAnimName(entry.name),
+        category: getCategoryForEntry(entry),
         frameCount: frames.length,
         variants: [],
       };
@@ -15779,6 +15964,13 @@ const CATEGORY_LABELS = {
 };
 const CATEGORY_ORDER = ['kongs','shop','mapicons','enemies','bosses','items','effects','other'];
 
+// Ein Galerie-Eintrag kann eine verwaiste Sequenz sein, deren eigener Name
+// ("Seq 39CC") in keine Kategorie faellt. Sie gehoert zu ihrer Figur, also
+// entscheidet der Nachbarname.
+function getCategoryForEntry(e) {
+  return getCategoryForAnimName(e && e.orphanNeighbourName ? e.orphanNeighbourName : (e ? e.name : ''));
+}
+
 function getCategoryForAnimName(name) {
   if (!name) return 'other';
   const n = name;
@@ -16296,6 +16488,24 @@ function getAnimPaletteMap() {
 // Composite sprites may replace the primary afterwards, so hasCompositeFrames comes
 // from the caller: deciding it needs parseAnimFrames, which the export does not run.
 function resolveSpritePalettes(animId, name, palInfo, hasCompositeFrames) {
+  // Eine verwaiste Sequenz hat keine Tabellenzeile, also zeigt auch kein
+  // Sprite-Initscript auf sie und die ganze Kaskade unten kaeme leer zurueck:
+  // grau = keine Referenzpalette = Mesen schaltet jede Kantenglaettung ab
+  // (SnesHdVideoFilter.cpp, S28). Der Nachbar im Bank ist dieselbe Figur, also
+  // wird dessen Antwort uebernommen. Die Ersetzung steht HIER und nicht an den
+  // zwei Aufrufstellen — sonst laufen Galerie und Pack-Export auseinander.
+  const _orph = orphanSeqInfo(animId);
+  if (_orph && _orph.neighbourAnimId !== null) {
+    const res = resolveSpritePalettes(_orph.neighbourAnimId, _orph.neighbourName,
+      getAnimPaletteMap().get(_orph.neighbourAnimId) || null, hasCompositeFrames);
+    // Eine eigene Pipetten-Zuweisung auf der Sequenz schlaegt den Nachbarn.
+    if (spriteOverrides.has(animId)) {
+      const ovId = spriteOverrides.get(animId);
+      const ovPal = loadSpritePalette(rom, ovId);
+      if (ovPal) { res.palette = ovPal; res.paletteSetId = ovId; res.isGrey = false; }
+    }
+    return res;
+  }
   let palette = null;
   let resolvedPaletteSetId = null;
   let resolvedPaletteAddr = null;
@@ -16789,6 +16999,78 @@ function mapIconPalette(animId) {
   return mapIconInfo(animId)?.palette || null;
 }
 
+// Galerie-Eintraege fuer die verwaisten Sequenzen. Bewusst derselbe Weg wie bei
+// den Tabellenanimationen (parseAnimFrames -> Deskriptor -> resolveSpritePalettes
+// -> renderCompositeFrame), nur dass die Bilder aus dem Scanner kommen und die
+// Palette vom Nachbarn geerbt wird. Dadurch tragen sie dieselben Felder und jeder
+// nachgelagerte Pfad — Auswahl, SD-Export, Container, Pack-Export — funktioniert
+// ohne weitere Aenderung.
+function buildOrphanSeqEntries() {
+  if (!rom) return [];
+  const out = [];
+  for (const o of findOrphanAnimSequences(rom)) {
+    const name = orphanSeqName(o);
+    const gfxRef = getSpriteFrame0GfxRef(rom, o.id);
+    if (gfxRef === null) continue;
+    const desc = loadSpriteDescriptor(rom, gfxRef);
+    if (!desc) continue;
+
+    const frames = o.frames;
+    const hasComposite = frames.some(f => f.extraRefs && f.extraRefs.length > 0);
+    const palRes = resolveSpritePalettes(o.id, name, null, hasComposite);
+    const palette = palRes.palette;
+    const paletteKey = palRes.paletteSetId !== null ? String(palRes.paletteSetId) : 'grey';
+    const block2PalKey = palRes.block2PaletteSetId !== null ? String(palRes.block2PaletteSetId) : null;
+
+    let rendered = null;
+    const thumb = frames.find(f => f.extraRefs && f.extraRefs.length > 0) || frames[0] || null;
+    if (thumb && thumb.extraRefs && thumb.extraRefs.length > 0) {
+      const secKey = palRes.secondaryPaletteSetId !== null ? String(palRes.secondaryPaletteSetId) : null;
+      rendered = renderCompositeFrame(thumb, palette, paletteKey, palRes.secondaryPalette, secKey,
+                                      palRes.block2Palette, block2PalKey);
+    } else {
+      rendered = renderSpriteFromDescriptor(desc, palette, palRes.block2Palette);
+    }
+
+    let displayCanvas = null, displayScale = 1;
+    if (rendered && rendered.canvas) {
+      const maxW = 80;
+      displayScale = Math.min(4, rendered.width > 0 ? Math.floor(maxW / rendered.width) : 1) || 1;
+      displayCanvas = document.createElement('canvas');
+      displayCanvas.width = rendered.width * displayScale;
+      displayCanvas.height = rendered.height * displayScale;
+      const dc = displayCanvas.getContext('2d');
+      dc.imageSmoothingEnabled = false;
+      dc.drawImage(rendered.canvas, 0, 0, rendered.width * displayScale, rendered.height * displayScale);
+    }
+
+    out.push({
+      animId: o.id,
+      name,
+      orphanOffset: o.offset,
+      orphanNeighbourName: o.neighbourName,
+      canvas: displayCanvas,
+      isGrey: palRes.isGrey,
+      paletteSetId: palRes.paletteSetId,
+      paletteAddr: palRes.paletteAddr,
+      palette,
+      secondaryPalette: palRes.secondaryPalette,
+      secondaryPaletteSetId: palRes.secondaryPaletteSetId,
+      block2Palette: palRes.block2Palette,
+      block2PaletteSetId: palRes.block2PaletteSetId,
+      spriteType: null,
+      frames,
+      animFrame: 0,
+      animTick: 0,
+      displayScale,
+      activeCanvas: null,
+    });
+  }
+  console.log(`[verwaist] ${out.length} Sequenzen in die Galerie aufgenommen ` +
+              `(${out.filter(e => e.isGrey).length} ohne aufloesbare Palette).`);
+  return out;
+}
+
 // ---- Gallery build ----
 
 function buildSpriteGallery() {
@@ -16800,6 +17082,7 @@ function buildSpriteGallery() {
   setTimeout(() => {
     gfxRefRenderCache.clear();
     animFramesCache.clear();
+    _orphanSeqs = null; _orphanSeqById = null;   // bei neuem ROM neu scannen
     // Step 1: build palette reverse-map from all sprite types (cached — the pack
     // export asks for the same map and must not repeat the 2048-type scan)
     const paletteMap = getAnimPaletteMap();
@@ -16888,6 +17171,10 @@ function buildSpriteGallery() {
         activeCanvas: null,
       });
     }
+
+    // Sequenzen ohne Tabellenzeile — bis hierher konnte die Galerie sie nicht
+    // zeigen (Dixies langer Fall, Lockjaws Zuschnappen und 37 weitere).
+    entries.push(...buildOrphanSeqEntries());
 
     // Append map icon entries (separate GFX system, not in sprite initscripts)
     const mapIconEntries = buildMapIconEntries();
@@ -17135,7 +17422,7 @@ function renderSpriteGallery() {
 
   const filtered = spriteGalleryData.filter(e => {
     if (!showGrey && e.isGrey && !spriteOverrides.has(e.animId)) return false;
-    if (activeCatFilter !== 'all' && getCategoryForAnimName(e.name) !== activeCatFilter) return false;
+    if (activeCatFilter !== 'all' && getCategoryForEntry(e) !== activeCatFilter) return false;
     if (filterRaw) {
       const f = filterRaw.replace(/^\$|^0x/, '');
       if (!e.name.toLowerCase().includes(filterRaw) &&
@@ -17159,7 +17446,7 @@ function renderSpriteGallery() {
   if (useGroups) {
     const grouped = {};
     for (const cat of CATEGORY_ORDER) grouped[cat] = [];
-    for (const e of filtered) grouped[getCategoryForAnimName(e.name)].push(e);
+    for (const e of filtered) grouped[getCategoryForEntry(e)].push(e);
     for (const cat of CATEGORY_ORDER) {
       if (grouped[cat].length === 0) continue;
       const sec = document.createElement('div');
