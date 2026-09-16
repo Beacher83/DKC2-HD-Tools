@@ -8358,12 +8358,39 @@ async function exportSpritesAsZip() {
           }
           if (!rendered) continue;
           renderedFrames.push({ index: fi, canvas: rendered.canvas, width: rendered.width, height: rendered.height,
+            // Ursprung des Bildes im Deskriptor-Raum (Anker = 0,0). Beide Renderer
+            // liefern ihn seit jeher; nur benutzt hat ihn hier niemand.
+            offsetX: rendered.offsetX || 0, offsetY: rendered.offsetY || 0,
             duration: frame.duration || frame.delay || 4, tiles: rendered.tiles || null });
-          maxW = Math.max(maxW, rendered.width);
-          maxH = Math.max(maxH, rendered.height);
         }
 
         if (renderedFrames.length === 0) continue;
+
+        // Alle Bilder am GEMEINSAMEN URSPRUNG ausrichten, nicht zentrieren.
+        // Jedes Bild hat seine eigene Umrissgroesse und seinen eigenen Ursprung
+        // (0x015B Auto Barrel Cannon Rotation wechselt zwischen 32x48 und 43x32).
+        // Zentriert man jedes fuer sich, wandert das Motiv von Bild zu Bild durchs
+        // Kader — gemessen an diesem ROM betrifft das 614 von 644 mehrbildrigen
+        // Animationen, im schlimmsten Fall um 131 Pixel (Kudgel's Club).
+        // Der Pack-Export bleibt davon unberuehrt: tiles[] ist bildrelativ und
+        // meta.offsetX/Y haelt fest, womit gepolstert wurde, das Zerschneiden ist
+        // also in sich stimmig. Es geht um die Bilder, die zum Upscaler gehen —
+        // dort kostet ein wanderndes Motiv Qualitaet.
+        {
+          let uMinX = Infinity, uMinY = Infinity, uMaxX = -Infinity, uMaxY = -Infinity;
+          for (const rf of renderedFrames) {
+            uMinX = Math.min(uMinX, rf.offsetX);
+            uMinY = Math.min(uMinY, rf.offsetY);
+            uMaxX = Math.max(uMaxX, rf.offsetX + rf.width);
+            uMaxY = Math.max(uMaxY, rf.offsetY + rf.height);
+          }
+          maxW = uMaxX - uMinX;
+          maxH = uMaxY - uMinY;
+          for (const rf of renderedFrames) {
+            rf.padX = rf.offsetX - uMinX;
+            rf.padY = rf.offsetY - uMinY;
+          }
+        }
 
         const variantManifest = {
           name: palEntry.name,
@@ -8377,8 +8404,8 @@ async function exportSpritesAsZip() {
             // Pad to uniform size (centered) for AI consistency
             const padded = new OffscreenCanvas(maxW, maxH);
             const pCtx = padded.getContext('2d');
-            const ox = Math.floor((maxW - rf.width) / 2);
-            const oy = Math.floor((maxH - rf.height) / 2);
+            const ox = rf.padX;
+            const oy = rf.padY;
             pCtx.drawImage(rf.canvas, ox, oy);
 
             const filename = `frame_${String(rf.index).padStart(3, '0')}${variantSuffix}.png`;
@@ -8414,8 +8441,8 @@ async function exportSpritesAsZip() {
           const sCtx = sheet.getContext('2d');
           for (let i = 0; i < renderedFrames.length; i++) {
             const rf = renderedFrames[i];
-            const ox = i * maxW + Math.floor((maxW - rf.width) / 2);
-            const oy = Math.floor((maxH - rf.height) / 2);
+            const ox = i * maxW + rf.padX;
+            const oy = rf.padY;
             sCtx.drawImage(rf.canvas, ox, oy);
           }
           const sheetName = `sheet${variantSuffix}.png`;
@@ -16678,16 +16705,117 @@ function stopGalleryAnim() {
   gfxRefRenderCache.clear();
 }
 
+// Umriss eines gfxRef im Deskriptor-Raum (Anker = 0,0) — dieselben Zahlen, die
+// renderSpriteFromDescriptor als offsetX/offsetY/width/height zurueckgibt, aber
+// ohne ein einziges Pixel zu zeichnen.
+const gfxRefBoxCache = new Map();
+function gfxRefBox(rom, gfxRef) {
+  if (gfxRefBoxCache.has(gfxRef)) return gfxRefBoxCache.get(gfxRef);
+  let box = null;
+  const desc = loadSpriteDescriptor(rom, gfxRef);
+  if (desc && desc.entries && desc.entries.length) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const en of desc.entries) {
+      minX = Math.min(minX, en.tx); minY = Math.min(minY, en.ty);
+      maxX = Math.max(maxX, en.tx + en.size); maxY = Math.max(maxY, en.ty + en.size);
+    }
+    if (isFinite(minX) && maxX > minX) box = { minX, minY, w: maxX - minX, h: maxY - minY };
+  }
+  gfxRefBoxCache.set(gfxRef, box);
+  return box;
+}
+
+// Gemeinsamer Umriss ALLER Bilder eines Eintrags — dieselbe Ausrichtung, die der
+// SD-Export schreibt. Wird beim Aufbau der Karte gebraucht, nicht erst beim
+// Hover: die erste Fassung hat die Zeichenflaeche beim Hover vergroessert, das
+// Raster floss um, die Karte rutschte unter der Maus weg, mouseleave feuerte und
+// die Animation fing von vorn an (Seq 6EE1 sprang zwischen zwei Zeilen hin und
+// her). Die Flaeche muss von Anfang an stimmen.
+// Rein aus den Deskriptoren gerechnet, damit das beim Aufbau nichts kostet.
+function entryAlignBox(e) {
+  if (!e._align) e._align = framesAlignBox(e.frames);
+  return e._align;
+}
+
+function framesAlignBox(frames) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const f of (frames || [])) {
+    let l, t, r, b;
+    if (f.canvas) { l = 0; t = 0; r = f.width; b = f.height; }   // Map-Icons: vorgerendert
+    else {
+      const pb = rom ? gfxRefBox(rom, f.gfxRef) : null;
+      if (!pb) continue;
+      l = pb.minX; t = pb.minY; r = pb.minX + pb.w; b = pb.minY + pb.h;
+      for (const er of (f.extraRefs || [])) {
+        const eb = gfxRefBox(rom, er.gfxRef);
+        if (!eb) continue;
+        l = Math.min(l, er.x + eb.minX);       t = Math.min(t, er.y + eb.minY);
+        r = Math.max(r, er.x + eb.minX + eb.w); b = Math.max(b, er.y + eb.minY + eb.h);
+      }
+    }
+    minX = Math.min(minX, l); minY = Math.min(minY, t);
+    maxX = Math.max(maxX, r); maxY = Math.max(maxY, b);
+  }
+  return (isFinite(minX) && maxX > minX)
+    ? { minX, minY, w: maxX - minX, h: maxY - minY }
+    : { minX: 0, minY: 0, w: 0, h: 0 };
+}
+
+// EIN Bild in die Flaeche einer Karte zeichnen — Standbild wie Hover-Bild.
+// Zwei Regeln, die vorher an drei Stellen verschieden gehandhabt wurden und sich
+// gegenseitig ins Gehege kamen:
+//   1. Die Flaeche aendert ihre Groesse NIE. Jede Aenderung laesst das Raster
+//      umfliessen und die Karte unter der Maus wegrutschen.
+//   2. HD und SD werden gleich behandelt. Vorher setzte die Hover-Schleife die
+//      Flaeche auf die Groesse des HD-Bildes, und stopHoverAnim zeichnete danach
+//      das SD-Standbild bei (0,0) hinein — daher schrumpfte das Bild nach dem
+//      Hover in die linke obere Ecke und fiel von HD auf SD zurueck.
+// HD-Bilder sind auf denselben Gesamtumriss gepolstert wie die SD-Bilder und
+// fuellen die Flaeche deshalb ganz; ein SD-Bild wird an seiner Stelle in diesem
+// Umriss eingesetzt.
+function drawEntryFrameInto(e, frameIndex) {
+  const cv = e.activeCanvas;
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  const hd = getHDSpriteFrame(e, frameIndex);
+  if (hd) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(hd.img, 0, 0, cv.width, cv.height);
+    return;
+  }
+
+  ctx.imageSmoothingEnabled = false;
+  const al = entryAlignBox(e);
+  const frame = (e.frames || [])[frameIndex];
+  if (!frame || al.w <= 0 || al.h <= 0) {
+    if (frameIndex === 0 && e.canvas) ctx.drawImage(e.canvas, 0, 0, cv.width, cv.height);
+    return;
+  }
+  const sx = cv.width / al.w, sy = cv.height / al.h;
+  if (frame.canvas) {                       // Map-Icons: vorgerendert
+    ctx.drawImage(frame.canvas, 0, 0, frame.width * sx, frame.height * sy);
+    return;
+  }
+  const palKey = e.paletteSetId !== null ? String(e.paletteSetId) : 'grey';
+  const secKey = e.secondaryPaletteSetId !== null ? String(e.secondaryPaletteSetId) : null;
+  const b2Key = e.block2PaletteSetId !== null ? String(e.block2PaletteSetId) : null;
+  const r = renderCompositeFrame(frame, e.palette, palKey, e.secondaryPalette, secKey, e.block2Palette, b2Key);
+  if (!r) return;
+  ctx.drawImage(r.canvas,
+    ((r.offsetX || 0) - al.minX) * sx, ((r.offsetY || 0) - al.minY) * sy,
+    r.width * sx, r.height * sy);
+}
+
 function stopHoverAnim() {
   if (hoverAnimTimer) { clearInterval(hoverAnimTimer); hoverAnimTimer = null; }
   // Restore frame 0 on the card that was animating
   if (hoverAnimEntry) {
     const e = hoverAnimEntry;
-    if (e.activeCanvas && e.canvas) {
-      const ctx = e.activeCanvas.getContext('2d');
-      ctx.clearRect(0, 0, e.activeCanvas.width, e.activeCanvas.height);
-      ctx.drawImage(e.canvas, 0, 0);
-    }
+    // Standbild ueber denselben Weg wie der Aufbau der Karte — sonst faellt eine
+    // Animation mit HD-Kunst nach dem Hover auf SD zurueck.
+    drawEntryFrameInto(e, 0);
     e.animFrame = 0; e.animTick = 0;
     hoverAnimEntry = null;
   }
@@ -17032,21 +17160,26 @@ function buildOrphanSeqEntries() {
       rendered = renderSpriteFromDescriptor(desc, palette, palRes.block2Palette);
     }
 
+    const alignBox = framesAlignBox(frames);
     let displayCanvas = null, displayScale = 1;
-    if (rendered && rendered.canvas) {
+    if (rendered && rendered.canvas && alignBox.w > 0) {
       const maxW = 80;
-      displayScale = Math.min(4, rendered.width > 0 ? Math.floor(maxW / rendered.width) : 1) || 1;
+      displayScale = Math.min(4, Math.floor(maxW / alignBox.w)) || 1;
       displayCanvas = document.createElement('canvas');
-      displayCanvas.width = rendered.width * displayScale;
-      displayCanvas.height = rendered.height * displayScale;
+      displayCanvas.width = alignBox.w * displayScale;
+      displayCanvas.height = alignBox.h * displayScale;
       const dc = displayCanvas.getContext('2d');
       dc.imageSmoothingEnabled = false;
-      dc.drawImage(rendered.canvas, 0, 0, rendered.width * displayScale, rendered.height * displayScale);
+      dc.drawImage(rendered.canvas,
+        ((rendered.offsetX || 0) - alignBox.minX) * displayScale,
+        ((rendered.offsetY || 0) - alignBox.minY) * displayScale,
+        rendered.width * displayScale, rendered.height * displayScale);
     }
 
     out.push({
       animId: o.id,
       name,
+      _align: alignBox,
       orphanOffset: o.offset,
       orphanNeighbourName: o.neighbourName,
       canvas: displayCanvas,
@@ -17081,6 +17214,7 @@ function buildSpriteGallery() {
 
   setTimeout(() => {
     gfxRefRenderCache.clear();
+    gfxRefBoxCache.clear();
     animFramesCache.clear();
     _orphanSeqs = null; _orphanSeqById = null;   // bei neuem ROM neu scannen
     // Step 1: build palette reverse-map from all sprite types (cached — the pack
@@ -17138,23 +17272,31 @@ function buildSpriteGallery() {
       } else {
         rendered = renderSpriteFromDescriptor(desc, palette, block2Palette);
       }
+      // Die Karte bekommt den gemeinsamen Umriss ALLER Bilder, nicht den von
+      // Bild 0 — sonst muesste der Hover die Flaeche vergroessern, das Raster
+      // floesse um und die Karte rutschte unter der Maus weg.
+      const alignBox = framesAlignBox(frames);
       let displayCanvas = null;
       let displayScale = 1;
-      if (rendered && rendered.canvas) {
+      if (rendered && rendered.canvas && alignBox.w > 0) {
         const maxW = 80;
-        displayScale = Math.min(4, rendered.width > 0 ? Math.floor(maxW / rendered.width) : 1) || 1;
+        displayScale = Math.min(4, Math.floor(maxW / alignBox.w)) || 1;
         displayCanvas = document.createElement('canvas');
-        displayCanvas.width = rendered.width * displayScale;
-        displayCanvas.height = rendered.height * displayScale;
+        displayCanvas.width = alignBox.w * displayScale;
+        displayCanvas.height = alignBox.h * displayScale;
         const dc = displayCanvas.getContext('2d');
         dc.imageSmoothingEnabled = false;
-        dc.drawImage(rendered.canvas, 0, 0, rendered.width * displayScale, rendered.height * displayScale);
+        dc.drawImage(rendered.canvas,
+          ((rendered.offsetX || 0) - alignBox.minX) * displayScale,
+          ((rendered.offsetY || 0) - alignBox.minY) * displayScale,
+          rendered.width * displayScale, rendered.height * displayScale);
       }
 
       entries.push({
         animId,
         name,
         canvas: displayCanvas,
+        _align: alignBox,
         isGrey,
         paletteSetId: resolvedPaletteSetId,
         paletteAddr: resolvedPaletteAddr,
@@ -18229,18 +18371,18 @@ function buildSpriteCard(e) {
 
   if (e.canvas) {
     // Check for HD sprite frame 0
+    // Die Groesse wird hier EINMAL festgelegt und danach nie wieder angefasst.
     const hdFrame = getHDSpriteFrame(e, 0);
     const cv = document.createElement('canvas');
     if (hdFrame) {
       cv.width = hdFrame.img.width; cv.height = hdFrame.img.height;
       cv.style.cssText = 'max-width:112px;max-height:80px;';
-      cv.getContext('2d').drawImage(hdFrame.img, 0, 0);
     } else {
       cv.width = e.canvas.width; cv.height = e.canvas.height;
       cv.style.cssText = 'image-rendering:pixelated;max-width:112px;max-height:80px;';
-      cv.getContext('2d').drawImage(e.canvas, 0, 0);
     }
     e.activeCanvas = cv; // animation loop draws updated frames here
+    drawEntryFrameInto(e, 0);
     card.appendChild(cv);
   } else {
     e.activeCanvas = null;
@@ -18263,12 +18405,14 @@ function buildSpriteCard(e) {
 
   // Hover animation: cycle frames on mouseenter, restore frame 0 on mouseleave
   if (e.frames && e.frames.length > 1 && e.activeCanvas) {
-    const cv = e.activeCanvas;
     card.addEventListener('mouseenter', () => {
       // Stop previous hover anim (restore its frame 0)
       stopHoverAnim();
       hoverAnimEntry = e;
       e.animFrame = 0; e.animTick = 0;
+      // Die Flaeche wird hier bewusst NICHT angefasst — sie hat seit dem Aufbau
+      // der Karte den gemeinsamen Umriss aller Bilder. Jede Groessenaenderung
+      // hier laesst das Raster umfliessen und die Karte unter der Maus wegrutschen.
       hoverAnimTimer = setInterval(() => {
         if (!e.activeCanvas) { clearInterval(hoverAnimTimer); hoverAnimTimer = null; return; }
         e.animTick++;
@@ -18277,32 +18421,7 @@ function buildSpriteCard(e) {
         if (e.animTick >= dur) {
           e.animTick = 0;
           e.animFrame = (e.animFrame + 1) % e.frames.length;
-          const nextFrame = e.frames[e.animFrame];
-          const scale = e.displayScale || 1;
-          // Check for HD frame
-          const hdFrame = getHDSpriteFrame(e, e.animFrame);
-          if (hdFrame) {
-            cv.width = hdFrame.img.width; cv.height = hdFrame.img.height;
-            const ctx = cv.getContext('2d');
-            ctx.imageSmoothingEnabled = true;
-            ctx.drawImage(hdFrame.img, 0, 0);
-          } else {
-            const ctx = cv.getContext('2d');
-            ctx.clearRect(0, 0, cv.width, cv.height);
-            ctx.imageSmoothingEnabled = false;
-          if (nextFrame.canvas) {
-            // Pre-rendered frame (map icons etc.)
-            ctx.drawImage(nextFrame.canvas, 0, 0, nextFrame.width * scale, nextFrame.height * scale);
-          } else {
-            const paletteKey = e.paletteSetId !== null ? String(e.paletteSetId) : 'grey';
-            const secPalKey = e.secondaryPaletteSetId !== null ? String(e.secondaryPaletteSetId) : null;
-            const b2PalKey = e.block2PaletteSetId !== null ? String(e.block2PaletteSetId) : null;
-            const rendered = renderCompositeFrame(nextFrame, e.palette, paletteKey, e.secondaryPalette, secPalKey, e.block2Palette, b2PalKey);
-            if (rendered) {
-              ctx.drawImage(rendered.canvas, 0, 0, rendered.width * scale, rendered.height * scale);
-            }
-          }
-          }
+          drawEntryFrameInto(e, e.animFrame);
         }
       }, 32);
     });

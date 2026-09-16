@@ -1,5 +1,68 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-16] — Bilder am gemeinsamen Ursprung ausrichten
+
+Viewer (`dkc2-viewer/index.html`), SD-Export und Galerie-Vorschau.
+
+**Anlass:** Beim Abspielen von `0x015B Auto Barrel Cannon Rotation` wanderte das Fass durchs
+Kader. Ursache: jedes Bild hat seinen eigenen Umriss **und** seinen eigenen Ursprung
+(`$02F8` ist 32×48 @ (-16,-28), `$0308` ist 43×32 @ (-21,-21)), und sowohl die Vorschau als
+auch der SD-Export haben jedes Bild für sich zentriert bzw. bei (0,0) abgesetzt.
+
+Gemessen an diesem ROM: **614 von 644 mehrbildrigen Animationen** betroffen, im schlimmsten
+Fall 131 Pixel (`Kudgel's Club`, `Klubba's Club Swing`), 71 Pixel bei `Blunderbuss`.
+
+**Der Pack-Export war nie betroffen** — `tiles[]` ist bildrelativ und `meta.offsetX/Y` hält
+fest, womit gepolstert wurde; das Zerschneiden ist in sich stimmig. Es ging um die Bilder,
+die zum Upscaler gehen: dort kostet ein wanderndes Motiv Qualität.
+
+### Was geändert wurde
+
+- **`gfxRefBox()`** — Umriss eines gfxRef im Deskriptor-Raum, dieselben Zahlen, die
+  `renderSpriteFromDescriptor` als `offsetX/offsetY/width/height` liefert, aber ohne ein
+  Pixel zu zeichnen.
+- **`framesAlignBox()` / `entryAlignBox()`** — gemeinsamer Umriss aller Bilder eines
+  Eintrags, inklusive `extraRefs` mit ihrem Weltversatz.
+- **SD-Export** richtet die Bilder daran aus (Einzelbilder und Sheet); `paddedWidth/Height`
+  ist jetzt der Gesamtumriss.
+- **Die Karte bekommt diese Größe beim Aufbau**, nicht erst beim Hover.
+- **`drawEntryFrameInto()`** — eine Stelle für Standbild, Hover-Bild und Wiederherstellung.
+
+### Zwei Regressionen auf dem Weg dahin, beide vom User im Spiel gefunden
+
+1. **Die erste Fassung vergrößerte die Zeichenfläche beim Hover.** Das Raster floss um, die
+   Karte rutschte unter der Maus weg, `mouseleave` feuerte, die Animation fing von vorn an —
+   `Seq 6EE1` sprang zwischen zwei Zeilen hin und her. **Die Fläche wird jetzt beim Aufbau
+   einmal festgelegt und danach nie wieder angefasst.** Deshalb kommt der Umriss aus den
+   Deskriptoren statt aus gerenderten Bildern: nur so ist er beim Aufbau umsonst zu haben.
+2. **Nach dem Hover schrumpfte das Standbild in die linke obere Ecke und fiel von HD auf SD
+   zurück.** Die Hover-Schleife stellte die Fläche auf die Größe des HD-Bildes um, und
+   `stopHoverAnim` zeichnete danach das SD-Standbild bei (0,0) hinein. Jetzt gehen alle drei
+   Wege durch `drawEntryFrameInto()`: HD-Bilder füllen die Fläche ganz (sie sind auf denselben
+   Gesamtumriss gepolstert), SD-Bilder werden an ihrer Stelle in diesem Umriss eingesetzt.
+
+### Bekannt und NICHT angefasst
+
+- **`renderCompositeFrame` wendet `frame.primaryOffset` nicht an** (aus den Befehlen `$87`
+  und `$8b`). Das würde die `tiles[]`-Koordinaten genau der Bilder verschieben, die diese
+  Befehle benutzen, und damit bereits upgescalte Container-Kunst fehlausrichten. Eigener
+  Vorgang, eigener Test.
+- **HD-Kunst im Container trägt die alte, zentrierte Polsterung.** Bei einer Animation, die
+  teils HD und teils SD ist, kann die Vorschau deshalb weiter wackeln; das verschwindet erst
+  beim nächsten Export/Upscale dieses Sets. Im Spiel ist nichts davon betroffen.
+
+### Offen: die Fassdrehung selbst
+
+`0x015B` wiederholt bei Bild 11–14 exakt die gfxRefs von Bild 3–6 (`$0300 $0304 $0308 $030C`,
+Rohbytes geprüft). Dreht man diese vier um 180°, läuft die Drehung durch statt
+zurückzuspringen — und 180° ist auf dem SNES H-Flip plus V-Flip, also mit den
+OAM-Attributbits erreichbar. **Belegt ist das nicht:** die Bytefolge trägt keine
+Flip-Information, und die vorhandene OAM-Aufzeichnung ist ein gefilterter Auszug ohne das
+Fass. Ein kurzer Lauf mit `SNES_HD_OAMCAP=1` würde es entscheiden. Für den Pack ist es
+folgenlos — Bild 11–14 bringen keine neuen Kacheln, und Mesen kann Flips seit `2209d5f3`.
+
+---
+
 ## [2026-09-16] — 39 Animationen, die die Galerie nie zeigen konnte
 
 Viewer (`dkc2-viewer/index.html`) + Mesen (`S39`, Commit `1954cc80`).
