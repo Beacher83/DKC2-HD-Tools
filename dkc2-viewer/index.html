@@ -401,6 +401,8 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       </label>
       <label style="display:flex;align-items:center;gap:4px;" title="Objekte, von denen mindestens ein Animationsbild vollständige Pixel in snes_hd_spritemiss.txt hat. Einzelne unvollständige Bilder werden beim Export übersprungen."><input type="checkbox" id="rtOnlyDrawable" checked> nur zeichenbare</label>
       <label style="display:flex;align-items:center;gap:4px;" title="Objekte aus einer einzelnen 8x8-Kachel — meist Bruchstücke."><input type="checkbox" id="rtHideTiny" checked> 8x8 ausblenden</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Fliegende Einzelkacheln nach ihrer Drehung gruppieren statt nach Nachbarschaft. Aus der OAM-Aufzeichnung verfolgt, welche Kachel auf welche folgt — aus hunderten zufälliger Flugformationen werden die tatsächlichen Rotationen."><input type="checkbox" id="rtGroupParticles" checked> Partikel als Drehung</label>
+      <label style="display:flex;align-items:center;gap:4px;" title="Objekte ausblenden, deren Kacheln ALLE in einem Sprite-Deskriptor des ROMs stehen — die gehören in die Sprite-Galerie, wo sie ganze Bilder haben (Lava, Feuerbälle, Kleevers Funken und Griff). Übrig bleibt Kunst, zu der das ROM keinen Deskriptor führt: genau wofür diese Ansicht gedacht ist."><input type="checkbox" id="rtOnlyNoDesc" checked> nur ohne Deskriptor</label>
       <label style="display:flex;align-items:center;gap:4px;" title="Schneidet die Ziffernkacheln (HUD gold, Fass weiß) aus jedem Objekt heraus — die zehn Ziffern je Schrift liegen auf der Seite 🔢 Zahlen. Was vom Zähler übrig bleibt, bleibt hier stehen: Diddy-Kopf, Banane, Stern."><input type="checkbox" id="rtHideNumbers" checked> Zahlen ausblenden</label>
       <label style="display:flex;align-items:center;gap:4px;color:#8bc34a;" title="Beim Export nur die wenigsten Animationsbilder schicken, die zusammen jede Kachel enthalten. Der Pack ist kachelbasiert — ein Bild, das keine neue Kachel bringt, kostet Rechenzeit und erzeugt eine zweite HD-Fassung derselben Kachel, von der der Import (erste-gewinnt) willkürlich eine behält."><input type="checkbox" id="rtCoverOnly" checked> nur Abdeckung exportieren</label>
       <label style="display:flex;align-items:center;gap:4px;" title="Nur Objekte mit mehr als einem Animationsbild — Fackeln, Flagge, Wespen, Rauch."><input type="checkbox" id="rtOnlyAnimated"> nur animierte</label>
@@ -3424,6 +3426,36 @@ function gfxRefTileHashes(rom, gfxRef) {
   }
   gfxRefTileHashCache.set(gfxRef, out);
   return out;
+}
+
+// Alle Kachel-Hashes, die irgendein Sprite-Deskriptor im ROM traegt.
+//
+// Die Laufzeit-Ansicht ist fuer Kunst, zu der das ROM KEINEN Deskriptor fuehrt --
+// so steht es im Knopf-Tooltip und so war sie gemeint. Tatsaechlich zeigt sie
+// alles, was in spritemiss steht, also auch Lava, Feuerbaelle, Kleevers Funken
+// und den Griff: die haben Deskriptoren und damit Eintraege in der Galerie, wo
+// sie ganze Bilder haben statt loser 8x8-Zellen. Aus der Galerie hochskaliert
+// wird ihre Kunst besser, und die Laufzeit-Liste wird wieder ueberschaubar.
+//
+// Einmal gerechnet und gemerkt. gfxRefTileHashes hat einen eigenen Cache, der
+// den Grossteil traegt, sobald die Gfx-Gruppen einmal gelaufen sind.
+let _descHashSet = null;
+function descriptorTileHashes(rom) {
+  if (_descHashSet) return _descHashSet;
+  if (!rom) return null;
+  const t0 = performance.now();
+  const s = new Set();
+  let refs = 0;
+  for (let g = 0; g < 0x8000; g += 4) {
+    const hs = gfxRefTileHashes(rom, g);
+    if (hs.length) refs++;
+    for (const h of hs) s.add(h);
+  }
+  _descHashSet = s;
+  console.log(`[laufzeit] ${s.size} Kachel-Hashes aus ${refs} Sprite-Deskriptoren ` +
+              `(${Math.round(performance.now() - t0)} ms) — Objekte, die NUR daraus bestehen, ` +
+              `gehören in die Sprite-Galerie und werden ausgeblendet.`);
+  return s;
 }
 
 const UNUSED_GFX_ID_BASE = 0xD000;   // unter den verwaisten Sequenzen (0xE000)
@@ -8936,6 +8968,11 @@ function sprMissKnowsHash(hash) {
 function sprTileIsHole(t) {
   return !rtTilePixels(`${t.hash}_P${t.pal}`) && sprMissKnowsHash(t.hash);
 }
+// Does this tile contribute any pixels at all? A phase made entirely of tiles
+// nobody ever captured draws an empty card -- see drawablePhases below.
+function rtTileHasPixels(t) {
+  return !!rtTilePixels(`${t.hash}_P${t.pal}`);
+}
 
 // The pixels of one runtime tile: the recording first, then the digits and
 // counter symbols that ship WITH the viewer in zahlen_groundtruth.js. That set is
@@ -9263,8 +9300,17 @@ function buildOamObjects() {
     // reached spritemiss, while 59 of its 60 phases were complete. Every phase
     // leaves as its own PNG, so counting them one by one is also what the export
     // does — an object is worth showing as soon as one phase can be drawn.
+    // A phase also has to DRAW something. `sprTileIsHole` only reports a tile
+    // whose hash spritemiss knows under another palette; a hash it has never
+    // seen at all counts as a blank cell, which is right for the banana's empty
+    // quadrant but wrong for an object where EVERY tile is unknown. Those are
+    // the objects whose art is already in the pack -- the pack is exactly why
+    // they never produced a miss -- and they showed up as empty cards that
+    // "nur zeichenbare" could not hide, because nothing about them was a hole.
+    // The export already skips them (`if (!drew) continue;`); only the gallery
+    // offered them for upscaling.
     obj.drawablePhases = spriteMissByHash
-      ? obj.phases.filter(ph => !ph.some(sprTileIsHole)).length : 0;
+      ? obj.phases.filter(ph => !ph.some(sprTileIsHole) && ph.some(rtTileHasPixels)).length : 0;
     oamObjects.push(obj);
   }
   const byId = new Map();
@@ -9447,7 +9493,8 @@ function fontObjects() {
       phases: [tiles], phaseCount: 1,
       allTiles,
       missing: spriteMissByHash ? tiles.filter(sprTileIsHole).length : allTiles.length,
-      drawablePhases: spriteMissByHash ? (tiles.some(sprTileIsHole) ? 0 : 1) : 0,
+      drawablePhases: spriteMissByHash
+        ? ((tiles.some(sprTileIsHole) || !tiles.some(rtTileHasPixels)) ? 0 : 1) : 0,
     });
   }
   fontObjectsCache = out;
@@ -9615,6 +9662,224 @@ function rtSuggestCover(pool) {
   chosen.openLeft = need.size;
   chosen.alreadyHd = done.size;
   return chosen;
+}
+
+// ============================================================
+// Partikel nach ihrer Drehung gruppieren statt nach Nachbarschaft
+// ============================================================
+// Ein Partikelschwarm bricht die Nachbarschaftsgruppierung. Kleevers zerberstendes
+// Schwert wirft 158 verschiedene Splitterkacheln als lauter EINZELNE 8x8-Objekte
+// aus (gemessen: 10174 OAM-Eintraege, ausnahmslos W8 H8) -- daraus wurden 537
+// Karten, weil jede zufaellige Flugformation als eigenes Objekt zaehlt.
+//
+// Was wirklich zusammengehoert, steht in der Aufzeichnung: eine Scherbe behaelt
+// ihre Flugbahn und wechselt dabei ihr Bild. Der OAM-INDEX taugt zum Verfolgen
+// nicht -- das Spiel baut die Liste jeden Frame neu, und ueber den Index gemessen
+// ist die Nachfolger-Eindeutigkeit 0.44, also Zufall. Ueber die POSITION verfolgt
+// steigt sie auf 0.77, und es fallen 8 geschlossene Zyklen heraus: 16, 16, 13, 12
+// und viermal 8 Bilder. Der 13er ist der Knochen, den der User im Spiel kreiseln
+// sah und im Viewer als vier unverbundene Karten wiederfand.
+const RT_TRACK_DIST = 14;    // SD-Pixel, die ein Partikel je Frame hoechstens macht
+const RT_SUCC_MIN = 0.45;    // Anteil, ab dem ein Nachfolger als belegt gilt
+const RT_MIN_GROUP = 3;      // kleinere Gruppen verdraengen kein vorhandenes Objekt
+function rtParticleAnimations(frames) {
+  // 1) Partikel ueber die Frames verfolgen (Naechster-Nachbar mit Vorhersage).
+  const tracks = [];
+  let active = [];
+  let prevF = null;
+  for (const fr of frames) {
+    if (prevF !== null && fr.frame - prevF > 3) { tracks.push(...active); active = []; }
+    prevF = fr.frame;
+    const ents = fr.ents.filter(e => e.hashes.length === 1);
+    // Eine Bahn bleibt bei IHRER Palette. Ohne das springt der Tracker zwischen
+    // Partikeln, die nur zufaellig zusammen fliegen: Kleevers Funken (P4) und die
+    // Klingensplitter (P3) tun das die ganze Zeit, und die Ketten wurden dadurch
+    // aus beidem gemischt -- im Viewer sichtbar als Funken in fast jeder Drehung.
+    const pairs = [];
+    active.forEach((t, ti) => ents.forEach((e, ei) => {
+      if (e.pal !== t.pal) return;
+      const d = Math.abs(e.x - t.px) + Math.abs(e.y - t.py);
+      if (d <= RT_TRACK_DIST) pairs.push([d, ti, ei]);
+    }));
+    pairs.sort((a, b) => a[0] - b[0]);
+    const usedT = new Set(), usedE = new Set();
+    for (const [, ti, ei] of pairs) {
+      if (usedT.has(ti) || usedE.has(ei)) continue;
+      usedT.add(ti); usedE.add(ei);
+      const t = active[ti], e = ents[ei];
+      const vx = e.x - t.x, vy = e.y - t.y;
+      t.x = e.x; t.y = e.y; t.px = e.x + vx; t.py = e.y + vy; t.miss = 0;
+      t.seq.push({ hash: e.hashes[0], pal: e.pal });
+      t.pal = e.pal;
+    }
+    const keep = [];
+    active.forEach((t, ti) => {
+      if (usedT.has(ti)) { keep.push(t); return; }
+      if (++t.miss <= 2) { t.px += t.px - t.x; t.py += t.py - t.y; keep.push(t); }
+      else tracks.push(t);
+    });
+    active = keep;
+    ents.forEach((e, ei) => {
+      if (usedE.has(ei)) return;
+      active.push({ x: e.x, y: e.y, px: e.x, py: e.y, miss: 0, pal: e.pal,
+                    seq: [{ hash: e.hashes[0], pal: e.pal }] });
+    });
+  }
+  tracks.push(...active);
+
+  // 2) Nachfolger zaehlen, ueber Bahnen mit genug Sichtungen.
+  const succ = new Map();
+  const palOf = new Map();
+  for (const t of tracks) {
+    for (const s of t.seq) if (!palOf.has(s.hash)) palOf.set(s.hash, s.pal);
+    if (t.seq.length < 6) continue;
+    const u = [];
+    for (const s of t.seq) if (!u.length || u[u.length - 1] !== s.hash) u.push(s.hash);
+    for (let i = 0; i + 1 < u.length; i++) {
+      if (!succ.has(u[i])) succ.set(u[i], new Map());
+      const m = succ.get(u[i]);
+      m.set(u[i + 1], (m.get(u[i + 1]) || 0) + 1);
+    }
+  }
+  const next = new Map();
+  for (const [a, m] of succ) {
+    let best = null, n = 0, tot = 0;
+    for (const [b, k] of m) { tot += k; if (k > n) { n = k; best = b; } }
+    if (best && n >= 2 && n / tot >= RT_SUCC_MIN) next.set(a, best);
+  }
+
+  // 3) Der Nachfolger-Graph ist FUNKTIONAL -- jede Kachel hat hoechstens einen
+  // Nachfolger -- und damit sind seine Zyklen eindeutig bestimmt. Die erste
+  // Fassung suchte sie gierig und bekam je nach Startreihenfolge ein anderes
+  // Ergebnis (JS 6 Zyklen, die Python-Gegenrechnung 8). Deshalb: erst ALLE
+  // Zyklen bestimmen, dann die Ketten, die in sie hineinlaufen, dann der Rest.
+  const done = new Set(), inCycle = new Set(), cycles = [];
+  for (const start of next.keys()) {
+    if (done.has(start)) continue;
+    const path = [], pos = new Map();
+    let cur = start;
+    while (cur !== undefined && !done.has(cur)) {
+      // Mindestens drei Bilder, fuer Zyklen wie fuer Ketten: ein Zweierwechsel
+      // ist zu wenig Beleg, um ein vorhandenes Objekt zu verdraengen -- genau
+      // solche Kleingruppen haben die erste Fassung mit Karten ueberschwemmt.
+      if (pos.has(cur)) {
+        const cyc = path.slice(pos.get(cur));
+        if (cyc.length >= RT_MIN_GROUP) { cycles.push(cyc); cyc.forEach(h => inCycle.add(h)); }
+        break;
+      }
+      pos.set(cur, path.length); path.push(cur); cur = next.get(cur);
+    }
+    path.forEach(h => done.add(h));
+  }
+  // Ketten beginnen dort, wo nichts hinfuehrt: sonst waere ein Stueck davon
+  // doppelt vergeben und die laengere Kette bliebe unerkannt.
+  const indeg = new Map();
+  for (const b of next.values()) indeg.set(b, (indeg.get(b) || 0) + 1);
+  const groups = cycles.map(c => ({ kind: 'cycle', tiles: c }));
+  const taken = new Set(inCycle);
+  for (const h of next.keys()) {
+    if (taken.has(h) || indeg.get(h)) continue;
+    const path = []; let cur = h;
+    while (cur !== undefined && !taken.has(cur)) { path.push(cur); taken.add(cur); cur = next.get(cur); }
+    if (path.length >= RT_MIN_GROUP) groups.push({ kind: 'chain', tiles: path });
+    else path.forEach(x => taken.delete(x));
+  }
+  // Kacheln ohne belegten Nachfolger bekommen KEINE eigene Karte. Die erste
+  // Fassung gab sie aus und entfernte dafuer die Nachbarschaftsobjekte -- das
+  // waren 1811 neue Karten ohne Animation, schlechter als vorher. Wo das
+  // Tracking nichts belegt, bleibt die alte Gruppierung zustaendig.
+  return groups.map(g => ({ ...g, pals: g.tiles.map(h => palOf.get(h) || 0) }));
+}
+
+// Aus den Gruppen Galerie-Objekte bauen: eine Drehung wird EINE Karte mit einer
+// Phase je Bild, genau wie eine Animation der Sprite-Galerie. Einzelbilder, fuer
+// die das Tracking keinen Nachfolger belegen konnte, bekommen ihre eigene Karte --
+// sonst waeren sie ueber diese Ansicht nicht mehr erreichbar.
+// Der Cache haengt an der Aufzeichnung, nicht nur am ersten Aufruf: `drawablePhases`
+// wird aus `spriteMissByHash` berechnet, und wenn die Gruppen einmal gebaut wurden,
+// BEVOR spritemiss geladen war, stand dort ueberall 0 -- und der standardmaessig
+// gesetzte Haken "nur zeichenbare" hat jede einzelne Drehung ausgeblendet, fuer den
+// Rest der Sitzung. Dasselbe Muster wie bei sprMissKnowsHash weiter oben.
+let _rtParticleObjs = null, _rtParticleFor = undefined;
+function rtParticleObjects() {
+  if (_rtParticleObjs && _rtParticleFor === spriteMissByHash) return _rtParticleObjs;
+  if (!oamFrames) return null;
+  const byGfx = new Map();
+  for (const f of oamFrames) {
+    if (!byGfx.has(f.gfx)) byGfx.set(f.gfx, []);
+    byGfx.get(f.gfx).push(f);
+  }
+  const objs = [], covered = new Set();
+  const t0 = performance.now();
+  for (const [gfx, frames] of byGfx) {
+    for (const g of rtParticleAnimations(frames)) {
+      let tiles = g.tiles.map((h, i) => ({ hash: h, pal: g.pals[i], x: 0, y: 0 }));
+      // Nur belegte Drehungen und Folgen verdraengen die alten Objekte.
+      for (const t of tiles) covered.add(`${t.hash}_P${t.pal}`);
+      // Ein Zyklus hat keinen natuerlichen Anfang -- auf die kleinste Kachel
+      // gedreht, damit die id nicht von der Durchlaufreihenfolge abhaengt.
+      if (g.kind === 'cycle') {
+        let k = 0;
+        for (let i = 1; i < tiles.length; i++) if (tiles[i].hash < tiles[k].hash) k = i;
+        tiles = tiles.slice(k).concat(tiles.slice(0, k));
+      }
+      const phases = tiles.map(t => [t]);
+      const allTiles = [...new Set(tiles.map(t => `${t.hash}_P${t.pal}`))];
+      const label = g.kind === 'cycle' ? `Drehung${tiles.length}` : `Folge${tiles.length}`;
+      objs.push({
+        id: `G${gfx}-${label}-${tiles[0].hash.slice(0, 4)}`,
+        gfx, w: 8, h: 8, particle: true, cycle: g.kind === 'cycle',
+        pals: [...new Set(tiles.map(t => t.pal))].sort((a, b) => a - b),
+        phases, phaseCount: phases.length, tiles: phases[0], cellCount: 1,
+        allTiles, seen: tiles.length,
+        missing: spriteMissByHash ? tiles.filter(sprTileIsHole).length : allTiles.length,
+        drawablePhases: spriteMissByHash
+          ? phases.filter(ph => !ph.some(sprTileIsHole) && ph.some(rtTileHasPixels)).length : 0,
+      });
+    }
+  }
+  // Reste: Kacheln, die das Tracking gesehen hat, die aber in keiner Drehung
+  // stehen UND keinen Deskriptor haben. Jede einzelne haelt sonst ein altes
+  // Nachbarschaftsobjekt am Leben -- und das schleppt dessen Deskriptor-Kunst
+  // mit in den Export. Beim ersten Versuch bekamen ALLE ungruppierten Kacheln
+  // eine Karte, das waren 1811; mit der Deskriptor-Bedingung sind es 17 im
+  // ganzen Lauf. Sie bekommen eine eigene Karte, damit die alten Klumpen
+  // vollstaendig wegfallen koennen.
+  const desc = descriptorTileHashes(rom);
+  for (const [gfx, frames] of byGfx) {
+    const seen = new Map();
+    for (const f of frames) for (const e of f.ents) {
+      if (e.hashes.length === 1) seen.set(`${e.hashes[0]}_P${e.pal}`, e);
+    }
+    for (const [key, e] of seen) {
+      const hash = e.hashes[0];
+      if (covered.has(key) || (desc && desc.has(hash))) continue;
+      const tile = { hash, pal: e.pal, x: 0, y: 0 };
+      covered.add(key);
+      objs.push({
+        id: `G${gfx}-Scherbe-${hash.slice(0, 4)}`,
+        gfx, w: 8, h: 8, particle: true, cycle: false,
+        pals: [e.pal], phases: [[tile]], phaseCount: 1, tiles: [tile], cellCount: 1,
+        allTiles: [key], seen: 1,
+        missing: spriteMissByHash ? [tile].filter(sprTileIsHole).length : 1,
+        drawablePhases: spriteMissByHash
+          ? ([[tile]].filter(ph => !ph.some(sprTileIsHole) && ph.some(rtTileHasPixels)).length) : 0,
+      });
+    }
+  }
+  _rtParticleObjs = { objs, covered };
+  _rtParticleFor = spriteMissByHash;
+  const cyc = objs.filter(o => o.cycle).length;
+  const sng = objs.filter(o => o.phaseCount === 1).length;
+  const drawable = objs.filter(o => o.drawablePhases > 0).length;
+  if (!spriteMissByHash) console.warn('[laufzeit] Partikel-Gruppen ohne geladene spritemiss gebaut — ' +
+                                      'alle gelten als nicht zeichenbar. Werden neu gebaut, sobald sie da ist.');
+  console.log(`[laufzeit] Partikel-Tracking: ${cyc} Drehungen, ${objs.length - cyc - sng} Folgen ` +
+              `und ${sng} Einzelreste (${drawable} zeichenbar) ` +
+              `aus ${covered.size} Kacheln (${Math.round(performance.now() - t0)} ms). Sie ersetzen die ` +
+              `Nachbarschaftsobjekte, die nur aus diesen Kacheln bestehen; alles ohne belegten ` +
+              `Nachfolger bleibt bei der alten Gruppierung.`);
+  return _rtParticleObjs;
 }
 
 // ============================================================
@@ -18030,14 +18295,43 @@ function rtFilteredObjects() {
   const hideTiny = document.getElementById('rtHideTiny')?.checked === true;
   const searchRaw = (document.getElementById('rtSearch')?.value || '').trim().toUpperCase();
   const onlyAnimated = document.getElementById('rtOnlyAnimated')?.checked === true;
-  const pool = document.getElementById('rtHideNumbers')?.checked !== false
+  // Nur ausblenden, wenn JEDE Kachel einen Deskriptor hat: ein Objekt, das die
+  // Nachbarschaftsgruppierung aus Deskriptor-Kunst UND deskriptorloser Kunst
+  // zusammengesetzt hat, muss sichtbar bleiben, sonst ist die zweite Haelfte
+  // ueber diese Ansicht nicht mehr erreichbar.
+  const descSet = document.getElementById('rtOnlyNoDesc')?.checked !== false
+    ? descriptorTileHashes(rom) : null;
+  let pool = document.getElementById('rtHideNumbers')?.checked !== false
     ? rtObjectsWithoutDigits() : oamObjects;
+  // Partikel nach ihrer Drehung statt nach Nachbarschaft: die Objekte, die NUR
+  // aus getrackten Partikelkacheln bestehen, weichen den Animationen. Alles
+  // andere -- Weltkartenschrift, Schaedelwagen, Fackeln -- bleibt unberuehrt,
+  // denn dort traegt die Nachbarschaft die Bedeutung.
+  if (document.getElementById('rtGroupParticles')?.checked !== false) {
+    const pa = rtParticleObjects();
+    if (pa) {
+      // Ein Objekt faellt weg, wenn JEDE seiner Kacheln anderswo erreichbar ist:
+      // entweder in einer Drehung, oder ueber einen Deskriptor in der Galerie.
+      // Der Kleever-Fall braucht beides zusammen -- die Nachbarschaft hat dort
+      // Splitter (getrackt) mit Funken (Deskriptor) zu einem 66x101-Klumpen
+      // verschmolzen, und mit nur einer der beiden Bedingungen blieb er stehen.
+      const reach = (k) => pa.covered.has(k) || (descSet && descSet.has(k.split('_')[0]));
+      // Die Drehungen nach VORN. Die Galerie sortiert nicht, sie zeigt die Liste
+      // in ihrer Reihenfolge -- angehaengt standen sie hinter zweihundert alten
+      // Karten und waren damit praktisch unsichtbar.
+      pool = pa.objs.concat(pool.filter(o => !o.allTiles.every(reach)));
+    }
+  }
   return pool.filter(o => {
     if (gfxSel !== 'all' && String(o.gfx) !== gfxSel) return false;
     if (palSel !== 'all' && !o.pals.includes(Number(palSel))) return false;
     if (onlyDrawable && o.drawablePhases === 0) return false;
-    if (hideTiny && o.w <= 8 && o.h <= 8) return false;
+    // Eine Drehung ist 8x8 gross und trotzdem kein Bruchstueck -- sie war der
+    // Grund, die Partikel ueberhaupt zu gruppieren. Ohne diese Ausnahme wirft
+    // der standardmaessig gesetzte Haken genau die neuen Karten wieder weg.
+    if (hideTiny && !o.particle && o.w <= 8 && o.h <= 8) return false;
     if (onlyAnimated && o.phaseCount < 2) return false;
+    if (descSet && o.allTiles.every(k => descSet.has(k.split('_')[0]))) return false;
     if (document.getElementById('rtOnlyKeep')?.checked === true && !oamKeepList.has(o.id)) return false;
     if (searchRaw && !o.id.toUpperCase().includes(searchRaw)
         && !o.allTiles.some(k => k.startsWith(searchRaw))) return false;
@@ -18878,7 +19172,8 @@ document.getElementById('spriteShowGrey').addEventListener('change', renderSprit
 // All of these are pure DISPLAY filters now. The grouping itself has no knobs
 // left — OAM says what an object is, so there is nothing to tune.
 for (const id of ['rtGfxFilter', 'rtPalSel', 'rtOnlyDrawable', 'rtHideTiny',
-                  'rtHideNumbers', 'rtOnlyAnimated', 'rtOnlyKeep', 'rtShowHd']) {
+                  'rtHideNumbers', 'rtOnlyAnimated', 'rtOnlyKeep', 'rtShowHd',
+                  'rtOnlyNoDesc', 'rtGroupParticles']) {
   document.getElementById(id).addEventListener('change', renderRuntimeGallery);
 }
 // The search field had no listener since it was added — typing only took effect

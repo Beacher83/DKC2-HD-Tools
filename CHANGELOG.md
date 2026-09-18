@@ -1,5 +1,216 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-18] — Partikel nach ihrer Drehung gruppieren statt nach Nachbarschaft
+
+Viewer (`dkc2-viewer/index.html`). Kleevers zerberstendes Schwert wirft **158 verschiedene
+Splitterkacheln** aus — und erzeugte daraus **537 Karten**, weil jede zufällige Flugformation
+als eigenes Objekt zählte. Der User: „so kann ich das nicht machen."
+
+**Warum die Nachbarschaft hier scheitert.** Gemessen an der OAM-Aufzeichnung: 10.174 Einträge,
+**ausnahmslos W8 H8** — jeder Splitter ist ein eigenes 8x8-Objekt, im Schnitt 28 gleichzeitig,
+maximal 54. Nachbarschaft trägt hier also keine Bedeutung, sie verbindet nur, was gerade
+nebeneinander fliegt. (Für Weltkartenschrift, Schädelwagen und Fackeln trägt sie Bedeutung —
+deshalb bleibt sie dort unangetastet.)
+
+**Was stattdessen trägt: die Flugbahn.** Eine Scherbe behält ihre Bahn und wechselt dabei ihr
+Bild. Der OAM-INDEX taugt zum Verfolgen nicht — das Spiel baut die Liste jeden Frame neu:
+
+| Verfolgung über | Nachfolger-Eindeutigkeit (Median) | Kacheln mit klarem Nachfolger | geschlossene Zyklen |
+|---|---|---|---|
+| OAM-Index | 0,44 (Zufall) | 3 von 156 | 0 |
+| **Position** (Nächster-Nachbar + Geschwindigkeitsvorhersage) | **0,77** | **69 von 158** | **6** |
+
+`rtParticleAnimations()` verfolgt die Partikel, zählt die Nachfolger über die Bahnen und
+zerlegt den Nachfolger-Graphen. Der ist **funktional** — jede Kachel hat höchstens einen
+Nachfolger —, also sind seine Zyklen eindeutig bestimmt; die erste Fassung suchte sie gierig
+und bekam je nach Startreihenfolge ein anderes Ergebnis.
+
+**Zwei Korrekturen nach dem ersten Lauf im Viewer** — er lieferte 269 Animationen und 1811
+Einzelscherben, und Kleevers Funken steckten in fast jeder Drehung:
+
+1. **Eine Bahn bleibt bei ihrer Palette.** Splitter (P3) und Funken (P4) fliegen dieselben
+   sechs Sekunden durchs selbe Bild; ohne Palettenbindung sprang der Tracker zwischen ihnen
+   und die Ketten wurden aus beidem gemischt.
+2. **Kacheln ohne belegten Nachfolger bekommen keine eigene Karte.** Die erste Fassung gab sie
+   aus und entfernte dafür die Nachbarschaftsobjekte — 1811 Karten ohne Animation, schlechter
+   als vorher. Wo das Tracking nichts belegt, bleibt die alte Gruppierung zuständig.
+   Dazu eine Mindestgröße von drei Bildern, für Zyklen wie für Ketten.
+
+**Das Ergebnis für die Splitter:**
+
+| | |
+|---|---|
+| 7 Drehungen | 16, 16, **13**, 12, 8, 8, 8 Bilder |
+| 11 Folgen | 10, 9, 8, 8, 6, 6, 5, 3, 3, 3, 3 |
+| **Karten gesamt** | **18 statt 537** |
+
+Die 13er-Drehung ist der „Knochen", den der User im Spiel kreiseln sah und im Viewer als vier
+unverbundene Karten wiederfand (`938A`, `66D9`, `0E69`, `01E1` — Bilder 2, 3, 4 und 1
+derselben Drehung). Die von ihm als „nicht animiert" eingestufte `A40CB4` ist Bild 9 davon.
+
+Neuer Haken **„Partikel als Drehung"**, standardmäßig an. Ersetzt werden nur Objekte, deren
+Kacheln **alle** in einer belegten Drehung oder Folge stehen. Zyklen werden auf ihre kleinste
+Kachel gedreht, damit die id nicht von der Durchlaufreihenfolge abhängt.
+
+**Gegen die Aufzeichnung geprüft** (`tools/spritemiss/parttest.js`, Funktion aus `index.html`
+geschnitten, echte `snes_hd_oam.txt` mit 3.632 Frames), gegengerechnet mit einer unabhängigen
+Python-Fassung (`ref2.py`): Zykluslängen, Kettenlängen, 147 eingeordnete Kacheln und die
+13er-Drehung des Knochens **identisch in beiden Werkzeugen**.
+
+**Zwei weitere Korrekturen nach dem zweiten Lauf**, beide vom User an konkreten IDs gemeldet:
+
+3. **Die Drehungen waren unsichtbar.** Sie sind 8x8 groß, und der standardmäßig gesetzte Haken
+   „8x8 ausblenden" wirft genau solche Objekte weg („meist Bruchstücke"). Eine Drehung mit 13
+   Bildern ist kein Bruchstück — `o.particle` ist jetzt von diesem Filter ausgenommen.
+4. **Verschmolzene Klumpen blieben stehen.** `G32-66x101-P34-669D` trägt Splitterkacheln
+   (getrackt) UND Funken (Deskriptor); weil nicht *alle* Kacheln aus dem Tracking stammten,
+   wurde es nicht ersetzt, und die Funken blieben sichtbar. Ein Objekt fällt jetzt weg, wenn
+   jede seiner Kacheln **anderswo erreichbar** ist — in einer Drehung oder über einen
+   Deskriptor in der Galerie. Der Kleever-Fall braucht beide Bedingungen zusammen.
+
+5. **Der Cache hing am ersten Aufruf, nicht an der Aufzeichnung.** Wurden die Gruppen gebaut,
+   bevor `spritemiss` geladen war, stand in `drawablePhases` überall 0 — und „nur zeichenbare"
+   blendete jede Drehung aus, für den Rest der Sitzung. Jetzt an `spriteMissByHash` gebunden,
+   wie `sprMissKnowsHash` es im selben File schon macht.
+6. **Die Drehungen standen am Ende der Liste.** Die Galerie sortiert nicht, sie rendert die
+   Liste in ihrer Reihenfolge; `concat` hängte die neuen Karten hinter zweihundert alte. Sie
+   stehen jetzt vorn.
+
+7. **Die 13 Reste hielten 31 alte Karten am Leben** — und die schleppten 118 Funken- und 89
+   Griffkacheln mit in den Export, also Deskriptor-Kunst, die aus der Galerie hochskaliert
+   gehört. Der erste Export zeigte es: 59 Objekte, 365 distinkte Kacheln, davon 207 fremde.
+   Kacheln, die das Tracking gesehen hat, die aber in keiner Gruppe stehen **und** keinen
+   Deskriptor haben, bekommen jetzt eine eigene Karte (`Scherbe`). Gemessen sind das **17 im
+   ganzen Lauf** (13 im Gfxset 32, 4 in 53) — die Deskriptor-Bedingung ist der Unterschied zu
+   Korrektur 2, wo ALLE ungruppierten Kacheln eine Karte bekamen und es 1811 waren.
+
+Nachgerechnet über die Aufzeichnung: von den 9.006 Kacheln des Gfxsets 32 sind 145 in einer
+Drehung, 7.582 Deskriptor-Kunst, 1.266 beides — und **13 weder noch**. Nur Karten, die eine
+dieser 13 tragen, bleiben aus der alten Gruppierung stehen; sie müssen es auch, sonst wäre
+diese Kunst nicht mehr erreichbar.
+
+Nach den Korrekturen erneut geprüft (`parttest2.js`): keine Gruppe mischt Paletten, keine
+mischt Splitter und Funken, keine hat weniger als drei Bilder, und die 13er-Drehung des
+Knochens steht unverändert.
+
+Der erste Vergleich schlug fehl (JS 6 Zyklen, Python 8) — und zwar zu Recht: meine
+Python-Referenz hatte nur Splitterkacheln verfolgt, der Viewer verfolgt alle 8x8-Partikel,
+weil er vorher nicht wissen kann, welche ein Splitter ist. Mit gleicher Eingabe stimmen sie
+überein. Das ist der Wert der zweiten Rechnung: sie hat nicht den Code korrigiert, sondern
+meine Annahme darüber.
+
+---
+
+## [2026-09-18] — Laufzeit-Ansicht zeigt nur noch Kunst ohne Deskriptor
+
+Viewer (`dkc2-viewer/index.html`). Vom User gemeldet: in der Laufzeit-Ansicht haben sich
+Objekte angesammelt, die in die Sprite-Galerie gehören — Lava, Feuerbälle, Kleevers Funken und
+Griff standen zwischen den Klingensplittern.
+
+**Der Widerspruch stand im eigenen Tooltip.** Der Knopf verspricht „Laufzeit-Sprites **ohne
+ROM-Anim-Eintrag**". Gezeigt wurde aber alles, was in `snes_hd_spritemiss.txt` steht, und
+dort landet jede Kachel, die den Pack verfehlt — auch die von Animationen, die einen
+Deskriptor haben und in der Galerie mit vollständigen Bildern stehen. Aus der Galerie
+hochskaliert wird deren Kunst besser, weil der Upscaler ganze Bilder sieht statt loser
+8x8-Zellen.
+
+**Die Größe trennt sie nicht**, gemessen an der OAM-Aufzeichnung vom 18.09.:
+
+| | OAM-Größen |
+|---|---|
+| Klingensplitter | 8x8: 10174 (ausnahmslos) |
+| Lava `0x0218` | 8x8: 3973, 16x16: 2428 |
+| Feuerball `0x0214` | 16x16: 4236 |
+| Funken `0x022F` | 16x16: 1309, 8x8: 1005 |
+
+Das Kriterium ist der **Deskriptor**: `descriptorTileHashes()` läuft einmal über die Tabelle
+bei `$3C8000` und sammelt alle Kachel-Hashes, die irgendein Sprite-Deskriptor ins VRAM lädt
+(`gfxRefTileHashes`, derselbe Hash, auf den Mesen matcht). Neuer Haken **„nur ohne
+Deskriptor"**, standardmäßig an. Ein Objekt fällt nur weg, wenn **jede** seiner Kacheln dort
+steht — ein von der Nachbarschaftsgruppierung aus beidem zusammengesetztes Objekt bleibt
+sichtbar, sonst wäre seine deskriptorlose Hälfte über diese Ansicht nicht mehr erreichbar.
+
+**Nachtrag, gleich beim ersten Test gefunden:** der Haken war in der Liste bei
+`for (const id of ['rtGfxFilter', …])` nicht eingetragen, die alle Filter-Steuerelemente mit
+`renderRuntimeGallery` verbindet. Der Filter wirkte also beim nächsten Neuzeichnen, aber das
+Umschalten selbst löste keines aus — genau die Falle, die drei Zeilen darunter schon für das
+Suchfeld dokumentiert ist („had no listener since it was added"). Belegt an den Zahlen des
+Users: die Ansicht zeigte 537 Objekte, und 460 deskriptorlose + 78 gemischte = 538 — der
+Filter hatte also längst gegriffen, nur eben nicht auf Knopfdruck.
+
+**Gegen ROM und Aufzeichnung geprüft** (`tools/spritemiss/desctest.js`, Funktionen aus
+`index.html` geschnitten, ROM-Stub, 723 ms für den ganzen Durchlauf):
+
+| Probe | Ergebnis |
+|---|---|
+| Deskriptor-Hashes gesamt | 75.980 aus 3.915 Deskriptoren — identisch zur Python-Gegenrechnung |
+| Klingensplitter mit Deskriptor | 0 von 158 |
+| Lava `0x0218` | 73 von 73 im Set |
+| Feuerball `0x0214` | 128 von 128 |
+| Funken `0x022F` | 195 von 195 |
+| Griff `0x022E` | 89 von 89 |
+
+Die erste Fassung des Tests erwartete 64.953 und schlug fehl — das ist die Zahl, wenn man nur
+die Kacheln zählt, die ein Deskriptor auch **platziert**. `gfxRefTileHashes` zählt alle, die
+sein DMA-Block lädt; die Differenz sind 11.027 mitgeladene, aber nicht gesetzte Kacheln.
+Für den Filter nachgerechnet: von den 3.809 Hashes in `spritemiss` liegen **61** nur in der
+weiten Menge, und **alle 61** sind über eine Tabellenanimation in der Galerie erreichbar. Die
+weite Definition blendet also nichts aus, was die Galerie nicht zeigen kann.
+
+---
+
+## [2026-09-18] — „nur zeichenbare" blendete leere Karten nicht aus
+
+Viewer (`dkc2-viewer/index.html`). Vom User gemeldet: der Haken macht keinen Unterschied,
+leere Karten bleiben stehen (`G32-40x96-P3-D0FB`, `G32-29x40-P2-55D2`).
+
+**Root cause.** Zeichenbarkeit hing allein an `sprTileIsHole`:
+
+```js
+function sprTileIsHole(t) {
+  return !rtTilePixels(`${t.hash}_P${t.pal}`) && sprMissKnowsHash(t.hash);
+}
+```
+
+Eine Kachel ist nur dann ein Loch, wenn sie keine Pixel hat **und** spritemiss ihren Hash
+unter irgendeiner Palette kennt. Der Zusatz ist richtig und stammt vom Bananenzähler: dessen
+leeres Viertel (`0C8210784D8AF5A5_P0`) hat nie einen Miss ausgelöst, und es als Lücke zu
+werten hat den ganzen Zähler aus der Galerie geworfen.
+
+Falsch wird er, wenn **jede** Kachel eines Objekts unbekannt ist. Genau das sind die Objekte,
+deren Kunst schon im Pack liegt — der Pack ist ja der Grund, warum sie nie einen Miss
+erzeugen. Belegt an den gemeldeten Karten: zu `D0FB…` und `55D2…` gibt es keine Zeile in
+`snes_hd_spritemiss.txt`, aber vier Dateien im installierten Pack (`D0FBA89265953A5B_P1.png`,
+`D0FBF8F70DC2A0E4_P3.png`, `55D221FEA895C0A8_P1.png`, `55D223AD722811F5_P1.png`). Kein Loch,
+also „zeichenbar" — und die Karte zeichnet trotzdem nichts.
+
+**Fix.** Eine Phase muss zusätzlich etwas zeichnen:
+
+```js
+obj.drawablePhases = obj.phases.filter(ph => !ph.some(sprTileIsHole) && ph.some(rtTileHasPixels)).length;
+```
+
+Dieselbe Bedingung bei den Schrift-Objekten. `rtTileHasPixels` ist neu und sagt nur, ob es zu
+`hash_Ppal` überhaupt Pixel gibt.
+
+**Der Export war nie betroffen** — er hat solche Phasen längst übersprungen (`if (!drew)
+continue;`). Es war ausschließlich die Galerie, die sie zum Hochskalieren angeboten hat.
+
+**Gegen die echten Daten geprüft** (`scratchpad/drawtest.js`, Funktionen aus `index.html`
+geschnitten, 4.747 (hash,pal)-Schlüssel aus der echten Aufzeichnung geladen), fünf Fälle:
+
+| Fall | alt | neu |
+|---|---|---|
+| Phase aus zwei echten Splitterkacheln | zeichenbar | zeichenbar |
+| leere Karte `D0FB…` | **zeichenbar** | nicht zeichenbar |
+| leere Karte `55D2…` | **zeichenbar** | nicht zeichenbar |
+| Bananenfall: unbekannte Kachel neben gezeichneter | zeichenbar | zeichenbar |
+| echtes Loch (`14AB5E5AD9830E45_P1`, bekannt unter P0) | nicht zeichenbar | nicht zeichenbar |
+
+Die Regression, die den Bananenzähler damals gekostet hat, ist als vierter Fall mitgeprüft.
+
+---
+
 ## [2026-09-16] — Kunst, die zu gar keiner Animation gehört
 
 Viewer (`dkc2-viewer/index.html`). Eine Stufe unter den verwaisten Sequenzen.
