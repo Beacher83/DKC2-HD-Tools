@@ -1,5 +1,70 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-21] — Der Stern überlebt jetzt die Inhaltsfilter
+
+Viewer (`dkc2-viewer/index.html`). Die Merkliste (★) gab es längst — dauerhaft gespeichert,
+mit eigenem Filter und eigener Export-Funktion. Nur wurde ein gemerktes Objekt von den
+Inhaltsfiltern trotzdem weggeworfen.
+
+**Der Fall:** der Kleever-Hook `G32-16x32-P4-C236`. Alle seine Kacheln stehen in der
+Deskriptortabelle, also hat ihn der **standardmäßig gesetzte** Haken „nur ohne Deskriptor"
+aus der Laufzeit-Ansicht geworfen — und er fehlte in der Upscale-Runde mit den Splittern,
+obwohl er dort hingehörte. Markieren half nicht: ein Objekt, das man nicht sieht, kann man
+auch nicht markieren, und selbst markiert blieb es unsichtbar.
+
+**Jetzt:** ein Objekt mit Stern überlebt `nur zeichenbare`, `8x8 ausblenden`, `nur animierte`
+und `nur ohne Deskriptor`. Der Stern heißt „das will ich behalten" — und genau dann ist es
+falsch, wenn ein Standardhaken ihn wieder wegwirft.
+
+**Was der Stern NICHT aushält**, mit Absicht: Gfxset, Palette, Suchfeld und „nur gemerkte".
+Das sind ausdrückliche Einschränkungen des Users, keine Vorauswahl — ein Generalschlüssel
+würde die Filter unbrauchbar machen.
+
+Fünf Zeilen in der Filterkette, kein neues Bedienelement, keine neue Karte, keine Änderung an
+Reihenfolge oder Cache. Geprüft mit `tools/spritemiss/keeptest.js`: schneidet die Filterkette
+aus `index.html` und lässt sie gegen den Hook laufen — 14 Prüfungen, beide Richtungen
+(greift ohne Stern, greift nicht mit Stern, ausdrückliche Filter unverändert), alle bestanden.
+
+---
+
+## [2026-09-21] — Die Laufzeit-Karte sagt jetzt auch, wenn sie nur HALB in HD vorliegt
+
+Viewer (`dkc2-viewer/index.html`). Die Karte meldete `✓HD`, wenn **alle** Kacheln eines
+Objekts HD-Kunst hatten — und sonst **nichts**. Ein Objekt mit 6 von 8 Kacheln sah damit
+genauso aus wie eines mit null.
+
+**Was das gekostet hat.** Der Hook im Kleever-Kampf war im Spiel oben glatt und unten klotzig.
+Die Galerie konnte das nicht zeigen, also ging die Suche über Recorder, Hash-Vergleiche und
+schließlich einen eigenen `SNES_HD_OAMCAP`-Lauf — nur um herauszufinden, was die Karte
+gewusst hätte: das Objekt besteht aus zwei 16×16-Teilen mit zusammen 8 Kacheln, von denen
+**2 keine HD-Kunst haben**.
+
+**Jetzt drei Zustände statt zwei:**
+
+| | Label | Farbe |
+|---|---|---|
+| alle Kacheln HD | `✓HD` | grün |
+| **teilweise** | **`◐6/8 HD`** | **bernstein** |
+| keine | (nichts) | neutral |
+
+Der Tooltip nennt bei Teildeckung **die fehlenden Hashes namentlich** — das ist der
+Unterschied zwischen „da stimmt was nicht" und einer Kachel, die man exportieren kann. Und die
+Konsolenausgabe beim Klick markiert jetzt **beide** Seiten (`[HD im Container]` /
+`[FEHLT — kein HD]`); vorher stand nur am Vorhandenen etwas, und eine Zeile ohne Anmerkung
+liest sich zu leicht als „in Ordnung".
+
+**Bewusst klein gehalten.** Kein neues Bedienelement, keine neue Karte, keine Änderung an
+Reihenfolge oder Filtern, kein neuer Cache — die vier Fallstricke, die eine Viewer-Änderung
+sonst in sieben Nachbesserungsrunden treiben. Es werden nur eine vorhandene Label-Zeile, ein
+vorhandener Tooltip und eine vorhandene Konsolenausgabe erweitert. Die Deckung kommt aus
+`rtCoveredKeys()`, derselben Quelle, die `✓HD` schon benutzt.
+
+Geprüft mit `tools/spritemiss/cardtest.js`: schneidet `buildRuntimeCard` per Klammerzählung
+aus `index.html` und lässt sie gegen einen DOM-Stub laufen — 12 Prüfungen über alle drei
+Fälle, alle bestanden.
+
+---
+
 ## [2026-09-18] — Partikel nach ihrer Drehung gruppieren statt nach Nachbarschaft
 
 Viewer (`dkc2-viewer/index.html`). Kleevers zerberstendes Schwert wirft **158 verschiedene

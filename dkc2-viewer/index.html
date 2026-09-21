@@ -18325,13 +18325,22 @@ function rtFilteredObjects() {
   return pool.filter(o => {
     if (gfxSel !== 'all' && String(o.gfx) !== gfxSel) return false;
     if (palSel !== 'all' && !o.pals.includes(Number(palSel))) return false;
-    if (onlyDrawable && o.drawablePhases === 0) return false;
+    // Ein gemerktes Objekt ueberlebt die INHALTS-Filter. Der Stern heisst
+    // "das will ich behalten" -- und genau dann ist es falsch, wenn ein
+    // Standardhaken es wieder wegwirft. Der Kleever-Hook war der Fall, an dem
+    // das aufgefallen ist: alle seine Kacheln stehen in der Deskriptortabelle,
+    // also hat ihn "nur ohne Deskriptor" (Standard an) aus der Laufzeit-Ansicht
+    // geworfen, und er fehlte in der Upscale-Runde mit den Splittern. Gfxset,
+    // Palette, Suche und "nur gemerkte" gelten weiter: das sind ausdrueckliche
+    // Einschraenkungen des Users, keine Vorauswahl.
+    const kept = oamKeepList.has(o.id);
+    if (!kept && onlyDrawable && o.drawablePhases === 0) return false;
     // Eine Drehung ist 8x8 gross und trotzdem kein Bruchstueck -- sie war der
     // Grund, die Partikel ueberhaupt zu gruppieren. Ohne diese Ausnahme wirft
     // der standardmaessig gesetzte Haken genau die neuen Karten wieder weg.
-    if (hideTiny && !o.particle && o.w <= 8 && o.h <= 8) return false;
-    if (onlyAnimated && o.phaseCount < 2) return false;
-    if (descSet && o.allTiles.every(k => descSet.has(k.split('_')[0]))) return false;
+    if (!kept && hideTiny && !o.particle && o.w <= 8 && o.h <= 8) return false;
+    if (!kept && onlyAnimated && o.phaseCount < 2) return false;
+    if (!kept && descSet && o.allTiles.every(k => descSet.has(k.split('_')[0]))) return false;
     if (document.getElementById('rtOnlyKeep')?.checked === true && !oamKeepList.has(o.id)) return false;
     if (searchRaw && !o.id.toUpperCase().includes(searchRaw)
         && !o.allTiles.some(k => k.startsWith(searchRaw))) return false;
@@ -18366,12 +18375,22 @@ function buildRuntimeCard(obj, doneKeys) {
   const done = doneKeys || rtCoveredKeys();   // hoisted by the caller in bulk
   const coveredTiles = obj.allTiles.filter(k => done.has(k)).length;
   const allHd = coveredTiles === obj.allTiles.length;
+  // Was der Karte bis zum 21.09. fehlte: der Fall DAZWISCHEN. Sie meldete nur
+  // "vollstaendig HD" und schwieg sonst -- ein Objekt mit 6 von 8 Kacheln sah
+  // aus wie eines mit null. Genau daran ist der Kleever-Hook haengen geblieben:
+  // im Spiel war er oben glatt und unten klotzig, und die Galerie konnte das
+  // nicht zeigen. Die fehlenden Hashes zu benennen ist der Unterschied zwischen
+  // "da stimmt was nicht" und einer Kachel, die man exportieren kann.
+  const missingHd = obj.allTiles.filter(k => !done.has(k));
+  const partialHd = coveredTiles > 0 && !allHd;
   card.title = `${obj.id}\nGfxset ${obj.gfx} | ${obj.w}x${obj.h}px, ${obj.cellCount} OAM-Eintrag/-Einträge | ` +
                `Palette ${obj.pals.join(',')} | ${obj.seen}x gezeichnet` +
                (obj.phaseCount > 1 ? `\n${obj.phaseCount} Animationsbilder — alle werden exportiert` : '') +
                (obj.missing ? `\n⚠ ${obj.missing} Kacheln ohne Pixel in spritemiss` +
                  ` — ${obj.drawablePhases}/${obj.phaseCount} Animationsbilder vollständig` : '') +
-               (allHd ? `\n✓ liegt vollständig als HD im Container` : '') +
+               (allHd ? `\n✓ liegt vollständig als HD im Container (${coveredTiles}/${obj.allTiles.length})` : '') +
+               (partialHd ? `\n◐ nur ${coveredTiles} von ${obj.allTiles.length} Kacheln als HD im Container` +
+                 `\n   es fehlen: ${missingHd.map(k => k.split('_')[0].slice(0, 8)).join(', ')}` : '') +
                `\nKlick: alle Hashes in die Konsole`;
   card._runtimeObj = obj;
 
@@ -18466,8 +18485,10 @@ function buildRuntimeCard(obj, doneKeys) {
   label.style.cssText = 'font-size:9px;color:#aaa;text-align:center;line-height:1.2;';
   label.textContent = `${obj.w}x${obj.h}` +
                       (obj.phaseCount > 1 ? ` · ▶${obj.phaseCount}` : '') +
-                      ` · ${obj.seen}x` + (obj.missing ? ' ⚠' : '') + (allHd ? ' ✓HD' : '');
+                      ` · ${obj.seen}x` + (obj.missing ? ' ⚠' : '') +
+                      (allHd ? ' ✓HD' : partialHd ? ` ◐${coveredTiles}/${obj.allTiles.length} HD` : '');
   if (allHd) label.style.color = '#4caf50';
+  else if (partialHd) label.style.color = '#ffb300';
   card.appendChild(label);
 
   card.addEventListener('click', () => {
@@ -18480,7 +18501,15 @@ function buildRuntimeCard(obj, doneKeys) {
     obj.phases.forEach((ph, i) => {
       console.log(`   Bild ${i + 1}: ` + ph.map(t => t.hash.slice(0, 8)).join(' '));
     });
-    for (const k of obj.allTiles) console.log(`   ${k}` + (done.has(k) ? '  [HD im Container]' : ''));
+    // Beide Faelle benennen. Vorher stand nur am Vorhandenen etwas dran, und
+    // eine Zeile ohne Anmerkung liest sich zu leicht als "in Ordnung".
+    for (const k of obj.allTiles) {
+      console.log(`   ${k}` + (done.has(k) ? '  [HD im Container]' : '  [FEHLT — kein HD]'));
+    }
+    if (partialHd) {
+      console.log(`   → ${missingHd.length} von ${obj.allTiles.length} Kacheln ohne HD: ` +
+                  missingHd.join(' '));
+    }
   });
   return card;
 }
