@@ -2039,7 +2039,28 @@ function loadLevelBackground(rom, style, palette) {
     for (let i = 3; i < bg1Img.data.length; i += 4) {
       if (bg1Img.data[i] > 0) { hasPixels = true; break; }
     }
-    if (hasPixels) {
+    // BG1 nur auf dem Sub-Screen (Ghostly Grove: Sonnenstrahlen): die Hardware
+    // zeichnet die Ebene nicht, sondern ADDIERT sie per Farbmathematik auf den
+    // Main-Screen. Die Rohfarben sind deshalb dunkel und gesaettigt -- rot auf
+    // der blaugruenen Szene ergibt hell/weisslich. Deckend gezeigt sahen sie rot
+    // aus. Die Rohfarben sind trotzdem genau das, was hochskaliert werden muss:
+    // Mesen rechnet die Farbmathematik selbst, mit der HD-Kachel als Operand.
+    // Gespeichert und exportiert wird 'colormath' mit Quelle bg1 exakt wie
+    // 'bg1overlay' -- es aendert sich nur die Vorschau.
+    const bg1SubOnly = !(ppu.mainScreen & 0x01) && !!(ppu.subScreen & 0x01)
+        && ppu.colorMath.useSubScreen;
+    if (hasPixels && bg1SubOnly) {
+      const cm = ppu.colorMath;
+      fgData = {
+        imgData: bg1Img, widthPx: bg1W, heightPx: bg1H,
+        colorMathAlpha: cm.half ? 0.5 : 1.0,
+        colorMathSubtract: !!cm.subtract,
+        colorMathAdditive: !cm.subtract,
+        mode: 'colormath',
+        source: 'bg1'
+      };
+      console.log(`  BG1 foreground: nur Sub-Screen, per Farbmathematik ${cm.subtract ? 'subtrahiert' : 'addiert'}${cm.half ? ' (halb)' : ''}, ${bg1W}x${bg1H}px`);
+    } else if (hasPixels) {
       fgData = {
         imgData: bg1Img, widthPx: bg1W, heightPx: bg1H,
         colorMathAlpha: 1.0,
@@ -2974,6 +2995,10 @@ function renderLevel(tilePartsImg, tileMap, canvas, showGrid, bgData, fgData, sh
     // For subtract mode, use difference blend (approximate)
     if (fgData.colorMathSubtract) {
       ctx.globalCompositeOperation = 'difference';
+    } else if (fgData.colorMathAdditive) {
+      // Echte Addition wie die SNES-Farbmathematik (nur BG1-auf-Sub, siehe
+      // bg1SubOnly). Die aelteren Overlays bleiben bei ihren abgestimmten Alphas.
+      ctx.globalCompositeOperation = 'lighter';
     }
 
     for (let by = 0; by < canvasH; by += fgData.heightPx * hdScale) {
@@ -3252,9 +3277,15 @@ function walkAnimSequence(rom, startOffset, covered, strict, blocked) {
     } else if (cmd === 0x88 || cmd === 0x8c) { mark(5); pos += 5;
     } else if (cmd === 0x8d) {
       // 2 images + control param: dur + ref1(2) + ref2(2) + param(2)
+      // Anders als $85/$86/$89/$8A liegt hier Bild 1 VOR Bild 2 (kleinerer
+      // OAM-Index). Gemessen in snes_hd_oam_test.txt: bei $8D Bild 1 vorn in
+      // 658 von 668 Frames, bei den anderen vier Befehlen Bild 2 vorn in 1.677
+      // von 1.691. $8D benutzt nur Klobber (0x01F4-0x01F7): der Rumpf sitzt vor
+      // dem Fassrand. Mit der alten Reihenfolge deckte das Fass den Rumpf ab, und
+      // die Hochskalierung backte den Fassrand in die Rumpfkacheln.
       if (pos + 8 > rom.size) break;
       const dur = rom.readByteAt(pos + 1), r1 = rom.readWordAt(pos + 2), r2 = rom.readWordAt(pos + 4);
-      frames.push({ duration: dur, gfxRef: r1, extraRefs: [{ gfxRef: r2, x: 0, y: 0 }] });
+      frames.push({ duration: dur, gfxRef: r1, extraRefs: [{ gfxRef: r2, x: 0, y: 0 }], extraBehind: true });
       mark(8);
       pos += 8;
     } else if (cmd === 0x8e || cmd === 0x93) { mark(3); pos += 3;
@@ -3545,6 +3576,24 @@ function unusedGfxInfo(animId) {
   if (animId < UNUSED_GFX_ID_BASE || animId >= ORPHAN_SEQ_ID_BASE) return null;
   if (!_unusedGfxById && rom) findUnusedGfxRefs(rom);
   return _unusedGfxById ? (_unusedGfxById.get(animId) || null) : null;
+}
+
+// Die 0xD000-Nummern sind LAUFENDE Nummern ueber die gefundenen Gruppen, und
+// welche Gruppen es gibt, haengt an der Spritecap. Waechst die Aufnahme, rutschen
+// die Nummern: die Zielflagge (Gfx 3300) war beim Import 0xD01F, heute 0xD029.
+// Der Container behaelt die Nummer vom Import. Der Pack-Export hat mit ihr die
+// Palette nachgeschlagen und so die Palette einer FREMDEN Gruppe als Referenz
+// ausgeliefert (gemessen 25.09.: Flaggenkacheln mit Grau/Rot/Gruen statt
+// Braun/Schwarz/Grau -> in Mesen braun-rote Karos). Wo die fremde Palette die
+// Kunst gar nicht erklaerte, blieb die Kachel ohne Referenz und fiel bei
+// gedimmten Kacheln ganz weg (Gfx 1458: 215/271, Gfx 14F0: 165/299 im Pack).
+// Der Name traegt die gfxRef aus dem ROM und wandert nicht — also ueber ihn gehen.
+// Liefert die heutige Nummer, oder null, wenn es die Gruppe nicht mehr gibt.
+function currentUnusedGfxId(animId, name) {
+  if (animId == null || animId < UNUSED_GFX_ID_BASE || animId >= ORPHAN_SEQ_ID_BASE) return animId;
+  if (!_unusedGfx && rom) findUnusedGfxRefs(rom);
+  const hit = (_unusedGfx || []).find(o => unusedGfxName(o) === name);
+  return hit ? hit.id : null;
 }
 
 // Name einer verwaisten Sequenz. Traegt den Bank-Offset, NICHT die laufende
@@ -13962,20 +14011,46 @@ async function exportAsTexturePack(containerName) {
         // animId/name carry the sprite's identity through to the reference-palette
         // resolution below — without them the export cannot say which colours the
         // art was baked under.
+        // Kunst ohne Animationseintrag: die gespeicherte Nummer kann veraltet sein,
+        // siehe currentUnusedGfxId(). origAnimId haelt nur die Sortierung stabil.
+        const origAnimId = s.animId ?? null;
+        const animId = currentUnusedGfxId(origAnimId, s.name || '');
+        if (animId !== origAnimId) {
+          console.log(`[sprites] ${s.name}: gespeicherte Nummer 0x${origAnimId.toString(16).toUpperCase()} ` +
+                      (animId == null ? 'gibt es nicht mehr — ohne Referenzpalette.'
+                                      : `ist heute 0x${animId.toString(16).toUpperCase()}.`));
+        }
         sprSources.push({ key: s.setId, scaleFactor: s.scaleFactor || 4, metaMap, frames,
-                          animId: s.animId ?? null, name: s.name || '' });
+                          animId, origAnimId, name: s.name || '' });
       }
     }
-    // Fallback for sprites imported in this session but not (yet) written to the container.
-    if (sprSources.length === 0 && hdPack && hdPack.sprites && hdPack.sprites.size > 0) {
+    // Sprites imported in this session but not written to THIS container.
+    //
+    // This used to run only when the container held no sprites at all. With a
+    // filled container, art that sat only in memory was skipped without a word:
+    // the Flitter ZIP of 24.09. (Flitter, Balloon 0x02D4, Seq 6266/62EC, parts
+    // of Lockjaw's bite) reached the pack with 0-1 of its tiles, although every
+    // tile was recorded and none is dimmed. Now every in-memory set whose key the
+    // container does not have is exported too, and named in the console.
+    // A key the container has stays with the container's copy.
+    if (hdPack && hdPack.sprites && hdPack.sprites.size > 0) {
+      const inContainer = new Set(sprSources.map(s => s.key));
+      const memOnly = [];
       for (const [key, spr] of hdPack.sprites) {
+        if (inContainer.has(key)) continue;
         sprSources.push({
           key, scaleFactor: spr.scaleFactor || 4, metaMap: spr.meta || new Map(),
           frames: [...spr.frames].map(([idx, bitmap]) => ({ idx, bitmap })),
-          animId: spr.animId ?? null, name: spr.name || '',
+          animId: currentUnusedGfxId(spr.animId ?? null, spr.name || ''),
+          origAnimId: spr.animId ?? null, name: spr.name || '',
         });
+        memOnly.push(key);
       }
-      console.log(`[sprites] ${sprSources.length} Sprite-Sets aus dem Speicher (im Container liegen keine).`);
+      if (memOnly.length) {
+        console.warn(`[sprites] ${memOnly.length} Sprite-Sets nur im Speicher, nicht in Container ` +
+                     `"${containerName}" — werden mit exportiert, bitte in den Container speichern: ` +
+                     memOnly.join(', '));
+      }
     }
     // S40: die beiden NEUEN Kategorien (verwaiste Sequenzen ab 0xE000, Kunst ohne
     // Animationseintrag ab 0xD000) laufen zuletzt. Ihre Kacheln ueberschneiden
@@ -13989,7 +14064,7 @@ async function exportAsTexturePack(containerName) {
     // unveraendert; die neuen Eintraege steuern nur bei, was sonst niemand
     // beansprucht. Stabil sortiert, die bisherige Reihenfolge bleibt sonst.
     sprSources.forEach((s, i) => { s._ord = i; });
-    const isNewKind = (s) => s.animId != null && s.animId >= 0xD000 && s.animId < 0xF000;
+    const isNewKind = (s) => s.origAnimId != null && s.origAnimId >= 0xD000 && s.origAnimId < 0xF000;
     sprSources.sort((a, b) => (isNewKind(a) ? 1 : 0) - (isNewKind(b) ? 1 : 0) || a._ord - b._ord);
 
     if (sprSources.length === 0) {
@@ -14074,20 +14149,24 @@ async function exportAsTexturePack(containerName) {
         const bestRefFor = (rgba, refPool) => {
           if (!refPool || refPool.length === 0) return null;
           // Collect opaque texels first so every candidate scores the same pixels.
-          // Every second texel is plenty for a 32x32 cell, but a sparse edge tile
-          // can run out of opaque ones — then look at every texel instead of
-          // giving up. Only tiles that would fail outright are affected.
-          const collect = (step) => {
-            const out = [];
-            for (let p = 0; p + 3 < rgba.length && out.length < SCORE_SAMPLES * 3; p += step) {
-              if (rgba[p + 3] < 200) continue;
-              out.push(rgba[p], rgba[p + 1], rgba[p + 2]);
-            }
-            return out;
-          };
-          let px = collect(8);
-          if (px.length < 32 * 3) px = collect(4);
-          if (px.length < 32 * 3) return null;   // too little evidence to judge
+          //
+          // The samples are spread EVENLY over all opaque texels of the cell. They
+          // used to be the first SCORE_SAMPLES found scanning from the top, i.e.
+          // the top rows only -- and a cell whose top edge is an anti-aliased
+          // colour transition was judged on nothing else. Measured 25.09. on
+          // Klomp's tail (617C145BEA9B1CC0, 0x0160 frame 3): top 64 texels
+          // trimmed error 1514, just over MAX_REF_ERR, so the tile shipped without
+          // a reference and came out inverted in Glimmer's Galleon; over the whole
+          // cell the trimmed error is 306.
+          const opaque = [];
+          for (let p = 0; p + 3 < rgba.length; p += 4) if (rgba[p + 3] >= 200) opaque.push(p);
+          if (opaque.length < 32) return null;   // too little evidence to judge
+          const px = [];
+          const nSamples = Math.min(SCORE_SAMPLES, opaque.length);
+          for (let k = 0; k < nSamples; k++) {
+            const p = opaque[Math.floor(k * opaque.length / nSamples)];
+            px.push(rgba[p], rgba[p + 1], rgba[p + 2]);
+          }
           let bestPal = null, bestErr = Infinity;
           for (const cand of refPool) {
             const c = cand.rgb;
@@ -14487,7 +14566,22 @@ async function exportAsTexturePack(containerName) {
     console.log(`[hashes] Processing ${allHashSets.length} set(s) for hashes.bin`);
     for (const set of allHashSets) {
       await _yieldToBrowser();
-      const ppuCfg = set.ppuConfig;
+      let ppuCfg = set.ppuConfig;
+      // Shop- und Weltkarten-Sets brauchen die PPU-Konfiguration fuer ihre Hashes
+      // gar nicht: der Oberwelt-Block unten rechnet mit chr/tm aus OVERWORLD_SETS
+      // bzw. der Ebenen-Meta. Das fruehe `continue` hat sie trotzdem verworfen --
+      // Cranky's Monkey Museum (gfxset 8) hatte 949 HD-Kacheln im Pack und NULL
+      // Eintraege in hashes.bin (Packs vom 24. und 25.09.), also auch keinen
+      // Fingerabdruck: Mesen konnte keine einzige Kachel zuordnen, das Museum blieb
+      // SD. Ersatz-Konfiguration nur fuer diesen Fall; die ppuConfig-abhaengigen
+      // Bloecke (BG1-Anordnung, BG2/BG3-Tilemaps, cmFg) verlangen ihre eigenen Daten
+      // und bleiben fuer solche Sets ohnehin leer.
+      if (!ppuCfg && set.owBlobs && set.vramSnapshot && isOverworldSet(set.gfxSetIndex)) {
+        const ow = OVERWORLD_SETS[set.gfxSetIndex];
+        ppuCfg = { bgMode: 1, bg1ChrBase: ow.chr, bg2ChrBase: 0, bg3ChrBase: 0, terrainChrBase: ow.chr };
+        console.warn(`[hashes] gfxset ${set.gfxSetIndex} (${ow.name}): keine ppuConfig — ` +
+                     `Oberwelt-Hashes werden trotzdem erzeugt (chr $${ow.chr.toString(16).toUpperCase()}).`);
+      }
       if (!ppuCfg) { console.warn(`[hashes] gfxset ${set.gfxSetIndex}: SKIPPED (no ppuConfig)`); continue; }
       const gfxset = set.gfxSetIndex ?? 0;
       const is4bpp = (ppuCfg.bgMode === 1);
@@ -17177,10 +17271,14 @@ function renderCompositeFrame(frame, palette, paletteKey, secondaryPalette, seco
 
   const out = new OffscreenCanvas(w, h);
   const ctx = out.getContext('2d');
-  ctx.drawImage(primary.canvas, primary.offsetX - left, primary.offsetY - top);
+  // Zuerst gezeichnet = hinten. Die Reihenfolge haengt am Befehl, siehe $8D in
+  // walkAnimSequence.
+  const drawPrimary = () => ctx.drawImage(primary.canvas, primary.offsetX - left, primary.offsetY - top);
+  if (!frame.extraBehind) drawPrimary();
   for (const { render, worldX, worldY } of extras) {
     ctx.drawImage(render.canvas, worldX + render.offsetX - left, worldY + render.offsetY - top);
   }
+  if (frame.extraBehind) drawPrimary();
   // S5: merge tile placements into composite-canvas coordinates
   const tiles = [];
   if (primary.tiles) {

@@ -1,5 +1,90 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-25] — Pack-Export: Kunst ohne Animationseintrag bekommt wieder IHRE Palette
+
+Viewer (`dkc2-viewer/index.html`, Sprite-Teil des Mesen-Pack-Exports).
+
+**Symptom (Spieltest 25.09.):** Zielflagge in Rickety Race mit braun-roten Karos, die Flagge
+im Viewer ist korrekt schwarz-weiß. Dazu fehlten Teile von Gfx 1458 (215 von 271 Kacheln im
+Pack) und Gfx 14F0 (165 von 299), obwohl alles aufgezeichnet war.
+
+**Ursache:** Die Nummern ab `0xD000` („Gfx XXXX“, Kunst ohne Animationseintrag) sind
+laufende Nummern über die Gruppen, die `findUnusedGfxRefs` in der Spritecap findet. Wächst
+die Aufnahme, verschieben sie sich: die Flagge (Gfx 3300) war beim Import `0xD01F`, heute ist
+sie `0xD029`. Der Container behält die Nummer vom Import, und der Export hat mit ihr
+`resolveSpritePalettes` gefragt, also die Palette einer **fremden** Gruppe als
+Referenz ausgeliefert. Gemessen in `sprite_palettes.bin`: die Flaggenkacheln tragen
+Grau/Rot/Grün, im Spiel läuft die Flagge unter Braun (Mast), Schwarz und Grau bis Weiß.
+Mesen färbt nach Palettenindex um, so landeten die dunklen Karos auf den Brauntönen
+des Masts. Wo die fremde Palette die Kunst gar nicht erklärte, bekam die Kachel keine
+Referenz, und wurde sie auch gedimmt gezeichnet, verwarf der Export sie ganz.
+
+**Fix:** `currentUnusedGfxId(animId, name)` sucht die heutige Nummer über den Namen, denn
+der trägt die gfxRef aus dem ROM und verschiebt sich nicht. Der Export rechnet damit, die Sortierung
+(neue Arten zuletzt) nutzt weiter die gespeicherte Nummer. Die Konsole meldet jede
+umgeschriebene Nummer. Verwaiste Sequenzen (`0xE000`, „Seq XXXX“) sind nicht betroffen, ihre
+Nummern kommen allein aus dem ROM.
+
+**Zweiter Fix, gleicher Export-Schritt: Stichprobe über die ganze Kachel.** Klomp (0x0160)
+zeigte in Glimmer's Galleon eine invertierte Schwanzkachel (`617C145BEA9B1CC0`, Bild 3). Sie war
+die einzige von 206 Klomp-Kacheln ohne Referenz. `bestRefFor` beurteilte eine Kachel an den
+ERSTEN 64 deckenden Texeln von oben, hier fast nur die rot-orange Übergangskante: getrimmter
+Fehler 1514, knapp über `MAX_REF_ERR` 1500. Über die ganze Kachel sind es 306. Ohne Referenz
+färbt Mesen nicht um, und in Glimmer (Live-Palette = Umkehrung) erscheint die Kachel dann
+invertiert. Jetzt werden die 64 Proben gleichmäßig über alle deckenden Texel verteilt; die
+Mindestzahl (32 deckende Texel) bleibt. Im Pack vom 24.09. haben 954 Sprite-Kacheln keine
+Referenz, 794 davon trotz genug Texeln. Wie viele davon an dieser Stichprobe hingen, zeigt
+der nächste Export (`[sprpal] … nicht erklärt` in der Konsole).
+
+**Vierter Fix: Crankys Museum bekommt seine Hashes.** `[hashes] gfxset 8: SKIPPED (no
+ppuConfig)`: gfxset 8 ist Cranky's Monkey Museum. Seine 949 BG1-Kacheln lagen im Pack (Namen
+nach VRAM-Adresse, `2000_P01.png`), `hashes.bin` hatte aber für gfxset 8 keinen einzigen
+Eintrag (Packs vom 24. und 25.09.), und damit auch keinen Fingerabdruck. Mesen konnte keine
+Kachel zuordnen, das Museum blieb SD (User-Befund 25.09.). Die Hash-Schleife brach für Sets
+ohne `ppuConfig` sofort ab, obwohl der Oberwelt-Block mit `OVERWORLD_SETS` (chr/tm) und der
+Ebenen-Meta rechnet und die Konfiguration gar nicht braucht. Jetzt bekommt ein Oberwelt-Set mit
+`owBlobs` und VRAM-Abzug eine Ersatzkonfiguration aus `OVERWORLD_SETS` (Konsole meldet es);
+die übrigen Blöcke hängen an eigenen Daten, die solche Sets nicht haben.
+
+**Dritter Fix: Sprites nur im Speicher werden mitexportiert.** Aus `sprites_export
+flitter_hd4x_edge.zip` (Flitter, Ballon 0x02D4, Lockjaws Biss Seq 57AA, Seq 6266 0xE020,
+Seq 62EC 0xE021) kamen je 0–1 Kacheln ins Pack, obwohl alle aufgezeichnet sind (seit
+August/September), keine gedimmt gezeichnet wird und das Paket selbst sauber ist (Skalierung 4,
+jedes Bild mit `tiles[]`). Der User hatte importiert (HD-Paket 21:16, Pack 21:19). Der Export
+las aber nur den Container; Sets, die nur im Speicher lagen, nahm er ausschließlich, wenn der
+Container GAR keine Sprites hatte, und überging sie sonst ohne Meldung. Jetzt wird jedes
+Speicher-Set mitexportiert, dessen Schlüssel der Container nicht hat, und die Konsole nennt es
+(`[sprites] … nur im Speicher …`). Hat der Container den Schlüssel, gilt seine Fassung.
+
+---
+
+## [2026-09-24] — Klobber: Rumpf vor dem Fass; Ghostly Grove: Strahlen werden addiert
+
+Viewer (`dkc2-viewer/index.html`). Zwei Fehler in der Darstellung, beide an ROM und
+Aufzeichnung belegt, beide ohne Sonderfall für ein Level.
+
+**Klobber (Zeichenreihenfolge bei `$8D`).** Zweibild-Frames wurden immer mit Bild 2 oben
+gezeichnet. Gemessen in `snes_hd_oam_test.txt` (OAM-Index = Vorrang) stimmt das für
+`$85/$86/$89/$8A` (Bild 2 vorn in 1.677 von 1.691 Frames: Rambi-Reiten, Team-Up, Werfen),
+aber **nicht für `$8D`**: dort liegt Bild 1 vorn, in 658 von 668 Frames. `$8D` benutzt nur
+Klobber (0x01F4–0x01F7), Bild 1 ist der Rumpf, Bild 2 das Fass. Im Viewer deckte der Fassrand
+den Rumpf ab, die Hochskalierung backte den Rand in die Rumpfkacheln, und im Spiel wirkte der
+Rumpf, als schwebe er über dem Fass. Die Lage der beiden Teile stimmte (relativer Versatz
+im Spiel 0/0, wie im Viewer). Jetzt: `$8D`-Frames tragen `extraBehind`, und
+`renderCompositeFrame` zeichnet Bild 2 zuerst.
+**Folge:** Klobbers vorhandene HD-Kunst ist aus dem falschen Bild entstanden. SD neu
+exportieren, neu hochskalieren, neu importieren.
+
+**Ghostly Grove (BG1 nur auf dem Sub-Screen).** Die Sonnenstrahlen liegen auf BG1, BG1 steht
+aber nur auf dem Sub-Screen und wird per Farbmathematik auf die Szene addiert. Der Viewer
+prüfte nur „eigene chr-Basis“ und zeigte BG1 als deckendes Overlay, also in den rohen,
+roten Farben. Jetzt: BG1 nur auf Sub + Farbmathematik aktiv → Modus `colormath`, Quelle
+`bg1`, in der Levelansicht per `lighter` addiert. Speichern und Pack-Export behandeln
+`colormath`/`bg1` genau wie `bg1overlay`, dort ändert sich nichts. **Die roten Rohfarben
+sind das Richtige für die Hochskalierung**, denn Mesen rechnet die Addition selbst.
+
+---
+
 ## [2026-09-21] — Der Stern überlebt jetzt die Inhaltsfilter
 
 Viewer (`dkc2-viewer/index.html`). Die Merkliste (★) gab es längst — dauerhaft gespeichert,
