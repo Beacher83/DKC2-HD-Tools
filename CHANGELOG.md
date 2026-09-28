@@ -1,5 +1,262 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-28, spätnachmittags] — BG2/BG3 der reparierten Sets: Tilemaps aus dem echten Abzug
+
+**Spieltest nach BG1-Reparatur:** BG1 von 34/43/44/47/48 HD; Hintergründe falsch („wie Pirate Panic“ in
+RR/TT/AA, SD in Haunted Hall). Liste aller Befunde: `OFFENE_TESTS.md`.
+
+**Gemessen:** Die exportierte SD-Ebene `bg2.png` von Target Terror (25.09.) ist ein Render des echten
+Abzugs GT „22“ mit Tilemap $5C00 / CHR $6000 (bis auf Zeilen außerhalb des Bildes identisch) — die Kunst
+ist richtig. `repairSetMetadataFromRom` hatte die BG2/BG3-Tilemaps aber aus der Katalog-SIMULATION
+genommen, und die zeigt das Referenzlevel des gfxsets (bei 34: Rickety Race) → die richtige Kunst wurde
+nach der falschen Karte zerschnitten. Die Tilemap-ADRESSEN des Katalogs stimmen mit den echten Registern
+überein (34: BG2 $5C00/$6000; 44: BG2 $6800/$7000 64×32, BG3 $5800/$6000).
+
+**Fix:** Katalog-`ppuConfig` trägt `bg2TilemapBase`/`bg3TilemapBase`; die Reparatur liest BG2/BG3 (und die
+SSB-BG1-Karte) an diesen Adressen aus dem Ground-Truth-VRAM. Die Rückfrage zeigt, wie viel davon mit der
+Katalog-Simulation übereinstimmt.
+
+**Zweite Ursache, gemessen:** Die Pack-Dateien `bg2/gfxset_34` und `bg2/gfxset_47` zeigen den Himmel und das
+Meer von **Pirate Panic** — obwohl die HD-Zips (`gfxset_22/2F_export_hd4x_edge.zip`) den Rummelplatz bzw. das
+Eis enthalten (HD verkleinert vs. SD: Abweichung 3,1–3,4). `saveCurrentHDToContainer` übernahm `hdPack.bg2/bg3`
+ohne Prüfung, zu welchem gfxset das Bild im Speicher gehört (Wall und cmFg hatten diese Prüfung längst).
+Jetzt: nur bei `bg2GfxSet/bg3GfxSet === gespeichertes gfxset`, sonst Warnung. Reparatur kann fremde
+Ebenenbilder entfernen: `repairSetMetadataFromRom(43, { clear: ['bg2'] })`.
+
+**Ohne Konsole (User-Wunsch):** Jedes Speichern (also jeder Import) prüft BG2/BG3 selbst: `fitLayerImage`
+rendert die Ebene mit jeder Kandidaten-Tilemap (Ground-Truth, bisher, Katalog) aus echtem VRAM + CGRAM und
+vergleicht mit dem Ebenenbild; die beste Tilemap wird gespeichert. Passt ein GESPEICHERTES Bild zu keiner
+(Abweichung > 25), wird es entfernt. Gemessen an den echten Bildern: richtig 2,8–4,8 (TT, AA, HH inkl.
+Kackle), fremd 73–181 (Pirate-Panic-Meer als TT/AA, Rummelplatz als AA). Ein erneuter Import der HD-Zips
+repariert damit ein Set vollständig.
+
+**Dritte Ursache (Re-Import 28.09. abends):** Während ein Import speicherte, lud der Viewer für das im
+Hintergrund angezeigte Level (Pirate Panic) dessen HD-Daten automatisch nach (`ensureGfxSetHDLoaded`). Das
+tauscht `hdPack` komplett: schließt die frisch importierten Cluster (gfxset_2C: „image source is detached“)
+und ersetzt BG2/BG3 durch die von Pirate Panic (gfxset_2F: von der neuen Prüfung abgelehnt). Vermutlich
+ist Pirate Panic am 25.09. genau so in die Sets gekommen. Fix: kein Auto-Nachladen, solange ein Import läuft
+(`hdImportBusy`).
+
+---
+
+## [2026-09-28, nachmittags] — URSACHE Haunted Hall / Target Terror: Sets mit Metadaten eines ANDEREN Levels gespeichert
+
+**Gemessen (Konsolen-Diagnose, Container „Anim Tiles v2“):**
+- `gfxset_2C` (Haunted Hall, gespeichert 25.09. 16:13): Zuordnungstabelle `12032B/3227e0d44c`,
+  chrRaw `a42ad3f372`, ppuConfig mit ShipDeck-BG3 160×64 — **byte-gleich mit gfxset_07 (Pirate Panic)**.
+- `gfxset_22` (34, gespeichert 25.09. 15:42): Tabelle mit 737 Blöcken, das ROM hat 466.
+- ROM-Katalog 34 = 44: `14912B/a7a70202cb` (gemeinsame Blöcke). gfxset_07: Container = ROM.
+- Die hochskalierte Kunst ist RICHTIG: die SD-Exporte vom 25.09. sind pixelgenau echte VRAM-Grafik
+  (Median-Fehler 0,4 / 0,7). Nur die Zuordnung Block → Adresse im Pack war zerwürfelt.
+- Der Kackle-Export vom 25.09. enthielt alle 223 Haunted-Hall-Blöcke + 81 Cluster — der Import hat
+  deshalb den ganzen Datensatz neu gespeichert, mit den falschen Metadaten.
+
+**Ursache:** `currentStyle.graphics` sagte 44, `currentTileRawData`/`currentBgData` hielten noch
+Pirate Panic → `currentMatchesActive` war wahr, gespeichert wurde die Level-Tabelle des falschen Levels.
+
+**Fix:**
+- `saveCurrentHDToContainer`: Level-Daten werden nur genommen, wenn ihre Zuordnungstabelle mit dem
+  ROM-Katalog des gespeicherten gfxsets übereinstimmt; sonst Katalog + `console.error`.
+- Neu: `repairSetMetadataFromRom(g)` (Konsole) schreibt Tabelle, chrRaw, ppuConfig, Tilemaps aus dem
+  ROM-Katalog und VRAM/CGRAM aus der Ground-Truth neu; HD-Kunst bleibt. Zeigt vorher alt → neu.
+- Ground-Truth hat beim Speichern wieder Vorrang (die Umstellung vom Morgen ist zurückgenommen).
+
+---
+
+## [2026-09-28, mittags] — Fingerabdrücke nach Spezifität geordnet (+ Mesen S56); VRAM-Ausschluss zurückgenommen
+
+Viewer (`fingerprints.bin`) + Mesen S56 (`SnesHdData.h`, `SnesHdPackLoader.cpp`).
+**Ersetzt den Fix „Fingerabdruck-Eindeutigkeit gegen fremde VRAM-Abzüge“ weiter unten.**
+
+**Warum zurückgenommen:** Ein gfxset dient mehreren Leveln; ein Fingerabdruck muss auf dem liegen,
+was ALLE seine Level teilen. Bei gfxset 34 (Rickety Race, Target Terror) ist das BG1 — und dieses
+BG1 steckt komplett (835/835) in Haunted Hall (44). Der VRAM-Ausschluss ließ 34 und 29 ohne
+Fingerabdruck (Pack 28.09. 09:30 — dort wäre in RR/TT und Gusty Glade kein BG-HD gekommen).
+BG3 als Ausweg taugt nicht: es unterscheidet sich zwischen Leveln desselben gfxsets (siehe gfxset 32).
+
+**Was wirklich fehlte: die Prüfreihenfolge.** Die alte Auswahl war richtig (fp34 auf gemeinsamen
+Schienen, fp44 auf Kacheln nur von 44). Mesen hielt die Abdrücke aber in einer `unordered_map` —
+die Reihenfolge war zufällig-aber-fest, und in Haunted Hall kam 34 zuerst.
+
+- **Viewer:** Kandidatenwahl wieder wie vorher (eindeutig gegen die HD-Hashes der anderen Sets).
+  Neu: Passt Abdruck X vollständig auf den VRAM-Abzug von Set Y, wird Y **vor** X in die Datei
+  geschrieben. Konsole: `Abdruck 34 passt auch auf gfxset 44 → 44 wird vor 34 geprueft`, am Ende
+  `Pruefreihenfolge: …`. Passen zwei Abdrücke gegenseitig aufeinander: `KONFLIKT` (keine
+  Reihenfolge hilft).
+- **Mesen S56:** `DetectActiveGfxset` prüft in Dateireihenfolge (`GfxsetFingerprintOrder`).
+- **bgcap-Filter bleibt korrigiert:** Ein aufgezeichneter Hash, der dem Abzug eines ANDEREN Sets an
+  dieser Adresse entspricht, gilt als Fehlerkennung, nicht als Laufzeitänderung (`G34` enthielt
+  316 Haunted-Hall-Kacheln).
+
+---
+
+## [2026-09-28] — BG-Aufnahme bleibt über Reloads; Spritecap und BG-Aufnahme werden ERGÄNZT statt ersetzt
+
+Viewer (`dkc2-viewer/index.html`).
+
+- **BG-Aufnahme** (`BG-Anim`) wird wie die Spritecap in der Datenbank gehalten und beim Start
+  wiederhergestellt (aus den Rohzeilen neu ausgewertet, damit die Anim-Einstufung stimmt).
+- **Beide** Knöpfe: Klick = gewählte Datei(en) zum Bestand **hinzufügen**, Shift+Klick = **ersetzen**.
+  Mehrfachauswahl möglich. Zusammengeführt wird als Zeilenmenge — Mesen hängt über Sitzungen an
+  dieselbe Datei an, die gewachsene Datei erneut zu wählen verdoppelt also nichts. Konsole:
+  `[bgcap] ergänzt: N neue Zeilen (vorher X, jetzt Y)`.
+- Rohzeilen liegen in eigenen Einträgen (`spritecap_lines`, `bgcap_lines`); die Spritecap (~90 MB)
+  wird beim Start weiterhin nur aus dem ausgewerteten Eintrag geladen.
+- Eine Spritecap aus der alten Version hat keine Rohzeilen: beim ersten Ergänzen fragt der Viewer,
+  ob er sie durch die gewählte Datei ersetzen darf (einmal die vollständige Datei nehmen).
+
+Offline geprüft: GESAMT direkt und als Zeilenmenge ergeben dieselbe Auswertung (8095 Kacheln,
+2436 Anim-Frames / 514 Adressen); GESAMT + aktuelle `snes_hd_bgcap.txt` = 8418, nochmaliges
+Hinzufügen derselben Datei ändert nichts.
+
+---
+
+## [2026-09-28, später] — URSACHE Haunted Hall: Fingerabdruck 34 lag auf gemeinsamen Kacheln
+
+Viewer (`dkc2-viewer/index.html`, `fingerprints.bin`). Löst den Befund vom 25.09. spät ab.
+
+**Gemessen:** Zwei frische VRAM-Abzüge aus Haunted Hall (`dkc2_vram_snapshot.lua`, WRAM $0539 = 0x2C)
+sind im ganzen statischen Grafikbereich $2000–$6FFF **byte-gleich mit der Ground-Truth „2C“** — der
+Abzug war nie falsch. Ground-Truth „22“ = Target Terror (gfxset 34) ist mit Haunted Hall in BG1
+($0000–$57FF) identisch und in BG2 völlig verschieden. Der installierte Fingerabdruck 34 bestand aus
+8 BG1-Schienenkacheln ($2260–$2F30): In beiden frischen Abzügen passen **34 mit 8/8 UND 44 mit 8/8**,
+Mesen prüft aufsteigend und nimmt 34.
+
+**Ursache:** Die Eindeutigkeit einer Referenzkachel wurde gegen die **exportierten HD-Hashes** der
+anderen Sets geprüft. Haunted Hall hat die Schienenkacheln im VRAM, aber keine HD-Kunst dafür — also
+galten sie als eindeutig für 34. Mesen dagegen prüft den **VRAM an der Adresse**.
+
+**Fix:** Eine Referenzkachel scheidet aus, wenn der VRAM-Abzug irgendeines anderen Sets an derselben
+Adresse denselben Hash hat (`[fingerprints] N Kandidaten verworfen: ein anderes Set hat …`). Am Ende
+prüft der Export jeden Abdruck gegen jeden fremden Abzug und meldet eine Vollübereinstimmung als Fehler.
+
+**Zurückgenommen (vom Morgen):** Die bgcap-Prüfung WÄHLT beim Speichern nicht mehr — der bisherige
+Abzug bleibt immer, Punkte werden nur gemeldet; der Export fragt nicht mehr nach, er notiert nur.
+Grund: `G` der bgcap = von Mesen erkanntes gfxset; unter der Fehlerkennung stand Target-Terror-Inhalt
+als „G44“, und Haunted Halls richtiger Abzug kam dagegen auf 0 %.
+
+Werkzeug neu: `Mesen2-SNES-HD_Projekt/dkc2_vram_snapshot.lua` (Taste [End], schreibt
+`Downloads\VRAM_G<hex>_<Zeit>.bin` + CGRAM + Info, überschreibt nie).
+
+---
+
+## [2026-09-28] — VRAM-Abzüge werden gegen die BG-Aufnahme geprüft; Ground-Truth gewinnt nicht mehr blind
+
+Viewer (`dkc2-viewer/index.html`). Fix zum Befund vom 25.09. spät (unten).
+
+**Neu: `scoreVramAgainstBgcap(vram, gfx)`.** Für jede STATISCHE Adresse, die Mesen im gfxset
+aufgezeichnet hat, muss der Abzug an `addr*2` genau die aufgezeichneten Bytes halten. Animierte
+Adressen zählen nicht (eine Phase beweist nichts). Unter 20 statischen Kacheln: „nicht prüfbar“.
+
+- **Speichern (`saveCurrentHDToContainer`):** Kandidaten sind der bisherige Container-Abzug,
+  die Ground-Truth und die Simulation. Mit BG-Aufnahme gewinnt der mit den meisten Treffern
+  (bei Gleichstand der bisherige); ohne sie bleibt der bisherige. Die Ground-Truth überschreibt
+  also nie mehr einen vorhandenen Abzug ungeprüft. Unter 50 % Treffern: Fehlermeldung + Hinweis.
+  Konsole: `[save] VRAM fuer gfxset_XX: "…" gewaehlt. bgcap-Abgleich: …`.
+- **VRAM-Import (`importVramForSet`):** meldet neu gegen bisher; unter 50 % rot.
+- **Pack-Export:** prüft vorab jeden Abzug, den er hashen wird (auch den Ground-Truth-Rückfall),
+  `[vramcheck]` je Set; unter 50 % fragt er, ob trotzdem exportiert werden soll.
+
+**Gemessen mit `snes_hd_bgcap_GESAMT_fuer_Viewer.txt` (nur statische Kacheln):**
+
+| gfxset | eigene Ground-Truth | bester Abzug |
+|---|---|---|
+| 4, 7, 9, 38 | 100 % | eigener |
+| 3 | 153/155 | „28“ 155/155 |
+| 29 | 883/906 (Rest BG1 $7000–$7FFF) | „1E“ 905/906 |
+| 32 | 702/829 (Rest komplett BG3 $6000–$63FF) | „29“ 829/829 |
+| **44** Haunted Hall | **0/251** | **„22“ 251/251** (alle BG2) |
+| **51** | **0/73** | „24“ 73/73 |
+| **37** | **0/34** | „03“, „2D“, „31“ je 34/34 (zu wenig für eine Zuordnung) |
+
+Die 50-%-Schwelle trennt die falsch zugeordneten (0 %) sauber von den übrigen (≥ 85 %).
+Offen: gfxset 32 sieht im Spiel in BG3 $6000–$63FF andere Kacheln als der Abzug (Schwesterlevel?).
+
+**KORREKTUR (28.09., später) — die Tabelle oben ist für 44 so NICHT zu lesen:**
+Das `G` in der bgcap ist das gfxset, das Mesen per Fingerabdruck **erkannt** hat
+(`_hdData->ActiveGfxset`, `SnesHdVideoFilter.cpp:3424`), nicht das tatsächliche Level. Die
+Ground-Truth-Dateinamen sind hex: „22“ = gfxset 34 = laut Kopfzeile **Target Terror**, „2C“ = 44 =
+**Haunted Hall**. Und „2C“ hält Kackles Animationsphasen an 40 von 52 Anim-Adressen — ist also
+wirklich Haunted Hall. Die 251 statischen „G44“-Kacheln (BG2 $6020–$6FE0) sind Target-Terror-Inhalt,
+aufgezeichnet, während Mesen ihn für 44 hielt. Folge: Die Prüfung ist nur so gut wie die Erkennung
+zur Aufnahmezeit; bei falscher Erkennung ist sie zirkulär. Offen, bis ein frischer Abzug aus
+Haunted Hall vorliegt (Werkzeug: `Mesen2-SNES-HD_Projekt/dkc2_vram_snapshot.lua`).
+
+---
+
+## [2026-09-25, spät] — BEFUND, noch kein Fix: `vram_groundtruth.js` ist für mehrere gfxsets falsch zugeordnet
+
+Nur Analyse, kein Code. Grundlage für den nächsten Schritt.
+
+**Symptom:** Nach dem Pack-Export von 23:21 war Haunted Hall (gfxset 44) überwiegend SD, Kackle SD,
+dazwischen HD-Kacheln an falschen Stellen. Mesen erkannte das Level als gfxset **34** (Rickety Race).
+
+**Kette:** Der Kackle-Import speicherte Set 44 neu. `saveCurrentHDToContainer` nimmt dabei
+`VRAM_GROUND_TRUTH` VORRANGIG („ALWAYS authoritative“) und überschrieb den bis dahin korrekten
+Container-Abzug. Der eingebettete Abzug „gfxset_2C“ ist aber nicht Haunted Hall: die CHR-Basis
+kam als $3000 statt $2000 heraus (BG1-Dateien 3000–6950, bis in Kackles BG2), der Fingerabdruck von 44
+wurde falsch, und der von 34 (Schienenkacheln, in beiden Leveln gleich) wurde eindeutig und passt
+jetzt auf Haunted Hall. Die Export-Warnung „gfxset 34 and gfxset 44 have IDENTICAL VRAM“ war das
+Symptom, nicht ein Fehlalarm.
+
+**Gemessen:** jeder eingebettete Abzug gegen die Kacheln, die Mesen im jeweiligen gfxset
+aufgezeichnet hat (`snes_hd_bgcap`, Bytes an ihrer VRAM-Adresse):
+
+| gfxset | eigener Abzug | bester fremder |
+|---|---|---|
+| 3, 4, 7, 9, 38 | ~100 % | — |
+| 44 Haunted Hall | 3/305 | „22“: 253/305 (auch Kackles BG2) |
+| 51 | 0/74 | „24“: 74/74 |
+| 37 | 2/144 | „03“: 34 |
+| 29, 32 | 883/1137, 704/909 | fremde leicht besser — unklar (Animation?) |
+
+**Nächste Schritte:** (1) Ground-Truth darf einen vorhandenen Container-Abzug nie überschreiben,
+nur Lücken füllen; mit geladener BG-Aufnahme gegenprüfen und bei Widerspruch ablehnen. (2) Set 44
+mit frischem VRAM-Dump aus Haunted Hall reparieren. (3) Die übrigen Abzüge prüfen, bevor eines
+dieser Sets wieder gespeichert wird.
+
+---
+
+## [2026-09-25] — Fingerabdruck meidet Adressen, die sich im Spiel ändern
+
+Viewer (`dkc2-viewer/index.html`, `fingerprints.bin` im Pack-Export).
+
+**Befund (Pack 22:08):** Mit Kackles neuem Import bekam gfxset 44 (Haunted Hall) einen neuen
+VRAM-Abzug, und damit einen neuen Fingerabdruck. 4 seiner 8 Referenzkacheln liegen in Kackles
+animiertem BG2-Bereich ($6500–$6590), und `snes_hd_bgcap.txt` hat an allen vier im Spiel ANDERE
+Kacheln aufgezeichnet. Mesen (`SnesHdData::DetectActiveGfxset`) verlangt, dass ALLE Referenzen
+passen; ein nicht erkanntes gfxset sperrt jeden HD-Nachschlag im Level. Haunted Hall wäre also
+nur in der einen Animationsphase des Abzugs erkannt worden.
+
+**Fix:** Ist eine BG-Aufnahme geladen, scheiden Kandidaten aus, an deren Adresse Mesen im Spiel
+einen anderen Inhalt gesehen hat. Die Konsole meldet die Zahl
+(`[fingerprints] N Kandidaten verworfen …`) und warnt, wenn keine BG-Aufnahme geladen ist.
+
+Nebenbei: Der alte Abzug von gfxset 44 war offenbar der von gfxset 34 (Export-Warnung „IDENTICAL
+VRAM at BG1 CHR base“). Mit dem neuen hat auch gfxset 34 wieder einen Fingerabdruck.
+
+---
+
+## [2026-09-25] — Pack-Export wartet, bis ein Import fertig gespeichert hat
+
+Viewer (`dkc2-viewer/index.html`).
+
+**Symptom:** Kackles Kopf und Hände (Haunted Hall, `gfxset_2C`, 317 Anim-Kacheln) fehlten im
+Pack, obwohl das HD-Paket einwandfrei war (9 Sheets, 32 px/Zelle) und der Import „saved to
+container“ meldete. Der User hatte das schon öfter beobachtet („nicht 100 % zuverlässig“).
+
+**Ursache:** eine Wettlaufsituation. Die Konsole zeigt die Zeilen des Pack-Exports
+(`[fingerprints]`, `[animtiles] 4853 … exportiert`) VOR `[save] paletteSnapshot captured for
+"gfxset_2C"` und `HD data saved to container`. Der Import speicherte noch (466 Kacheln, 646
+Sprites), als der Export den Container schon gelesen hatte. Der Export liest nur den Container,
+also fehlte alles aus diesem Import, ohne Meldung. Vermutlich derselbe Fall wie das
+Flitter-Paket am 24.09.
+
+**Fix:** `importHDPackToContainer` zählt laufende Imports (`hdImportBusy`, auch bei Fehlern
+wieder freigegeben), und `exportAsTexturePack` bricht mit einer Meldung ab, solange einer läuft.
+
+---
+
 ## [2026-09-25] — Pack-Export: Kunst ohne Animationseintrag bekommt wieder IHRE Palette
 
 Viewer (`dkc2-viewer/index.html`, Sprite-Teil des Mesen-Pack-Exports).

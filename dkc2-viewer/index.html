@@ -344,9 +344,9 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <button id="catImportHDBtn" style="padding:3px 10px;background:#2196f3;color:#fff;border:1px solid #2196f3;font-weight:bold;" title="Import / merge upscaled HD textures from ZIP — multiple ZIPs can be imported one after another">Import HD</button>
       <button id="catClearHDBtn" style="padding:3px 8px;background:#555;color:#ccc;border:1px solid #777;" title="Clear all loaded HD textures">Clear HD</button>
       <button id="spriteCapBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_spritecap.txt laden (Mesen-Recording der Runtime-Palette-Slots — nötig für den Sprite-Anteil des Texture-Pack-Exports)">Spritecap</button>
-      <input type="file" id="spriteCapInput" accept=".txt" style="display:none">
+      <input type="file" id="spriteCapInput" accept=".txt" multiple style="display:none">
       <button id="bgCapBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_bgcap.txt laden (Mesen-Recording der BG-Miss-Tiles — Quelle für animierte BG-Kacheln, CHR-DMA-Frames wie Gusty-Blätter)">BG-Anim</button>
-      <input type="file" id="bgCapInput" accept=".txt" style="display:none">
+      <input type="file" id="bgCapInput" accept=".txt" multiple style="display:none">
       <button id="runtimeSprBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_spritemiss.txt + snes_hd_sprpos.txt laden (Mesen-Recording S8/S15) — Laufzeit-Sprites ohne ROM-Anim-Eintrag: Weltkarten-Schrift, Schädelwagen, Fackeln. Beide Dateien auf einmal auswählbar.">Laufzeit</button>
       <input type="file" id="runtimeSprInput" accept=".txt" multiple style="display:none">
       <button id="containerMgrBtn" style="padding:3px 10px;background:#9c27b0;color:#fff;border:1px solid #9c27b0;font-weight:bold;" title="HD Container verwalten — Speichern, Laden, Exportieren">Container</button>
@@ -5731,6 +5731,11 @@ function buildCatalogByGfxSet(gfxSetIndex) {
         wallTilesW: bgData.wallData ? bgData.wallData.tilesW : 0,
         wallTilesH: bgData.wallData ? bgData.wallData.tilesH : 0,
         wallTilemapBase: bgData.wallData && ppu.bg2 ? (ppu.bg2.tilemapBase + 0x800) : 0,
+        // Where the tilemaps live, so they can be re-read from a REAL VRAM dump
+        // (repairSetMetadataFromRom): this simulation shows the gfxset's reference
+        // level, the exported BG2/BG3 art shows the level of the Ground-Truth dump.
+        bg2TilemapBase: ppu.bg2 ? ppu.bg2.tilemapBase : null,
+        bg3TilemapBase: ppu.bg3 ? ppu.bg3.tilemapBase : null,
       };
       if (ppu.bg2 && ppu.bg2.enabled) {
         const tmByteOffset = ppu.bg2.tilemapBase * 2;
@@ -10851,6 +10856,42 @@ async function loadRecording(name) {
   });
 }
 
+// Recordings grow: a new Mesen run yields a new file, and it must ADD to what the
+// viewer already has instead of replacing it (by hand this meant merging text
+// files — snes_hd_bgcap_GESAMT_fuer_Viewer.txt). The raw lines are kept in their
+// own record "<name>_lines" (the spritecap is ~90 MB, so the restore path must
+// not have to load them) and merged as a set: Mesen appends to the same file
+// across sessions, so picking the grown file again must not double anything.
+// Returns { text, total, added, before } or null when the user cancelled.
+async function mergeRecordingLines(name, files, linePrefix, replace) {
+  let base = [];
+  if (!replace) {
+    const rec = await loadRecording(name + '_lines');
+    if (rec && Array.isArray(rec.lines)) {
+      base = rec.lines;
+    } else if (await loadRecording(name)) {
+      // Stored by an older viewer version: parsed results only, no raw lines.
+      if (!confirm(`Die gespeicherte ${name}-Aufzeichnung stammt aus einer älteren Viewer-Version ` +
+                   `und kann nicht ergänzt werden.\n\nOK = durch die gewählte(n) Datei(en) ersetzen ` +
+                   `(am besten einmal die vollständige Datei nehmen)\nAbbrechen = nichts ändern`)) {
+        return null;
+      }
+    }
+  }
+  const set = new Set(base);
+  const before = set.size;
+  for (const file of files) {
+    const text = await file.text();
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (line.startsWith(linePrefix)) set.add(line);
+    }
+  }
+  const lines = [...set];
+  await saveRecording(name + '_lines', { lines });
+  return { text: lines.join('\n'), total: lines.length, added: lines.length - before, before };
+}
+
 // Reflect spritecap state on the button — one place, used by both the file
 // picker and the restore path.
 function updateSpriteCapButton(count, pairs, savedAt) {
@@ -10866,8 +10907,8 @@ function updateSpriteCapButton(count, pairs, savedAt) {
   btn.style.background = '#2e7d32';
   const when = savedAt ? new Date(savedAt).toLocaleString() : 'jetzt';
   btn.title = `${count} Hashes / ${pairs} (hash,pal)-Paare — geladen am ${when}.\n` +
-              `Bleibt über Reloads erhalten. Zum Aktualisieren einfach eine neue ` +
-              `snes_hd_spritecap.txt wählen.`;
+              `Bleibt über Reloads erhalten. Klick = neue snes_hd_spritecap.txt ERGÄNZEN, ` +
+              `Shift+Klick = ERSETZEN.`;
 }
 
 async function restoreSpriteCapFromDb() {
@@ -11141,7 +11182,7 @@ async function saveCurrentHDToContainer(containerName) {
   // and the direct cause of Mesen rendering a mix of unrelated tiles per level, plus
   // fingerprint generation failing for those gfxsets (no tile hash is unique to a
   // single gfxset when several gfxsets share the exact same underlying data).
-  const currentMatchesActive = currentStyle && activeGfxIdx != null && currentStyle.graphics === activeGfxIdx;
+  let currentMatchesActive = currentStyle && activeGfxIdx != null && currentStyle.graphics === activeGfxIdx;
 
   // Ensure catalogData (the fallback source for everything below that ISN'T covered
   // by VRAM_GROUND_TRUTH — tileArrangementData, chrRawData, ppuConfig, tilemaps) is
@@ -11156,6 +11197,26 @@ async function saveCurrentHDToContainer(containerName) {
   if (activeGfxIdx != null && (!catalogData || catalogData.gfxSetIndex !== activeGfxIdx) && graphicsSetsMap?.has(activeGfxIdx)) {
     catalogData = buildCatalogByGfxSet(activeGfxIdx);
     console.log(`[save] Rebuilt catalogData for gfxset ${activeGfxIdx} from ROM (cached catalogData was for a different gfxset or missing)`);
+  }
+  // currentStyle can claim the saved gfxset while currentTileRawData/currentBgData
+  // still hold ANOTHER level. Measured 28.09.: set gfxset_2C (Haunted Hall, saved
+  // 25.09. 16:13) carried Pirate Panic's tile arrangement (byte-identical to
+  // gfxset_07's), chrRawData and ppuConfig — so its 466 HD blocks were cut up along
+  // Pirate Panic's map and landed at wrong addresses (BG1 names $3000-$6950, SD in
+  // game). gfxset_22 got a 737-block table from yet another level. The catalog's
+  // arrangement is built from ROM for exactly this gfxset (and equals the stored one
+  // for working sets, e.g. gfxset_07) — the level data must agree with it or it is
+  // not used.
+  if (currentMatchesActive && catalogData?.tileArrangement && currentTileRawData?.tileArrangement) {
+    const a = catalogData.tileArrangement.data, b = currentTileRawData.tileArrangement.data;
+    const n = Math.min((catalogData.tileCount || 0), (currentTileRawData.tileCount || 0)) * 32;
+    let same = n > 0;
+    for (let i = 0; same && i < n; i++) if (a[i] !== b[i]) same = false;
+    if (!same) {
+      currentMatchesActive = false;
+      console.error(`[save] Geladene Level-Daten passen NICHT zu gfxset ${activeGfxIdx} (Zuordnungstabelle ` +
+        `weicht vom ROM-Katalog ab) — veraltet? Es werden die Katalogdaten aus dem ROM verwendet.`);
+    }
   }
 
   // Determine setId from current context
@@ -11261,16 +11322,25 @@ async function saveCurrentHDToContainer(containerName) {
   }
 
   let bg2Blob = null, bg3Blob = null, wallBlob = null;
-  if (hdPack.bg2) bg2Blob = await bitmapToBlob(hdPack.bg2);
-  if (hdPack.bg3) bg3Blob = await bitmapToBlob(hdPack.bg3);
+  // hdPack.bg2/bg3 is ONE slot for the whole session. Take it only if it belongs to
+  // the gfxset being saved — exactly the check wall/cmFg below always had. Without
+  // it, Pirate Panic's upscaled sky/sea (resident from an earlier container load)
+  // was written into gfxset_22 (Target Terror) and gfxset_2F (Arctic Abyss) on 25.09.
+  // Measured 28.09.: their pack BG2 files show Pirate Panic's sea.
+  const layerOwn = (g) => g === undefined || g === activeGfxIdx;
+  if (hdPack.bg2 && layerOwn(hdPack.bg2GfxSet)) bg2Blob = await bitmapToBlob(hdPack.bg2);
+  else if (hdPack.bg2) console.warn(`[save] BG2-Bild im Speicher gehoert zu gfxset ${hdPack.bg2GfxSet}, nicht ${activeGfxIdx} — nicht uebernommen.`);
+  if (hdPack.bg3 && layerOwn(hdPack.bg3GfxSet)) bg3Blob = await bitmapToBlob(hdPack.bg3);
+  else if (hdPack.bg3) console.warn(`[save] BG3-Bild im Speicher gehoert zu gfxset ${hdPack.bg3GfxSet}, nicht ${activeGfxIdx} — nicht uebernommen.`);
   // bg2/bg3 are freed from hdPack after a save exactly like the tiles, so a re-save
   // would null them out in the record. Keep whatever is already stored.
+  let bg2FromStore = false, bg3FromStore = false;
   if (!bg2Blob && existingSet?.bg2Blob) {
-    bg2Blob = existingSet.bg2Blob;
+    bg2Blob = existingSet.bg2Blob; bg2FromStore = true;
     console.log(`[save] "${setId}": gespeichertes BG2-Bild übernommen (keines im Speicher).`);
   }
   if (!bg3Blob && existingSet?.bg3Blob) {
-    bg3Blob = existingSet.bg3Blob;
+    bg3Blob = existingSet.bg3Blob; bg3FromStore = true;
     console.log(`[save] "${setId}": gespeichertes BG3-Bild übernommen (keines im Speicher).`);
   }
   // Shop / world-map layers, same rule as bg2/bg3: keep what is stored when
@@ -11540,30 +11610,91 @@ async function saveCurrentHDToContainer(containerName) {
 
   // Store full VRAM snapshot for content-hash computation at export time.
   // Sources (in priority order):
-  // 1. VRAM_GROUND_TRUTH[gfxset_XX] — real VRAM dumped directly from Mesen at
-  //    runtime (Lua script, all 25 playable gfxsets, embedded 2026-06-29, commit
-  //    882f23a). ALWAYS authoritative when available for this gfxset: the viewer's
-  //    own VRAM simulation (loadLevelBackground(), used by both currentBgData and
-  //    catalogData below) is KNOWN to deviate from real runtime VRAM for some
-  //    gfxsets (e.g. 37 = Lava-Levels) due to VBlank DMA / init-code writes it
-  //    doesn't fully replicate (SNES_HD_PACK_PROJECT.md, "VRAM Dump/Import
-  //    Feature", 2026-06-15). Checked FIRST, unconditionally — not just as a
-  //    last-resort gap-filler like applyGroundTruthVram() does elsewhere — so
-  //    vramSnapshot is correct regardless of which Level/gfxset the UI happens to
-  //    have loaded at import time.
-  // 2. currentBgData.vram — simulated; only trusted if it actually belongs to the
-  //    gfxset being saved (currentMatchesActive) — otherwise it's stale.
-  // 3. catalogData.vram — simulated fallback (gfxset catalog mode).
+  // 1. VRAM_GROUND_TRUTH[gfxset_XX] — real VRAM dumped from Mesen (Lua). ALWAYS
+  //    authoritative when available: the viewer's VRAM simulation is known to
+  //    deviate from runtime VRAM for some gfxsets. Re-confirmed 28.09.: two fresh
+  //    Haunted Hall dumps are byte-identical to GT "2C" in $2000-$6FFF. (A brief
+  //    detour the same morning demoted the GT on a circular bgcap argument — undone.)
+  // 2. the snapshot already in the container (e.g. a hand-imported Mesen dump).
+  // 3. currentBgData.vram — simulated; only if it belongs to this gfxset.
+  // 4. catalogData.vram — simulated fallback (gfxset catalog mode).
+  // bgcap scores are only logged, never used to choose (the bgcap's G is the
+  // DETECTED gfxset, which can be wrong).
   let vramSnapshot = null;
   const gtKey = activeGfxIdx != null ? `gfxset_${activeGfxIdx.toString(16).toUpperCase().padStart(2, '0')}` : null;
-  if (gtKey && typeof VRAM_GROUND_TRUTH !== 'undefined' && VRAM_GROUND_TRUTH[gtKey]) {
-    vramSnapshot = _b64ToUint8Array(VRAM_GROUND_TRUTH[gtKey]);
-    console.log(`[save] Using VRAM_GROUND_TRUTH for ${gtKey} (authoritative real VRAM dump, not simulated)`);
-  } else if (currentMatchesActive && currentBgData && currentBgData.vram) {
-    vramSnapshot = new Uint8Array(currentBgData.vram);  // 128KB copy
-  } else if (catalogData && catalogData.vram) {
-    vramSnapshot = new Uint8Array(catalogData.vram);  // catalog-mode / stale-currentBgData fallback
-    console.log(`[save] Using catalogData.vram as vramSnapshot for ${gtKey || '?'} (no ground truth available, simulation only)`);
+  {
+    const cands = [];
+    if (gtKey && typeof VRAM_GROUND_TRUTH !== 'undefined' && VRAM_GROUND_TRUTH[gtKey]) {
+      cands.push({ name: `Ground-Truth ${gtKey}`, vram: _b64ToUint8Array(VRAM_GROUND_TRUTH[gtKey]) });
+    }
+    if (existingSet?.vramSnapshot && (existingSet.vramSnapshot.length || existingSet.vramSnapshot.byteLength)) {
+      const v = existingSet.vramSnapshot instanceof Uint8Array
+        ? existingSet.vramSnapshot : new Uint8Array(existingSet.vramSnapshot);
+      cands.push({ name: 'Container (bisher)', vram: v });
+    }
+    if (currentMatchesActive && currentBgData && currentBgData.vram) {
+      cands.push({ name: 'Simulation (Level)', vram: new Uint8Array(currentBgData.vram) });
+    } else if (catalogData && catalogData.vram) {
+      cands.push({ name: 'Simulation (Katalog)', vram: new Uint8Array(catalogData.vram) });
+    }
+    for (const c of cands) c.score = scoreVramAgainstBgcap(c.vram, activeGfxIdx);
+    const chosen = cands[0] || null;
+    if (chosen) {
+      vramSnapshot = chosen.vram;
+      const summary = cands.map(c => `${c.name}: ${vramScoreText(c.score)}`).join(' | ');
+      console.log(`[save] VRAM fuer ${gtKey || '?'}: "${chosen.name}" behalten/gewaehlt. bgcap-Abgleich: ${summary}`);
+      const better = cands.find(c => c.score && c.score.ratio >= VRAM_CHECK_MIN_RATIO
+        && (!chosen.score || c.score.hit > chosen.score.hit));
+      if (chosen.score && chosen.score.ratio < VRAM_CHECK_MIN_RATIO && better) {
+        console.warn(`[save] Hinweis: "${better.name}" passt besser zur BG-Aufnahme als "${chosen.name}". `
+          + `NICHT automatisch uebernommen — die Aufnahme kann unter einem falsch erkannten gfxset stehen. `
+          + `Im Zweifel frischen Abzug mit dkc2_vram_snapshot.lua machen.`);
+      }
+    }
+  }
+
+  // BG2/BG3: pick the tilemap that actually produced the layer image, and drop a
+  // stored image that belongs to no candidate (see fitLayerImage). Runs on every
+  // save, so a plain re-import repairs a set — no console step.
+  {
+    const gtV = (gtKey && typeof VRAM_GROUND_TRUTH !== 'undefined' && VRAM_GROUND_TRUTH[gtKey])
+      ? _b64ToUint8Array(VRAM_GROUND_TRUTH[gtKey]) : null;
+    const gtC = (gtKey && typeof CGRAM_GROUND_TRUTH !== 'undefined' && CGRAM_GROUND_TRUTH[gtKey])
+      ? _b64ToUint8Array(CGRAM_GROUND_TRUTH[gtKey]) : null;
+    const catCfg = catalogData?.ppuConfig || {};
+    for (const L of [2, 3]) {
+      const blob = L === 2 ? bg2Blob : bg3Blob;
+      if (!blob || !gtV || !gtC || !ppuConfig) continue;
+      const w = ppuConfig[`bg${L}TilesW`] || 32, hgt = ppuConfig[`bg${L}TilesH`] || 32;
+      const chrBase = ppuConfig[`bg${L}ChrBase`];
+      const base = ppuConfig[`bg${L}TilemapBase`] ?? catCfg[`bg${L}TilemapBase`];
+      if (chrBase == null || w > 64 || hgt > 64) continue;   // ShipDeck virtual maps etc.: leave alone
+      const cands = [];
+      if (base != null && base * 2 + w * hgt * 2 <= gtV.length) {
+        cands.push({ name: 'Ground-Truth', tm: Array.from(gtV.slice(base * 2, base * 2 + w * hgt * 2)) });
+      }
+      const cur = L === 2 ? bg2TilemapData : bg3TilemapData;
+      if (cur && cur.length) cands.push({ name: 'bisher', tm: cur });
+      const catTm = L === 2 ? catalogData?.bg2TilemapData : catalogData?.bg3TilemapData;
+      if (catTm && catTm.length) cands.push({ name: 'Katalog', tm: catTm });
+      if (!cands.length) continue;
+      const bpp = (L === 3 && ppuConfig.bgMode === 1) ? 2 : 4;
+      for (const c of cands) c.err = await fitLayerImage(blob, c.tm, w, hgt, chrBase, bpp, gtV, gtC);
+      cands.sort((a, b) => a.err - b.err);
+      const best = cands[0];
+      const txt = cands.map(c => `${c.name} ${c.err.toFixed(1)}`).join(', ');
+      if (best.err <= LAYER_FIT_MAX_ERR) {
+        if (L === 2) bg2TilemapData = best.tm; else bg3TilemapData = best.tm;
+        console.log(`[save] BG${L} "${setId}": Tilemap "${best.name}" passt zum Ebenenbild (Abweichung ${txt}).`);
+      } else if ((L === 2 && bg2FromStore) || (L === 3 && bg3FromStore)) {
+        if (L === 2) bg2Blob = null; else bg3Blob = null;
+        console.error(`[save] BG${L} "${setId}": gespeichertes Ebenenbild passt zu KEINER Tilemap dieses Levels ` +
+          `(Abweichung ${txt}) — stammt aus einem anderen Set und wird entfernt.`);
+      } else {
+        console.warn(`[save] BG${L} "${setId}": importiertes Ebenenbild passt schlecht zum echten VRAM ` +
+          `(Abweichung ${txt}) — behalten (animierte Ebene? anderes Level des gfxsets?).`);
+      }
+    }
   }
 
   const clusters = [];
@@ -11646,8 +11777,10 @@ async function saveCurrentHDToContainer(containerName) {
     // R3: reference BG palette (CGRAM 0-127, BGR555) this set's tiles were
     // rendered/upscaled under. Exported as palettes.bin so Mesen can diff
     // live CGRAM against it (underwater darkening, sunset HDMA, cycling).
-    paletteSnapshot: (currentPalette && currentPalette.length >= 128)
-      ? Array.from(currentPalette.slice(0, 128)) : null,
+    // Only the loaded level's palette when that level IS this gfxset (28.09.: re-imports
+    // of 2B/22 captured Pirate Panic's, id=3); otherwise keep the stored one.
+    paletteSnapshot: (currentMatchesActive && currentPalette && currentPalette.length >= 128)
+      ? Array.from(currentPalette.slice(0, 128)) : (existingSet?.paletteSnapshot ?? null),
     // Must match the setId/tile-filter source above (activeGfxIdx), not currentStyle
     // directly — this is the tag ensureGfxSetHDLoaded()/loadContainerToHDPack() use to
     // prefix reloaded tile keys and stamp bg2GfxSet/bg3GfxSet. A mismatch here was the
@@ -11661,8 +11794,10 @@ async function saveCurrentHDToContainer(containerName) {
   // R3 feedback: make it obvious whether this save captured a palette
   // reference — a missing snapshot silently degrades the export to the
   // ROM first-level derivation (wrong-sister-level color-cast trap).
-  if (currentPalette && currentPalette.length >= 128) {
+  if (currentMatchesActive && currentPalette && currentPalette.length >= 128) {
     console.log(`[save] paletteSnapshot captured for "${setId}" (palette of currently loaded level, id=${currentLevelId})`);
+  } else if (existingSet?.paletteSnapshot) {
+    console.log(`[save] paletteSnapshot fuer "${setId}" beibehalten (geladenes Level gehoert nicht zu diesem gfxset).`);
   } else {
     console.warn(`[save] paletteSnapshot NICHT gesetzt für "${setId}" — kein Level geladen. Export fällt für dieses Set auf ROM-Ableitung (erstes Level des Sets) zurück.`);
   }
@@ -11750,6 +11885,38 @@ function _b64ToUint8Array(b64) {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+// How well does a VRAM snapshot agree with what Mesen really saw for this gfxset?
+// The bgcap logs, per BG tile lookup, the VRAM word address and the tile's bytes.
+// For every STATIC address (animated ones hold a different phase at any moment and
+// prove nothing) the snapshot must hold exactly those bytes at addr*2. That makes
+// the recording an independent check on a snapshot, whatever its source.
+// Why it exists: the embedded ground truth (Lua dumps, 07.08.) is filed under the
+// wrong gfxset for several sets. Measured 25.09.: gfxset 44 (Haunted Hall) matched
+// 3/305 with its own "2C" dump and 253/305 with "22". The save path took the GT
+// unconditionally, overwrote a good snapshot, and Haunted Hall was recognised as 34.
+// Returns null when the recording has too few static tiles of this gfxset to judge.
+const VRAM_CHECK_MIN_TILES = 20;
+function scoreVramAgainstBgcap(vram, gfxIdx) {
+  if (!vram || !bgCapEntries || gfxIdx == null) return null;
+  let hit = 0, total = 0;
+  for (const e of bgCapEntries) {
+    if (e.gfx !== gfxIdx || e.isAnim) continue;
+    const off = e.addr * 2;
+    if (off + e.bytes.length > vram.length) continue;
+    total++;
+    let same = true;
+    for (let i = 0; i < e.bytes.length; i++) {
+      if (vram[off + i] !== e.bytes[i]) { same = false; break; }
+    }
+    if (same) hit++;
+  }
+  return total >= VRAM_CHECK_MIN_TILES ? { hit, total, ratio: hit / total } : null;
+}
+const VRAM_CHECK_MIN_RATIO = 0.5;
+function vramScoreText(s) {
+  return s ? `${s.hit}/${s.total} (${Math.round(s.ratio * 100)} %)` : 'nicht pruefbar';
 }
 
 // Restore a container set's shop / world-map HD layers into hdPack.
@@ -11942,9 +12109,16 @@ async function ensureGfxSetHDLoaded(gfxIdx) {
   // a revisited level to show a stale/foreign background or lose its HD clusters
   // (2026-07 regression).
   if (hdPack && hdPack.gfxSetIndex === gfxIdx) return; // this gfxset is already active
+  // Never swap hdPack while an import is between "loaded into hdPack" and "saved to
+  // the container": the swap below closes the just-imported clusters and replaces
+  // bg2/bg3 with the displayed level's. Seen 28.09. during a re-import: the viewer
+  // showed Pirate Panic, auto-loaded gfxset 7 mid-import -> gfxset_2C's save failed
+  // ("image source is detached"), gfxset_2F's save found Pirate Panic's BG2/BG3.
+  if (hdImportBusy > 0) { console.log(`[HD auto-load] gfxset ${gfxIdx} zurueckgestellt — Import laeuft.`); return; }
 
   const setId = `gfxset_${gfxIdx.toString(16).toUpperCase().padStart(2, '0')}`;
   const sets = await hdGetContainerSets(activeContainerName);
+  if (hdImportBusy > 0) return;   // an import may have started during the await
   const set = sets.find(s => s.type === 'level' && s.setId === setId);
   if (!set) return; // nothing saved for this gfxset yet
 
@@ -12659,6 +12833,12 @@ function canvasIsFullyTransparent(ctx, w, h) {
 
 async function exportAsTexturePack(containerName) {
   if (typeof JSZip === 'undefined') { alert('JSZip library not loaded.'); return; }
+  if (hdImportBusy > 0) {
+    alert('Ein Import speichert gerade noch in den Container.\n\n'
+      + 'Der Pack-Export liest nur den Container — was noch nicht gespeichert ist, fehlte im Pack. '
+      + 'Bitte warten, bis der Import-Knopf wieder "Import HD" zeigt, dann erneut exportieren.');
+    return;
+  }
 
   _emptyTilesSkipped = 0;
 
@@ -12720,6 +12900,35 @@ async function exportAsTexturePack(containerName) {
   const levelSets = sets.filter(s => s.type === 'level');
 
   if (levelSets.length === 0) { alert('Container hat keine Level-Tiles.'); return; }
+
+  // Every snapshot the export will hash from (stored, or the GT fallback applied
+  // further down) is checked against the BG recording BEFORE anything is built.
+  // A wrong snapshot yields wrong hashes AND a wrong fingerprint, and the pack
+  // gives no sign of it — Haunted Hall 25.09. was recognised as gfxset 34.
+  if (bgCapEntries) {
+    const badSnaps = [];
+    for (const s of levelSets) {
+      let v = s.vramSnapshot, src = 'Container';
+      if (!v && typeof VRAM_GROUND_TRUTH !== 'undefined' && s.setId && VRAM_GROUND_TRUTH[s.setId]) {
+        v = _b64ToUint8Array(VRAM_GROUND_TRUTH[s.setId]); src = 'Ground-Truth';
+      }
+      if (!v) continue;
+      if (!(v instanceof Uint8Array)) v = new Uint8Array(v);
+      const sc = scoreVramAgainstBgcap(v, s.gfxSetIndex ?? null);
+      if (sc) console.log(`[vramcheck] ${s.setId} (gfxset ${s.gfxSetIndex}, ${src}): ${vramScoreText(sc)}`);
+      if (sc && sc.ratio < VRAM_CHECK_MIN_RATIO) badSnaps.push(`${s.setId} (gfxset ${s.gfxSetIndex}, ${src}): ${vramScoreText(sc)}`);
+    }
+    // Only a note: the bgcap's G is the gfxset Mesen DETECTED at recording time.
+    // A low score means "abzug wrong" OR "recording made under a misdetection"
+    // (28.09.: Haunted Hall's correct snapshot scored 0 % against Target Terror
+    // tiles filed as G44). A fresh dump (dkc2_vram_snapshot.lua) decides.
+    if (badSnaps.length) {
+      console.warn(`[vramcheck] Abzug und BG-Aufnahme widersprechen sich (Abzug falsch ODER Aufnahme unter ` +
+        `falsch erkanntem gfxset):\n  ${badSnaps.join('\n  ')}`);
+    }
+  } else {
+    console.warn('[vramcheck] Kein bgcap geladen — VRAM-Abzuege werden nicht gegengeprueft.');
+  }
 
   // Check if tileArrangement data is available
   const setsWithArrangement = levelSets.filter(s => s.tileArrangementData && s.ppuConfig);
@@ -14923,11 +15132,68 @@ async function exportAsTexturePack(containerName) {
     const MAX_REF_TILES = 8;
     const MIN_REF_TILES = 4;
 
+    // Addresses whose content CHANGES at runtime must not carry a reference tile:
+    // Mesen's DetectActiveGfxset requires ALL refs to match, so one ref inside an
+    // animation makes the gfxset undetectable whenever another phase is showing, and
+    // an undetected gfxset blocks every HD lookup in the level. The snapshot cannot
+    // tell (it holds one phase); the bgcap recording can: it logs what Mesen really
+    // saw at each address. Measured 25.09. on Haunted Hall (gfxset 44): 4 of its 8
+    // refs sat inside Kackle's animated BG2 area ($6500-$6590), and bgcap had
+    // recorded DIFFERENT tiles at all four.
+    const fpRuntimeHashes = new Map();   // "gfxset:addr" -> Set(hash seen in game)
+    if (bgCapEntries) {
+      for (const b of bgCapEntries) {
+        const k = `${b.gfx}:${b.addr}`;
+        if (!fpRuntimeHashes.has(k)) fpRuntimeHashes.set(k, new Set());
+        fpRuntimeHashes.get(k).add(String(b.hash).toUpperCase());
+      }
+    } else {
+      console.warn('[fingerprints] Kein bgcap geladen — Referenzkacheln in Laufzeit-Animationen ' +
+                   'koennen nicht ausgeschlossen werden (Erkennung im Spiel evtl. unzuverlaessig).');
+    }
+    let fpRuntimeDropped = 0;
+
+    // Every set's VRAM snapshot — used to (a) tell misdetected bgcap content from
+    // real runtime changes and (b) ORDER the fingerprints (see below the loop).
+    // Deliberately NOT used to reject candidates: a gfxset serves several levels,
+    // and what all of them share can also sit in another gfxset. Measured 28.09.:
+    // gfxset 34 (Rickety Race, Target Terror) has 835 BG1 tiles, ALL present in
+    // Haunted Hall (44) at the same addresses. Rejecting them left 34 without any
+    // fingerprint (its remaining own art is BG3, which differs between its levels).
+    const fpOtherVram = new Map();   // gfxset -> VRAM snapshot
+    for (const s of levelSets) {
+      if (s.gfxSetIndex == null || !s.vramSnapshot || fpOtherVram.has(s.gfxSetIndex)) continue;
+      fpOtherVram.set(s.gfxSetIndex, s.vramSnapshot instanceof Uint8Array
+        ? s.vramSnapshot : new Uint8Array(s.vramSnapshot));
+    }
+    const fpVramHashAt = (vram, addr) =>
+      (addr * 2 + 32 <= vram.length) ? fnv1a_64(vram, addr * 2, 32) : null;
+
     for (const [gs, entries] of gfxsetMap) {
       const candidates = [];
       for (const e of entries) {
         // Skip BG3/BG4 tiles (2bpp) — fingerprint detection uses 4bpp wordCount
         if (e.layer >= 2) continue;
+        // A recorded hash that equals ANOTHER set's snapshot at this address is not
+        // a runtime change but a misdetection: the bgcap's G is the gfxset Mesen
+        // DETECTED. Measured 28.09.: "G34" held 316 Haunted Hall tiles, "G44" 251
+        // Target Terror tiles — the old filter threw out every real candidate of 34.
+        const seen = fpRuntimeHashes.get(`${gs}:${e.vramAddr}`);
+        if (seen) {
+          const own = e.hash.toString(16).toUpperCase().padStart(16, '0');
+          let changes = false;
+          for (const hs of seen) {
+            if (hs === own) continue;
+            let foreign = false;
+            for (const [otherGs, otherVram] of fpOtherVram) {
+              if (otherGs === gs) continue;
+              const oh = fpVramHashAt(otherVram, e.vramAddr);
+              if (oh !== null && oh.toString(16).toUpperCase().padStart(16, '0') === hs) { foreign = true; break; }
+            }
+            if (!foreign) { changes = true; break; }
+          }
+          if (changes) { fpRuntimeDropped++; continue; }
+        }
         const hashStr = e.hash.toString();
         // Check if this hash appears in any OTHER gfxset
         let isUnique = true;
@@ -14972,6 +15238,42 @@ async function exportAsTexturePack(containerName) {
       }
     }
 
+    // ORDER: the more specific fingerprint must be checked first. Mesen (S56+)
+    // checks in FILE order and takes the first full match. If fingerprint X fully
+    // matches set Y's VRAM, then in Y's levels both X and Y match — Y must come
+    // before X. Case 28.09.: fp34 sits on track tiles all levels of 34 share, and
+    // Haunted Hall (44) has them too; fp44 sits on tiles only 44 has. So 44 goes
+    // first: Haunted Hall -> 44, Rickety Race / Target Terror -> 34.
+    // If X matches Y AND Y matches X, no order helps — reported as an error.
+    const fpCovers = (x, y) => {           // does fingerprint x fully match set y's VRAM?
+      const v = fpOtherVram.get(y), refs = fpEntries.get(x);
+      return !!v && refs.every(r => fpVramHashAt(v, r.vramAddr) === r.hash);
+    };
+    const fpOrder = [];
+    {
+      const all = [...fpEntries.keys()].sort((a, b) => a - b);
+      const mustPrecede = new Map(all.map(g => [g, new Set()]));   // g -> sets that must come before g
+      for (const x of all) {
+        for (const y of all) {
+          if (x === y || !fpCovers(x, y)) continue;
+          if (fpCovers(y, x)) {
+            if (x < y) console.error(`[fingerprints] KONFLIKT: Fingerabdruck ${x} und ${y} passen jeweils auf den ` +
+              `VRAM des anderen — keine Reihenfolge trennt sie, eines der Level wird falsch erkannt.`);
+            continue;
+          }
+          mustPrecede.get(x).add(y);
+          console.log(`[fingerprints] Abdruck ${x} passt auch auf gfxset ${y} → ${y} wird vor ${x} geprueft.`);
+        }
+      }
+      const placed = new Set();
+      while (fpOrder.length < all.length) {
+        const next = all.find(g => !placed.has(g) && [...mustPrecede.get(g)].every(p => placed.has(p)))
+          ?? all.find(g => !placed.has(g));   // only reachable with a cycle of 3+
+        fpOrder.push(next);
+        placed.add(next);
+      }
+    }
+
     if (fpEntries.size > 0) {
       // Calculate buffer size: 1 + sum(2 + refCount * 10)
       let totalSize = 1;  // gfxsetCount byte
@@ -14984,7 +15286,8 @@ async function exportAsTexturePack(containerName) {
 
       fpView.setUint8(offset, fpEntries.size); offset += 1;
 
-      for (const [gs, refs] of fpEntries) {
+      for (const gs of fpOrder) {
+        const refs = fpEntries.get(gs);
         fpView.setUint8(offset, gs); offset += 1;
         fpView.setUint8(offset, refs.length); offset += 1;
         for (const ref of refs) {
@@ -14996,7 +15299,10 @@ async function exportAsTexturePack(containerName) {
       }
 
       root.file('fingerprints.bin', new Uint8Array(fpBuf));
-      console.log(`[fingerprints] Generated fingerprints for ${fpEntries.size} gfxsets`);
+      console.log(`[fingerprints] Generated fingerprints for ${fpEntries.size} gfxsets, Pruefreihenfolge: ${fpOrder.join(',')}`);
+      const noSnap = fpOrder.filter(g => !fpOtherVram.has(g));
+      if (noSnap.length) console.warn(`[fingerprints] Ohne VRAM-Abzug (Reihenfolge fuer sie nicht pruefbar): ${noSnap.join(',')}`);
+      if (fpRuntimeDropped) console.log(`[fingerprints] ${fpRuntimeDropped} Kandidaten verworfen: im Spiel stand an ihrer Adresse ein anderer Inhalt (bgcap).`);
     }
   }
   }
@@ -15785,8 +16091,20 @@ document.getElementById('vramDumpInput').addEventListener('change', async (e) =>
     const fp = fnv1a_64(vramSnapshot, 0, Math.min(512, vramSnapshot.length));
     console.log(`[VRAM Import] Saved to ${containerName}/${type}/${setId}. Fingerprint(first 512B): ${fp.toString(16)}`);
 
-    statusEl.textContent = `VRAM-Dump importiert für ${setId} (${raw.length} bytes → ${vramSnapshot.length} bytes). Jetzt "Texture Pack" exportieren.`;
-    statusEl.style.color = '#4caf50';
+    // Check the dump against the BG recording: a dump taken in the wrong level, or
+    // while another screen was up, is exactly what broke Haunted Hall. Old vs new.
+    const gfxIdx = targetSet.gfxSetIndex ?? null;
+    const oldSnap = targetSet.vramSnapshot
+      ? (targetSet.vramSnapshot instanceof Uint8Array ? targetSet.vramSnapshot : new Uint8Array(targetSet.vramSnapshot))
+      : null;
+    const newScore = scoreVramAgainstBgcap(vramSnapshot, gfxIdx);
+    const oldScore = scoreVramAgainstBgcap(oldSnap, gfxIdx);
+    const check = `bgcap-Abgleich gfxset ${gfxIdx}: neu ${vramScoreText(newScore)}, bisher ${vramScoreText(oldScore)}`;
+    console.log(`[VRAM Import] ${check}`);
+    const bad = newScore && newScore.ratio < VRAM_CHECK_MIN_RATIO;
+    statusEl.textContent = `VRAM-Dump importiert für ${setId} (${raw.length} bytes → ${vramSnapshot.length} bytes). ${check}. `
+      + (bad ? 'ACHTUNG: passt schlecht — Dump im richtigen Level gemacht?' : 'Jetzt "Texture Pack" exportieren.');
+    statusEl.style.color = bad ? '#f44336' : '#4caf50';
     await refreshContainerList();
   } catch (err) {
     statusEl.textContent = `VRAM Import Fehler: ${err.message}`;
@@ -15795,6 +16113,144 @@ document.getElementById('vramDumpInput').addEventListener('change', async (e) =>
   }
   e.target.value = '';  // reset for re-selection
 });
+
+// How well does an (upscaled) BG layer image match what a tilemap + real VRAM/CGRAM
+// render? Mean RGB distance (0-255) over the pixels the image covers; where the
+// render is transparent instead, 255. Measured 28.09.: correct layer images score ~2-4 (only
+// palette post-processing differs), Pirate Panic's sea stored under Target Terror
+// and wrong tilemaps score ~90-250.
+const LAYER_FIT_MAX_ERR = 25;
+async function fitLayerImage(blob, tm, tilesW, tilesH, chrBase, bpp, vram, cgram) {
+  const W = tilesW * 8, H = tilesH * 8;
+  let bmp;
+  try { bmp = await createImageBitmap(blob); } catch (e) { return 255; }
+  const cv = new OffscreenCanvas(W, H);
+  const ctx = cv.getContext('2d');
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, 0, 0, W, H);
+  bmp.close?.();
+  const img = ctx.getImageData(0, 0, W, H).data;
+  const pal = (i) => { const c = cgram[i * 2] | (cgram[i * 2 + 1] << 8);
+    return [(c & 31) << 3, ((c >> 5) & 31) << 3, ((c >> 10) & 31) << 3]; };
+  const bytesPerTile = bpp === 2 ? 16 : 32;
+  let sum = 0, n = 0;
+  for (let ty = 0; ty < tilesH; ty++) {
+    for (let tx = 0; tx < tilesW; tx++) {
+      let off = ((ty & 31) * 32 + (tx & 31)) * 2;
+      if (tx >= 32) off += 0x800;
+      if (ty >= 32) off += tilesW > 32 ? 0x1000 : 0x800;
+      if (off + 1 >= tm.length) continue;
+      const e = tm[off] | (tm[off + 1] << 8);
+      const t = e & 0x3FF, p = (e >> 10) & 7, fx = e & 0x4000, fy = e & 0x8000;
+      const a = ((chrBase * 2) + t * bytesPerTile) & 0xFFFF;
+      for (let y = 0; y < 8; y++) {
+        const yy = fy ? 7 - y : y;
+        const p0 = vram[a + yy * 2], p1 = vram[a + yy * 2 + 1];
+        const p2 = bpp === 4 ? vram[a + 16 + yy * 2] : 0, p3 = bpp === 4 ? vram[a + 17 + yy * 2] : 0;
+        for (let x = 0; x < 8; x++) {
+          const s = fx ? x : 7 - x;
+          const ci = ((p0 >> s) & 1) | (((p1 >> s) & 1) << 1) | (((p2 >> s) & 1) << 2) | (((p3 >> s) & 1) << 3);
+          const q = ((ty * 8 + y) * W + tx * 8 + x) * 4;
+          // Only pixels the IMAGE covers: rows the game never shows can hold VRAM
+          // garbage the export left empty (Target Terror's bottom rows).
+          const opImg = img[q + 3] > 128, opRef = ci !== 0;
+          if (!opImg) continue;
+          n++;
+          if (opImg !== opRef) { sum += 255; continue; }
+          const c = pal((bpp === 2 ? p * 4 : p * 16) + ci);
+          sum += (Math.abs(img[q] - c[0]) + Math.abs(img[q + 1] - c[1]) + Math.abs(img[q + 2] - c[2])) / 3;
+        }
+      }
+    }
+  }
+  return n ? sum / n : 255;
+}
+
+// --- Repair a set's mapping metadata from ROM (28.09.) ---
+// For sets that were saved with ANOTHER level's metadata (gfxset_2C carried Pirate
+// Panic's tile arrangement / chrRawData / ppuConfig, gfxset_22 a 737-block table).
+// Rewrites ONLY the ROM-derived mapping fields from buildCatalogByGfxSet(g) — the
+// same source that is byte-identical to the stored table of working sets — plus the
+// Ground-Truth VRAM/CGRAM. HD art (tiles, clusters, BG2/BG3 images, anim tiles) is
+// left untouched. Console: await repairSetMetadataFromRom(44)
+// opts.clear: layer images to REMOVE because they are known to be foreign, e.g.
+// await repairSetMetadataFromRom(43, { clear: ['bg2'] }) — gfxset_2B's export never
+// contained a bg2.png, so whatever BG2 image the record holds came from another set.
+async function repairSetMetadataFromRom(g, opts = {}, containerName = activeContainerName) {
+  if (typeof opts === 'string') { containerName = opts; opts = {}; }
+  const clear = new Set(opts.clear || []);
+  if (!rom || !graphicsSetsMap?.has(g)) { console.error(`[repair] ROM nicht geladen oder gfxset ${g} unbekannt`); return 0; }
+  if (!containerName) { console.error('[repair] Kein Container aktiv'); return 0; }
+  const h = (a) => { if (!a) return '-'; const u = a instanceof Uint8Array ? a : new Uint8Array(a);
+    return u.length + 'B/' + fnv1a_64(u, 0, u.length).toString(16).slice(0, 10); };
+  const cat = buildCatalogByGfxSet(g);
+  if (!cat?.tileArrangement || !cat.gfxData) { console.error(`[repair] Katalog fuer gfxset ${g} ohne Daten`); return 0; }
+  const arr = Array.from(new Uint8Array(cat.tileArrangement.data.buffer, 0, (cat.tileCount || 0) * 32));
+  const chr = Array.from(cat.gfxData.data.slice(0, (cat.gfxCount || 0) * 32));
+  const key = `gfxset_${g.toString(16).toUpperCase().padStart(2, '0')}`;
+  const gtVram = (typeof VRAM_GROUND_TRUTH !== 'undefined' && VRAM_GROUND_TRUTH[key]) ? _b64ToUint8Array(VRAM_GROUND_TRUTH[key]) : null;
+  let gtPal = null;
+  if (typeof CGRAM_GROUND_TRUTH !== 'undefined' && CGRAM_GROUND_TRUTH[key]) {
+    const cg = _b64ToUint8Array(CGRAM_GROUND_TRUTH[key]);
+    gtPal = [];
+    for (let i = 0; i < 128; i++) gtPal.push(cg[i * 2] | (cg[i * 2 + 1] << 8));
+  }
+  // BG2/BG3 (and the SSB BG1 overlay) tilemaps: read at the catalog's addresses but
+  // from the REAL dump. The exported layer art is the level of the Ground-Truth dump;
+  // the catalog simulates the gfxset's reference level instead. Measured 28.09.:
+  // Target Terror's exported bg2.png = render of GT "22" at $5C00 (identical up to the
+  // off-screen rows), while the catalog simulated Rickety Race there -> the pack cut the
+  // fairground along the wrong map ("looks like Pirate Panic").
+  const cfg = cat.ppuConfig || {};
+  const readTm = (base, w, hgt, fallback) => {
+    if (!gtVram || base == null || fallback == null) return fallback ?? null;
+    const off = base * 2, len = (w || 32) * (hgt || 32) * 2;
+    if (off + len > gtVram.length) return fallback;
+    return Array.from(gtVram.slice(off, off + len));
+  };
+  const bg2Tm = readTm(cfg.bg2TilemapBase, cfg.bg2TilesW, cfg.bg2TilesH, cat.bg2TilemapData);
+  const bg3Tm = readTm(cfg.bg3TilemapBase, cfg.bg3TilesW, cfg.bg3TilesH, cat.bg3TilemapData);
+  const bg1Tm = readTm(cfg.bg1TilemapBase, cfg.bg1TilesW, cfg.bg1TilesH, cat.bg1TilemapData);
+  const same = (a, b) => (!a && !b) ? 'leer' : (!a || !b) ? 'nur eins' :
+    `${Math.round(100 * a.filter((x, i) => x === b[i]).length / Math.max(a.length, 1))} % gleich`;
+  const sets = (await hdGetContainerSets(containerName)).filter(s => s.type === 'level' && s.gfxSetIndex === g);
+  if (!sets.length) { console.error(`[repair] Kein Level-Set fuer gfxset ${g} im Container`); return 0; }
+  const plan = sets.map(s => `${s.setId}: tileArr ${h(s.tileArrangementData)} → ${h(arr)}, chrRaw ${h(s.chrRawData)} → ${h(chr)}, ` +
+    `vram ${h(s.vramSnapshot)} → ${gtVram ? h(gtVram) : '(bleibt)'}`).join('\n') +
+    `\nTilemaps aus ${gtVram ? 'Ground-Truth' : 'Katalog (keine Ground-Truth!)'}: ` +
+    `BG2 ${bg2Tm ? bg2Tm.length + 'B' : '-'} (Katalog-Simulation ${same(bg2Tm, cat.bg2TilemapData)}), ` +
+    `BG3 ${bg3Tm ? bg3Tm.length + 'B' : '-'} (${same(bg3Tm, cat.bg3TilemapData)})` +
+    (clear.size ? `\nEbenenbilder ENTFERNEN: ${[...clear].join(', ')}` : '');
+  console.log(`[repair] gfxset ${g} (${key}), ROM-Katalog ${cat.tileCount} Bloecke:\n${plan}`);
+  if (!confirm(`Metadaten von gfxset ${g} aus dem ROM neu schreiben?\n\n${plan}\n\n` +
+               `HD-Kunst (Kacheln, Cluster, BG2/BG3, Anim) bleibt unveraendert.`)) return 0;
+  for (const s of sets) {
+    const { key: _k, container, type, setId, ...rest } = s;
+    await hdSaveSet(containerName, 'level', setId, {
+      ...rest,
+      tileArrangementData: arr,
+      tileArrangementTileCount: cat.tileCount || 0,
+      gfxCount: cat.gfxCount || 0,
+      chrRawData: chr,
+      ppuConfig: cat.ppuConfig ? { ...cat.ppuConfig } : rest.ppuConfig,
+      bg2TilemapData: bg2Tm,
+      bg3TilemapData: bg3Tm,
+      wallTilemapData: cat.wallTilemapData ?? null,
+      bg1TilemapData: bg1Tm,
+      tileChecksums: null,   // was computed from the wrong level's VRAM
+      vramSnapshot: gtVram || rest.vramSnapshot,
+      paletteSnapshot: gtPal || rest.paletteSnapshot,
+      ...(clear.has('bg2') ? { bg2Blob: null } : {}),
+      ...(clear.has('bg3') ? { bg3Blob: null } : {}),
+      ...(clear.has('wall') ? { wallBlob: null } : {}),
+      ...(clear.has('cmFg') ? { cmFgBlob: null } : {}),
+      savedAt: Date.now(),
+    });
+    console.log(`[repair] ${setId} neu geschrieben.`);
+  }
+  if (typeof refreshContainerList === 'function') await refreshContainerList();
+  return sets.length;
+}
 
 // --- Refresh container set metadata ---
 // Updates existing container sets with fresh chrRawData, vramSnapshot, ppuConfig, etc.
@@ -16146,7 +16602,23 @@ function closeContainerSelectDialog() {
 
 // --- Modified HD Import (with container save) ---
 
+// Laufende Imports (inkl. Speichern in den Container). Der Pack-Export liest nur
+// den Container -- startet er, waehrend ein Import noch speichert, fehlt dessen
+// Inhalt im Pack, ohne jede Meldung. So am 25.09. passiert: Kackle (gfxset_2C) war
+// importiert, das Pack exportiert, und das Log zeigt "HD data saved to container"
+// erst NACH den Export-Zeilen -- 0 von 317 Kackle-Kacheln im Pack.
+let hdImportBusy = 0;
+
 async function importHDPackToContainer(file, containerName) {
+  hdImportBusy++;
+  try {
+    return await importHDPackToContainerInner(file, containerName);
+  } finally {
+    hdImportBusy--;
+  }
+}
+
+async function importHDPackToContainerInner(file, containerName) {
   // First, run the existing import logic
   const imported = await importHDPack(file);
 
@@ -19522,15 +19994,25 @@ document.getElementById('catExportBtn').addEventListener('click', () => exportCa
 document.getElementById('catImportHDBtn').addEventListener('click', () => {
   document.getElementById('hdZipInput').click();
 });
-document.getElementById('spriteCapBtn').addEventListener('click', () => {
+// Click = ADD the chosen file(s) to what is stored; Shift+click = REPLACE.
+let spriteCapReplace = false, bgCapReplace = false;
+document.getElementById('spriteCapBtn').addEventListener('click', (ev) => {
+  spriteCapReplace = ev.shiftKey;
   document.getElementById('spriteCapInput').click();
 });
 document.getElementById('spriteCapInput').addEventListener('change', async (e) => {
   if (!e.target.files.length) return;
-  const file = e.target.files[0];
+  const files = [...e.target.files];
   e.target.value = '';
-  const text = await file.text();
-  const res = parseSpriteCap(text);
+  let merged;
+  try {
+    merged = await mergeRecordingLines('spritecap', files, 'SPR ', spriteCapReplace);
+  } catch (err) {
+    alert('Spritecap konnte nicht gespeichert werden: ' + err.message);
+    return;
+  }
+  if (!merged) return;
+  const res = parseSpriteCap(merged.text);
   if (res.map.size === 0) {
     alert('Keine gültigen SPR-Zeilen gefunden — ist das eine snes_hd_spritecap.txt aus Mesen (Build S5a+)?');
     return;
@@ -19540,7 +20022,9 @@ document.getElementById('spriteCapInput').addEventListener('change', async (e) =
   spriteCapRows = res.rows;
   spriteCapHashRow = res.hashRow;
   updateSpriteCapButton(res.map.size, res.pairs, null);
-  // Persist so it survives reloads — re-picking a file just overwrites it.
+  console.log(`[spritecap] ${spriteCapReplace ? 'ERSETZT' : 'ergänzt'}: ${merged.added} neue Zeilen ` +
+              `(vorher ${merged.before}, jetzt ${merged.total}) → ${res.map.size} Hashes`);
+  // Persist so it survives reloads.
   try {
     await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs, dimmed: [...res.dimmed],
                                        rows: res.rows, hashRow: [...res.hashRow] });
@@ -19549,25 +20033,45 @@ document.getElementById('spriteCapInput').addEventListener('change', async (e) =
     console.warn('[spritecap] konnte nicht gespeichert werden:', err);
   }
 });
-document.getElementById('bgCapBtn').addEventListener('click', () => {
-  document.getElementById('bgCapInput').click();
-});
-document.getElementById('bgCapInput').addEventListener('change', async (e) => {
-  if (!e.target.files.length) return;
-  const file = e.target.files[0];
-  e.target.value = '';
-  const text = await file.text();
+
+function applyBgCapText(text, savedAt) {
   const res = parseBgCap(text);
-  if (res.entries.length === 0) {
-    alert('Keine gültigen BGA-Zeilen gefunden — ist das eine snes_hd_bgcap.txt aus Mesen (Build S6a+)?');
-    return;
-  }
+  if (res.entries.length === 0) return null;
   bgCapEntries = res.entries;
   const btn = document.getElementById('bgCapBtn');
   btn.textContent = `BG-Anim ✓ ${res.animFrames}/${res.animAddrs}`;
   btn.style.background = '#2e7d32';
   const gfxCount = new Set(res.entries.map(e => e.gfx)).size;
-  btn.title = `${res.animFrames} Anim-Frames auf ${res.animAddrs} Adressen (${gfxCount} Gfxsets) + ${res.gapAddrs} statische Coverage-Lücken-Adressen. ${res.bad} verworfen. Die Anim-Frames werden beim Export als hash-adressierte Kacheln aufgelöst.`;
+  const when = savedAt ? new Date(savedAt).toLocaleString() : 'jetzt';
+  btn.title = `${res.entries.length} distinkte Kacheln, ${res.animFrames} Anim-Frames auf ${res.animAddrs} Adressen ` +
+              `(${gfxCount} Gfxsets) + ${res.gapAddrs} statische Coverage-Lücken-Adressen. ${res.bad} verworfen. ` +
+              `Stand: ${when}.\nBleibt über Reloads erhalten. Klick = neue snes_hd_bgcap.txt ERGÄNZEN, ` +
+              `Shift+Klick = ERSETZEN.`;
+  return res;
+}
+document.getElementById('bgCapBtn').addEventListener('click', (ev) => {
+  bgCapReplace = ev.shiftKey;
+  document.getElementById('bgCapInput').click();
+});
+document.getElementById('bgCapInput').addEventListener('change', async (e) => {
+  if (!e.target.files.length) return;
+  const files = [...e.target.files];
+  e.target.value = '';
+  let merged;
+  try {
+    merged = await mergeRecordingLines('bgcap', files, 'BGA ', bgCapReplace);
+  } catch (err) {
+    alert('BG-Aufnahme konnte nicht gespeichert werden: ' + err.message);
+    return;
+  }
+  if (!merged) return;
+  const res = applyBgCapText(merged.text, null);
+  if (!res) {
+    alert('Keine gültigen BGA-Zeilen gefunden — ist das eine snes_hd_bgcap.txt aus Mesen (Build S6a+)?');
+    return;
+  }
+  console.log(`[bgcap] ${bgCapReplace ? 'ERSETZT' : 'ergänzt'}: ${merged.added} neue Zeilen ` +
+              `(vorher ${merged.before}, jetzt ${merged.total}) — bleibt über Reloads erhalten`);
 });
 document.getElementById('runtimeSprBtn').addEventListener('click', () => {
   document.getElementById('runtimeSprInput').click();
@@ -20125,6 +20629,19 @@ if (window.showDirectoryPicker) {
 
 // Bring the stored spritecap back, so it no longer has to be re-uploaded.
 restoreSpriteCapFromDb();
+// Same for the BG recording: re-parsed from its stored raw lines (~5 MB, a
+// fraction of a second), so the anim classification is always current.
+(async () => {
+  try {
+    const rec = await loadRecording('bgcap_lines');
+    if (!rec || !Array.isArray(rec.lines) || !rec.lines.length) return;
+    const res = applyBgCapText(rec.lines.join('\n'), rec.savedAt);
+    if (res) console.log(`[bgcap] ${rec.lines.length} Zeilen aus der Datenbank wiederhergestellt ` +
+                        `(Stand ${rec.savedAt}) — kein erneutes Hochladen nötig`);
+  } catch (e) {
+    console.warn('[bgcap] restore failed:', e);
+  }
+})();
 // Same for the runtime sprite recordings. Deliberately WITHOUT grouping them:
 // that is a multi-second single-threaded pass (260 000 positions ≈ 5 s) and
 // running it here froze the page right after load, before the user had even
