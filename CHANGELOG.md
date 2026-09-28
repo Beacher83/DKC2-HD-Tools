@@ -1,5 +1,64 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-09-28, nachts] — Funky-Jet-Icon, Cattail und die „Breaking Barrel“-Fragmente
+
+Alle drei gegen die Spritecap geprüft (was das Spiel wirklich gezeichnet hat), mit den Viewer-Funktionen
+selbst (Node-Harness, `resolveSpritePalettes` / `loadSpriteDescriptor`).
+
+- **Funky Jet Icon (0x1EC):** Direktadresse 0x3D761C (Braun/Orange/Rosa/Grau) war falsch. Das Spiel zeichnet
+  alle 20 Kacheln mit Holzbraun/Grau/Rot/Blau; diese 15 Farben stehen genau einmal im ROM, an 0x3D7294.
+  Jetzt 15/15.
+- **Cattail Plant (0x2C4):** kuratiertes Set 0x56 hatte die Grüns, aber keine Braunrampe (Kopf grün). Das
+  Spiel nutzt Set 0x58 (492 von 494 Aufzeichnungen, 15/15).
+- **Breaking Barrel (0x225–0x229) und 38 weitere Animationen:** Deskriptoren mit gfxRef < $02C4 sind KURZ
+  (5-Byte-Kopf + Positionen, KEINE Grafik) — das Spiel überspringt für sie den Upload (`CODE_B59CCB`,
+  `CPX #$02C5`) und zeichnet Kacheln, die ein anderes Sprite schon geladen hat. Der Viewer las 8 Byte Kopf
+  und dahinter „125 Kacheln“ = die Bytes der nächsten Deskriptoren (sie liegen 7–9 Byte auseinander) —
+  daher der Salat; keine dieser Kacheln kam je im Spiel vor. Jetzt: kurze Deskriptoren ohne eigene Grafik
+  (`sharedChr`), in der Galerie nicht renderbar statt Müll. $02C4 (Diddys erstes Laufbild, 574 Byte) bleibt
+  beim normalen Weg.
+
+- **Bramble Blast (gfxset 39) war in KEINEM Pack** (weder 25.09. noch 28.09.: keine Hashes, keine Dateien,
+  kein Fingerabdruck), obwohl das HD-Zip vom 10.09. existiert (Manifest korrekt, gfxset 39) und der Viewer
+  die Kunst als Vorschau zeigt. Vermutung: der Datensatz hat Kunst, aber keine Zuordnungstabelle/ppuConfig
+  — solche Sets fielen am Filter `setsWithArrangement` WORTLOS aus dem Export. Jetzt: der Export listet sie
+  (`[export] Sets mit Kunst, aber ohne Metadaten`) und fragt, bevor er ohne sie weitermacht.
+
+  Bestätigt beim nächsten Export: die neue Meldung fand zusätzlich **Ghostly Grove (gfxset 30, `gfxset_1E`,
+  543 Kacheln, tileArr und ppuConfig FEHLEN)** — importiert am 25.09., also mitten in den Speicherfehlern.
+  Bramble Blast neu importiert (Speichern sauber). Ghostly Grove bewusst NICHT: es läuft im Spiel in HD, weil
+  Mesen es als Gusty Glade (29) erkennt — gleiche Grafik, Log `gfx=29`. Ein eigenes Set 30 würde das ändern.
+- **Import-Knopf zeigte zu früh „Import HD“:** `importHDPack` (Level, Sprite, Laufzeit) setzte den Knopf 4 s nach
+  dem LADEN zurück, während das Speichern in den Container noch lief. Jetzt warten diese Timer, solange
+  `hdImportBusy` > 0; zurückgesetzt wird erst nach „HD data saved to container“.
+- `[vramcheck]` beim Export nur noch als eine Info-Zeile (die niedrigen Werte für 34/37/44/51 stammen aus
+  Aufnahmen unter früherer Fehlerkennung, kein Handlungsbedarf).
+
+Hinweis: Eine Pipetten-Zuweisung im Browser (Tier 2) schlägt die kuratierte Palette. Wer für Cattail eine
+gesetzt hat, muss sie zurücksetzen, sonst bleibt der Kopf grün.
+
+---
+
+## [2026-09-28, spät] — Diddys Gesicht am Level-Ende: Gruppe „Gfx 14A8“ wurde nicht mehr gefunden
+
+**Befund (N2):** Pack 25.09. gegen Pack 28.09. 20:50: genau 494 Sprite-Kacheln haben ihre Referenzpalette
+verloren — alle aus einer Palette (Diddy: Fell, Gesicht, Mütze), alle aus dem Sprite „Gfx 14A8“ (0xD006,
+Grafik ohne Animationseintrag). Statt einer slot-freien Datei mit Referenz lagen sie jetzt viermal
+(Slot 3–6) mit eingebrannten Farben im Pack → falsche Farben in jedem Slot mit anderer Palette.
+
+**Ursache:** Gruppen ohne Animationseintrag entstehen aus der Spritecap (aufeinanderfolgende Refs mit
+derselben Palette) und heißen nach ihrem ERSTEN Ref. Mit wachsender Spritecap kann ein Nachbar-Ref
+dazukommen, die Gruppe beginnt früher und heißt anders — `currentUnusedGfxId` fand „Gfx 14A8“ nicht mehr,
+das Sprite bekam keine Palette, jede Kachel wurde verworfen.
+
+**Fix:** Findet sich der Name nicht, wird die Gruppe genommen, die den Ref aus dem Namen ENTHÄLT
+(Konsole: `[gfx] "Gfx 14A8" ist heute Teil der Gruppe …`).
+
+**Klobber (N1) ist etwas anderes:** seine 1.004 Kacheln (Anim 500–503, 778) haben im Pack dieselben
+Referenzen und Slots wie am 25.09. Die Ursache liegt nicht in den Sprite-Daten des Packs.
+
+---
+
 ## [2026-09-28, spätnachmittags] — BG2/BG3 der reparierten Sets: Tilemaps aus dem echten Abzug
 
 **Spieltest nach BG1-Reparatur:** BG1 von 34/43/44/47/48 HD; Hintergründe falsch („wie Pirate Panic“ in

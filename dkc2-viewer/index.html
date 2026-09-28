@@ -3589,10 +3589,27 @@ function unusedGfxInfo(animId) {
 // gedimmten Kacheln ganz weg (Gfx 1458: 215/271, Gfx 14F0: 165/299 im Pack).
 // Der Name traegt die gfxRef aus dem ROM und wandert nicht — also ueber ihn gehen.
 // Liefert die heutige Nummer, oder null, wenn es die Gruppe nicht mehr gibt.
+// Nicht nur ueber den ersten Ref der Gruppe suchen: die Gruppen WACHSEN mit der
+// Spritecap. Sieht eine neue Aufnahme den Nachbar-Ref vor dem ersten, beginnt die
+// Gruppe dort, heisst anders ("Gfx 14A0" statt "Gfx 14A8"), und das gespeicherte
+// Sprite fand keine Gruppe mehr -> keine Palette -> keine Referenz. Gemessen 28.09.:
+// "Gfx 14A8" (0xD006) verlor so alle 494 Kacheln ihre Referenz; der Export schrieb
+// sie mit eingebrannten Farben in vier Slots (Diddys Gesicht am Level-Ende).
+// Der Ref im Namen bleibt ein Ref der Gruppe — also die Gruppe nehmen, die ihn ENTHAELT.
 function currentUnusedGfxId(animId, name) {
   if (animId == null || animId < UNUSED_GFX_ID_BASE || animId >= ORPHAN_SEQ_ID_BASE) return animId;
   if (!_unusedGfx && rom) findUnusedGfxRefs(rom);
-  const hit = (_unusedGfx || []).find(o => unusedGfxName(o) === name);
+  const groups = _unusedGfx || [];
+  let hit = groups.find(o => unusedGfxName(o) === name);
+  if (!hit) {
+    const m = /^Gfx ([0-9A-F]{4})$/i.exec(name || '');
+    if (m) {
+      const ref = parseInt(m[1], 16);
+      hit = groups.find(o => o.refs.includes(ref));
+      if (hit) console.log(`[gfx] "${name}" ist heute Teil der Gruppe "${unusedGfxName(hit)}" ` +
+                           `(0x${hit.id.toString(16).toUpperCase()}).`);
+    }
+  }
   return hit ? hit.id : null;
 }
 
@@ -3669,6 +3686,31 @@ function loadSpriteDescriptor(rom, gfxRef) {
   if (snesAddr === 0) return null;
   const fileOffset = snesAddrToFile(snesAddr);
   if (fileOffset + 8 >= rom.size) return null;
+
+  // Short descriptors (gfxRef < $02C4): 5-byte header + displacements, NO graphics.
+  // The game skips the graphics upload for them (CODE_B59CCB: CPX #$02C5 / BCS) and
+  // draws tiles another sprite already put in VRAM — breaking-barrel and egg
+  // fragments, stars, particles. They sit 7-9 bytes apart in the ROM (0x29C at file
+  // 0x695, 0x2A0 at 0x69C ...), so reading an 8-byte header plus "125 CHR tiles" here
+  // decoded the NEXT descriptors as graphics: 43 animations showed garbage, and not
+  // one of those 125 hashes was ever drawn by the game (spritecap, 28.09.).
+  // $02C4 is below the bound too but is Diddy's first run frame with full data
+  // (574 bytes) — the Kong code uploads it — so it keeps the normal path.
+  if (gfxRef < 0x2C4) {
+    rom.seek(fileOffset);
+    const big16Count = rom.readByte(), small8Count = rom.readByte(), tileBase = rom.readByte();
+    const extraCount = rom.readByte(), flags = rom.readByte();
+    const totalDisp = big16Count + small8Count + extraCount;
+    if (totalDisp === 0 || totalDisp > 128) return null;
+    const entries = [];
+    for (let i = 0; i < totalDisp; i++) {
+      const rawX = rom.readByte(), rawY = rom.readByte();
+      entries.push({ tx: rawX - 0x80, ty: rawY - 0x80, size: i < big16Count ? 16 : 8 });
+    }
+    return { big16Count, small8Count, extraCount, tileBase, flags, entries,
+             block1Tiles: 0, block2Tiles: 0, region2Offset: 0, chrBlock1: null, chrBlock2: null,
+             sharedChr: true };
+  }
 
   // Always read full 8-byte header
   rom.seek(fileOffset);
@@ -10221,7 +10263,7 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
     const sizeMB = (file.size / 1024 / 1024).toFixed(1);
     btn.textContent = `${totalSprites} sprites (${totalFrames} frames) loaded!`;
     console.log(`HD Sprite Pack: ${spriteScaleFactor}x | ${totalSprites} sprites, ${totalFrames} frames | ${sizeMB} MB`);
-    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+    setTimeout(() => { if (hdImportBusy > 0) return; btn.textContent = origText; btn.disabled = false; }, 4000);  // still saving to the container: importHDPackToContainer re-enables it when done
 
   } catch (err) {
     console.error('HD Sprite Import error:', err);
@@ -10309,7 +10351,7 @@ async function importHDRuntimePack(zip, manifest, rootPrefix, btn, origText, fil
             '(der Upscaler muss ein ganzzahliges Vielfaches liefern). Details in der Konsole.');
     }
     btn.textContent = `${written} Laufzeit-Kacheln geladen!`;
-    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+    setTimeout(() => { if (hdImportBusy > 0) return; btn.textContent = origText; btn.disabled = false; }, 4000);  // still saving to the container: importHDPackToContainer re-enables it when done
     return written;
   } catch (err) {
     console.error('[laufzeit] HD-Import fehlgeschlagen:', err);
@@ -10784,7 +10826,7 @@ async function importHDPack(file) {
       : `+${newTiles} tiles (${updatedTiles} updated), +${newClusters} clusters${hdBg2 ? ', BG2' : ''}${hdBg3 ? ', BG3' : ''}`) + animInfo;
     btn.textContent = `Merged! (${mergeInfo})`;
     console.log(`HD Pack merged: ${scaleFactor}x | ${mergeInfo} | ${sizeMB} MB`);
-    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+    setTimeout(() => { if (hdImportBusy > 0) return; btn.textContent = origText; btn.disabled = false; }, 4000);  // still saving to the container: importHDPackToContainer re-enables it when done
 
     return { kind: 'level', gfxSetIndex: manifest.gfxSetIndex, tileCount: hdPack.tiles.size };
 
@@ -12915,16 +12957,19 @@ async function exportAsTexturePack(containerName) {
       if (!v) continue;
       if (!(v instanceof Uint8Array)) v = new Uint8Array(v);
       const sc = scoreVramAgainstBgcap(v, s.gfxSetIndex ?? null);
-      if (sc) console.log(`[vramcheck] ${s.setId} (gfxset ${s.gfxSetIndex}, ${src}): ${vramScoreText(sc)}`);
+      // per-set scores only in the summary below
       if (sc && sc.ratio < VRAM_CHECK_MIN_RATIO) badSnaps.push(`${s.setId} (gfxset ${s.gfxSetIndex}, ${src}): ${vramScoreText(sc)}`);
     }
     // Only a note: the bgcap's G is the gfxset Mesen DETECTED at recording time.
     // A low score means "abzug wrong" OR "recording made under a misdetection"
     // (28.09.: Haunted Hall's correct snapshot scored 0 % against Target Terror
     // tiles filed as G44). A fresh dump (dkc2_vram_snapshot.lua) decides.
+    // Info only. 28.09.: 34/37/44/51 score low here although their snapshots are
+    // right (fresh dumps confirmed 44) — the recording was made while Mesen detected
+    // the wrong gfxset. Not a reason to act, so not a warning.
     if (badSnaps.length) {
-      console.warn(`[vramcheck] Abzug und BG-Aufnahme widersprechen sich (Abzug falsch ODER Aufnahme unter ` +
-        `falsch erkanntem gfxset):\n  ${badSnaps.join('\n  ')}`);
+      console.log(`[vramcheck] niedriger Abgleich (meist Aufnahme unter frueherer Fehlerkennung, kein Handlungsbedarf): ` +
+        badSnaps.join(' | '));
     }
   } else {
     console.warn('[vramcheck] Kein bgcap geladen — VRAM-Abzuege werden nicht gegengeprueft.');
@@ -12938,6 +12983,22 @@ async function exportAsTexturePack(containerName) {
   if (setsWithArrangement.length === 0 && setsWithOverworld.length === 0) {
     alert('Container enthält keine Tile-Arrangement-Daten.\n\nBitte die Tiles erneut speichern (Container → Save), damit die nötigen VRAM-Metadaten gespeichert werden.');
     return;
+  }
+  // A level set WITH art but without arrangement/ppuConfig used to drop out here
+  // without a word: no hashes, no files, no fingerprint — the viewer still previews
+  // the art (it reads tiles, not metadata), Mesen shows SD. Bramble Blast (gfxset 39,
+  // imported 10.09.) was never in any pack. Say it, and name the one-step fix.
+  {
+    const lost = levelSets.filter(s => (s.tiles?.length || 0) > 0 && !(s.tileArrangementData && s.ppuConfig)
+      && !(s.owBlobs && isOverworldSet(s.gfxSetIndex)));
+    if (lost.length) {
+      const list = lost.map(s => `${s.setId} (gfxset ${s.gfxSetIndex}, ${s.tiles.length} Kacheln, ` +
+        `tileArr ${s.tileArrangementData ? 'ja' : 'FEHLT'}, ppuConfig ${s.ppuConfig ? 'ja' : 'FEHLT'})`).join('\n');
+      console.error(`[export] Sets mit Kunst, aber ohne Metadaten — landen NICHT im Pack:\n${list}`);
+      if (!confirm(`Diese Sets haben HD-Kunst, aber keine Zuordnungsdaten, und fehlen deshalb im Pack ` +
+          `(im Spiel SD):\n\n${list}\n\nAbhilfe: in der Konsole  await repairSetMetadataFromRom(<gfxset>)  ` +
+          `oder das HD-Zip des Sets neu importieren.\n\nTrotzdem ohne sie exportieren?`)) return;
+    }
   }
 
   const zip = new JSZip();
@@ -17123,7 +17184,9 @@ const SPRITE_PALETTE_BY_KEY = {
   'Yoshi': 0x75, 'Mario': 0x76, 'Link': 0x81,
   'Hook': 0x09, "Krook's Thrown Hook": 0x55, 'Krook Hook': 0x55,
   'Krochead': 0x56, 'Croc Head': 0x56,
-  'Cattail Plant': 0x56,  // swamp plant, uses Krochead-area palette
+  // Was 0x56: close greens but no brown ramp, so the head came out green. The game
+  // draws it with set 0x58 (spritecap 28.09.: 492 of 494 recordings, 15/15 colours).
+  'Cattail Plant': 0x58,
   'Water Splash': 0x11, 'Splash': 0x11, 'Lava Smoke': 0x42,
   'Banana': 0x00,
   'Coin Appearance': 0x14, 'Animal Disappear': 0x1B,
@@ -17243,7 +17306,10 @@ function getCompositeSecondaryPaletteSetId(animId, animName) {
 // or palettes loaded via $8400 that have no table index).
 // Values are PC-file addresses pointing to the first actual color (skip color 0).
 const SPRITE_PALETTE_DIRECT_ADDR = {
-  'Funky Jet Icon': 0x3D761C,  // DATA_FD761A + 2 (FunkyAndSwankyLevelIcons.bin, skip color 0)
+  // Was 0x3D761C (FunkyAndSwankyLevelIcons.bin): brown/orange/pink/grey, not what the
+  // game draws. Spritecap 28.09.: all 20 tiles recorded under wood-brown / grey / red /
+  // blue, and that exact 15-colour run sits at 0x3D7294 (only there in the ROM).
+  'Funky Jet Icon': 0x3D7294,
   'Fireworks': 0x3D61C4,       // DATA_FD61C2 + 2 (Sprite_Fireworks.bin, skip color 0)
 };
 
