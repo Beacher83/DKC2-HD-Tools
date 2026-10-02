@@ -8582,21 +8582,28 @@ async function exportSpritesAsZip() {
         }
       }
 
+      // Composite: ein Ordner je Teil, siehe compositePartCount(). Teil 0 behaelt den
+      // bisherigen Ordnernamen.
+      const partCount = compositePartCount(frames);
+      for (let part = 0; part < partCount; part++) {
+      const partFolder = compositePartKey(folderName, part);
       const spriteManifest = {
         name: entry.name,
         animId: entry.animId,
         animIdHex: `0x${animHex}`,
+        folder: partFolder,
         spriteType: entry.spriteType,
         category: getCategoryForEntry(entry),
         frameCount: frames.length,
         variants: [],
       };
+      if (partCount > 1) { spriteManifest.part = part; spriteManifest.partCount = partCount; }
 
       for (const palEntry of palettesToExport) {
         const variantSuffix = palEntry.name === 'default' ? '' : `_${palEntry.name}`;
         const variantFolder = palettesToExport.length > 1
-          ? rootFolder.folder(folderName).folder(palEntry.name)
-          : rootFolder.folder(folderName);
+          ? rootFolder.folder(partFolder).folder(palEntry.name)
+          : rootFolder.folder(partFolder);
         const paletteKey = palEntry.id !== null ? String(palEntry.id) : 'grey';
 
         const renderedFrames = [];
@@ -8615,7 +8622,9 @@ async function exportSpritesAsZip() {
             gfxRefRenderCache.clear(); // clear cache to ensure fresh render with this palette
             const secPalKey = entry.secondaryPaletteSetId !== null ? String(entry.secondaryPaletteSetId) : null;
             const b2PalKey = entry.block2PaletteSetId !== null ? String(entry.block2PaletteSetId) : null;
-            rendered = renderCompositeFrame(frame, palEntry.palette, paletteKey, entry.secondaryPalette, secPalKey, entry.block2Palette, b2PalKey);
+            rendered = partCount > 1
+              ? renderFramePart(frame, part, palEntry.palette, paletteKey, entry.secondaryPalette, secPalKey, entry.block2Palette, b2PalKey)
+              : renderCompositeFrame(frame, palEntry.palette, paletteKey, entry.secondaryPalette, secPalKey, entry.block2Palette, b2PalKey);
           }
           if (!rendered) continue;
           renderedFrames.push({ index: fi, canvas: rendered.canvas, width: rendered.width, height: rendered.height,
@@ -8627,6 +8636,9 @@ async function exportSpritesAsZip() {
 
         if (renderedFrames.length === 0) continue;
 
+        // Ursprung des gepolsterten Bildes im Deskriptor-Raum -- damit setzt der
+        // Viewer die Teile eines Composites wieder zusammen.
+        let originX = 0, originY = 0;
         // Alle Bilder am GEMEINSAMEN URSPRUNG ausrichten, nicht zentrieren.
         // Jedes Bild hat seine eigene Umrissgroesse und seinen eigenen Ursprung
         // (0x015B Auto Barrel Cannon Rotation wechselt zwischen 32x48 und 43x32).
@@ -8651,11 +8663,13 @@ async function exportSpritesAsZip() {
             rf.padX = rf.offsetX - uMinX;
             rf.padY = rf.offsetY - uMinY;
           }
+          originX = uMinX; originY = uMinY;
         }
 
         const variantManifest = {
           name: palEntry.name,
           paletteSetId: palEntry.id,
+          originX, originY,
           frames: [],
         };
 
@@ -8722,8 +8736,11 @@ async function exportSpritesAsZip() {
         if (palEntry.name !== 'default') manifest.stats.totalVariants++;
       }
 
-      manifest.sprites.push(spriteManifest);
-      manifest.stats.totalSprites++;
+      if (spriteManifest.variants.length > 0) {
+        manifest.sprites.push(spriteManifest);
+        manifest.stats.totalSprites++;
+      }
+      }   // Teile
       processed++;
       if (processed % 5 === 0) {
         btn.textContent = `Exporting... ${Math.round(processed / total * 100)}%`;
@@ -10192,8 +10209,9 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
       const sprInfo = sprites[si];
       const animHex = sprInfo.animIdHex || `0x${sprInfo.animId.toString(16).toUpperCase().padStart(4, '0')}`;
       // Reconstruct the folder name used during export
+      // Composite-Teile tragen ihren Ordner im Manifest (..._x1); aeltere Manifeste nicht.
       const safeName = sprInfo.name.replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/_+/g, '_');
-      const spriteKey = `${safeName}_${animHex}`;
+      const spriteKey = sprInfo.folder || `${safeName}_${animHex}`;
 
       // Determine which variant to load — prefer 'default', fallback to first
       const variants = sprInfo.variants || [];
@@ -10246,6 +10264,9 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
           meta: hdMeta,
           paddedWidth: frameW,
           paddedHeight: frameH,
+          part: sprInfo.part ?? null,
+          originX: variant.originX ?? null,
+          originY: variant.originY ?? null,
         });
         totalSprites++;
       }
@@ -12087,6 +12108,8 @@ async function loadContainerToHDPack(containerName) {
         meta: hdMeta,
         paddedWidth: set.paddedWidth || 0,
         paddedHeight: set.paddedHeight || 0,
+        part: set.part ?? null,
+        originX: set.originX ?? null, originY: set.originY ?? null,
       });
     }
   }
@@ -14291,7 +14314,7 @@ async function exportAsTexturePack(containerName) {
                                       : `ist heute 0x${animId.toString(16).toUpperCase()}.`));
         }
         sprSources.push({ key: s.setId, scaleFactor: s.scaleFactor || 4, metaMap, frames,
-                          animId, origAnimId, name: s.name || '' });
+                          animId, origAnimId, name: s.name || '', part: s.part ?? null });
       }
     }
     // Sprites imported in this session but not written to THIS container.
@@ -14312,7 +14335,7 @@ async function exportAsTexturePack(containerName) {
           key, scaleFactor: spr.scaleFactor || 4, metaMap: spr.meta || new Map(),
           frames: [...spr.frames].map(([idx, bitmap]) => ({ idx, bitmap })),
           animId: currentUnusedGfxId(spr.animId ?? null, spr.name || ''),
-          origAnimId: spr.animId ?? null, name: spr.name || '',
+          origAnimId: spr.animId ?? null, name: spr.name || '', part: spr.part ?? null,
         });
         memOnly.push(key);
       }
@@ -14333,9 +14356,25 @@ async function exportAsTexturePack(containerName) {
     // Animationen zuerst, greift writtenKeys und sie behalten ihre Referenz
     // unveraendert; die neuen Eintraege steuern nur bei, was sonst niemand
     // beansprucht. Stabil sortiert, die bisherige Reihenfolge bleibt sonst.
-    sprSources.forEach((s, i) => { s._ord = i; });
+    //
+    // Composite-Sets, die noch als EIN Bild hochgerechnet wurden (vor der Zerlegung in
+    // Teile, siehe compositePartCount), laufen ganz zum Schluss: ihre Kacheln tragen die
+    // Kunst des anderen Teils mit. So gewinnt fuer jede geteilte Kachel die saubere
+    // Quelle -- Rattlys eigene Animation statt "DD Idle on Rattly" -- und ein gemischtes
+    // Set steuert nur noch bei, was sonst niemand hat, bis es in Teilen neu kommt.
+    const isMixedComposite = (s) => {
+      if (s.part != null || !rom || s.animId == null || s.animId >= 0xD000) return false;
+      try { return compositePartCount(parseAnimFrames(rom, s.animId)) > 1; } catch (e) { return false; }
+    };
+    const mixed = [];
+    sprSources.forEach((s, i) => { s._ord = i; s._mixed = isMixedComposite(s); if (s._mixed) mixed.push(s.key); });
+    if (mixed.length) {
+      console.warn(`[sprites] ${mixed.length} Composite-Sets noch als EIN Bild hochgerechnet -- laufen zuletzt, ` +
+                   `bitte in Teilen neu exportieren/hochrechnen: ${mixed.join(', ')}`);
+    }
     const isNewKind = (s) => s.origAnimId != null && s.origAnimId >= 0xD000 && s.origAnimId < 0xF000;
-    sprSources.sort((a, b) => (isNewKind(a) ? 1 : 0) - (isNewKind(b) ? 1 : 0) || a._ord - b._ord);
+    sprSources.sort((a, b) => (a._mixed ? 1 : 0) - (b._mixed ? 1 : 0)
+      || (isNewKind(a) ? 1 : 0) - (isNewKind(b) ? 1 : 0) || a._ord - b._ord);
 
     if (sprSources.length === 0) {
       console.warn('[sprites] Weder im Container noch im Speicher HD-Sprites gefunden — sprites/ bleibt leer. ' +
@@ -14513,7 +14552,16 @@ async function exportAsTexturePack(containerName) {
               const hasComposite = frames.some(f => f.extraRefs && f.extraRefs.length > 0);
               const res = resolveSpritePalettes(spr.animId, spr.name,
                 getAnimPaletteMap().get(spr.animId) || null, hasComposite);
-              if (res) {
+              if (res && spr.part > 0) {
+                // Zusatzteil eines zerlegten Composites: gezeichnet mit der Zweitpalette,
+                // ohne eine solche mit der primaeren -- genau wie renderFramePart.
+                const pal = res.secondaryPalette || (!res.isGrey ? res.palette : null);
+                if (pal) sprPool.push(toRgbTable(pal));
+              } else if (res && spr.part === 0) {
+                // Hauptteil: nur seine eigenen Paletten, die Zweitpalette gehoert dem Zusatzteil.
+                if (!res.isGrey) sprPool.push(toRgbTable(res.palette));
+                if (res.block2Palette) sprPool.push(toRgbTable(res.block2Palette));
+              } else if (res) {
                 // A grey ramp is the "no palette found" placeholder, not a reference.
                 if (!res.isGrey) sprPool.push(toRgbTable(res.palette));
                 if (res.secondaryPalette) sprPool.push(toRgbTable(res.secondaryPalette));
@@ -16758,6 +16806,8 @@ async function importHDPackToContainerInner(file, containerName) {
             scaleFactor: sprData.scaleFactor,
             paddedWidth: sprData.paddedWidth || 0,
             paddedHeight: sprData.paddedHeight || 0,
+            part: sprData.part ?? null,
+            originX: sprData.originX ?? null, originY: sprData.originY ?? null,
             frameCount: frames.length, frames, meta,
             savedAt: Date.now()
           });
@@ -17776,9 +17826,45 @@ function getHDSpriteFrame(entry, frameIndex) {
   const spriteKey = `${safeName}_0x${animHex}`;
   const sprData = hdPack.sprites.get(spriteKey);
   if (!sprData) return null;
+  if (sprData.part === 0) return composeHDPartsFrame(entry, spriteKey, sprData, frameIndex);
   const img = sprData.frames.get(frameIndex);
   if (!img) return null;
   return { img, scaleFactor: sprData.scaleFactor, paddedWidth: sprData.paddedWidth, paddedHeight: sprData.paddedHeight };
+}
+
+// Ein in Teile zerlegtes Composite fuer die Anzeige zusammensetzen: jeder Teil an
+// seinen Ursprung im Deskriptor-Raum, in der Reihenfolge, die der Animationsbefehl
+// vorgibt ($8D -> extraBehind), auf die Flaeche von entryAlignBox -- dieselbe, die
+// drawEntryFrameInto fuer SD benutzt. Je Set gemerkt; ein neuer Import legt neue
+// Set-Objekte an und verwirft damit auch den Speicher.
+function composeHDPartsFrame(entry, baseKey, part0, frameIndex) {
+  if (!part0._composed) part0._composed = new Map();
+  if (part0._composed.has(frameIndex)) return part0._composed.get(frameIndex);
+  const frame = (entry.frames || [])[frameIndex];
+  const al = entryAlignBox(entry);
+  const sc = part0.scaleFactor || 1;
+  let result = null;
+  if (frame && al.w > 0 && al.h > 0) {
+    const layers = [];
+    for (let p = 0; p < compositePartCount(entry.frames); p++) {
+      const set = p === 0 ? part0 : hdPack.sprites.get(compositePartKey(baseKey, p));
+      const img = set && set.frames.get(frameIndex);
+      if (img && set.originX != null) layers.push({ p, img, set });
+    }
+    if (layers.length > 0) {
+      // Zuerst gezeichnet = hinten, wie in renderCompositeFrame.
+      const z = (l) => l.p === 0 ? (frame.extraBehind ? Infinity : -1) : l.p;
+      layers.sort((a, b) => z(a) - z(b));
+      const out = new OffscreenCanvas(al.w * sc, al.h * sc);
+      const ctx = out.getContext('2d');
+      for (const { img, set } of layers) {
+        ctx.drawImage(img, (set.originX - al.minX) * sc, (set.originY - al.minY) * sc);
+      }
+      result = { img: out, scaleFactor: sc, paddedWidth: al.w, paddedHeight: al.h };
+    }
+  }
+  part0._composed.set(frameIndex, result);
+  return result;
 }
 
 function renderCompositeFrame(frame, palette, paletteKey, secondaryPalette, secondaryPaletteKey, block2Palette, block2PaletteKey) {
@@ -17831,6 +17917,43 @@ function renderCompositeFrame(frame, palette, paletteKey, secondaryPalette, seco
     }
   }
   return { canvas: out, width: w, height: h, offsetX: left, offsetY: top, tiles };
+}
+
+// Composite-Teile (01.10./02.10.2026, N1/N2/N5).
+//
+// Ein Composite (Kong auf Rattly, Klobber im Fass, Diddy mit Radio) besteht im
+// Spiel aus GETRENNTEN Sprites mit eigener Palette und eigener OAM-Reihenfolge.
+// Bis heute ging es als EIN Bild zum Upscaler und wurde danach in Kacheln
+// geschnitten: jede Kachel trug die Kunst des anderen Teils mit -- Diddys Umriss
+// in Rattlys Kacheln, das Fass in Klobbers, Diddys Gesicht im Radio. Mesen zeigt
+// das, sobald es eine Kachel ueber das andere Sprite zeichnet (S49, OAM-Gleichstand).
+//
+// Darum: Teil 0 = gfxRef (Hauptteil), Teil k = extraRefs[k-1]. Jeder Teil wird fuer
+// sich exportiert, hochgerechnet und geschnitten; der Viewer setzt die Teile fuer die
+// Anzeige wieder zusammen, so wie Mesen die Sprites uebereinander legt.
+function compositePartCount(frames) {
+  let n = 0;
+  for (const f of (frames || [])) n = Math.max(n, (f.extraRefs || []).length);
+  return n > 0 ? n + 1 : 1;
+}
+
+// Ordnername eines Teils. Teil 0 behaelt den alten Namen und ersetzt damit beim
+// Import das alte gemischte Set desselben Eintrags.
+function compositePartKey(baseKey, part) {
+  return part > 0 ? `${baseKey}_x${part}` : baseKey;
+}
+
+// EIN Teil eines Bildes, im Deskriptor-Raum (Anker = 0,0) -- dieselben Felder wie
+// renderCompositeFrame, tiles relativ zur eigenen Flaeche. null, wenn das Bild
+// diesen Teil nicht hat.
+function renderFramePart(frame, part, palette, paletteKey, secondaryPalette, secondaryPaletteKey, block2Palette, block2PaletteKey) {
+  if (part === 0) return renderGfxRef(frame.gfxRef, palette, paletteKey, block2Palette, block2PaletteKey);
+  const er = (frame.extraRefs || [])[part - 1];
+  if (!er) return null;
+  const extra = renderGfxRef(er.gfxRef, secondaryPalette || palette, secondaryPaletteKey || paletteKey);
+  if (!extra) return null;
+  return { canvas: extra.canvas, width: extra.width, height: extra.height,
+           offsetX: er.x + extra.offsetX, offsetY: er.y + extra.offsetY, tiles: extra.tiles };
 }
 
 function startGalleryAnim() { galleryAnimActive = true; }
@@ -18630,8 +18753,11 @@ function showSpriteCardInfo(e) {
     const animHex = e.animId.toString(16).toUpperCase().padStart(4, '0');
     const spriteKey = `${safeName}_0x${animHex}`;
     const sprData = hdPack.sprites.get(spriteKey);
-    const totalHdFrames = sprData ? sprData.frames.size : 0;
     const frameCount = e.frames ? e.frames.length : 0;
+    // Ueber getHDSpriteFrame, damit ein in Teile zerlegtes Composite zusammengesetzt erscheint.
+    const hdImg = (fi) => getHDSpriteFrame(e, fi)?.img || null;
+    let totalHdFrames = 0;
+    for (let fi = 0; fi < frameCount; fi++) if (hdImg(fi)) totalHdFrames++;
 
     const hdSection = document.createElement('div');
     hdSection.style.cssText = 'margin-top:12px;border-top:1px solid #333;padding-top:8px;';
@@ -18654,7 +18780,7 @@ function showSpriteCardInfo(e) {
       stripDiv.style.cssText = 'display:flex;gap:3px;flex-wrap:wrap;margin-top:6px;';
       const thumbSize = 48;
       for (let fi = 0; fi < frameCount; fi++) {
-        const hdF = sprData.frames.get(fi);
+        const hdF = hdImg(fi);
         const thumb = document.createElement('canvas');
         thumb.title = `Frame ${fi}`;
         thumb.style.cssText = `width:${thumbSize}px;height:${thumbSize}px;border:1px solid ${hdF ? '#ff9800' : '#333'};border-radius:3px;cursor:pointer;background:#111;`;
@@ -18674,7 +18800,7 @@ function showSpriteCardInfo(e) {
         }
         thumb.addEventListener('click', () => {
           // Update main preview to show this frame
-          const selectedHd = sprData.frames.get(fi);
+          const selectedHd = hdImg(fi);
           if (selectedHd) {
             previewCv.width = selectedHd.width; previewCv.height = selectedHd.height;
             previewCv.getContext('2d').drawImage(selectedHd, 0, 0);
