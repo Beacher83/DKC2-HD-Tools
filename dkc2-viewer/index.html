@@ -18857,6 +18857,16 @@ function updateSpriteSelectionUI() {
   const cnt = document.getElementById('sprSelCount');
   const btn = document.getElementById('spriteExportBtn');
   if (cnt) cnt.textContent = spriteSelection.size > 0 ? `${spriteSelection.size} gewählt` : '';
+  // Der Leeren-Knopf ging zwischen den anderen unter (02.10.): bei aktiver Auswahl
+  // traegt er die Anzahl und hebt sich farbig ab.
+  const clr = document.getElementById('sprSelectClearBtn');
+  if (clr) {
+    const on = spriteSelection.size > 0;
+    clr.textContent = on ? `✕ Auswahl aufheben (${spriteSelection.size})` : '✕ Leeren';
+    clr.style.background = on ? '#b71c1c' : '';
+    clr.style.color = on ? '#fff' : '';
+    clr.style.borderColor = on ? '#e53935' : '';
+  }
   if (btn && !btn.disabled) {
     btn.textContent = spriteSelection.size > 0 ? `Export Auswahl (${spriteSelection.size})` : 'Export Sprites ZIP';
   }
