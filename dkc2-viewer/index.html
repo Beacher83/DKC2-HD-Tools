@@ -7493,13 +7493,23 @@ async function canvasToBlob(canvas) {
 // S6b step 3: decode a bgcap animation frame (8x8 SNES tile from its recorded
 // VRAM bytes + CGRAM) into a 32x32 canvas (4x nearest-neighbour), same tile
 // size as the catalog's SD export.
+// Kachel-Bytes einer bgcap-Aufnahme in 4bpp-Form fuer drawTile8x8. BG3 ist 2bpp
+// (16 Byte, 4 Farben): Bitebenen 3/4 = 0, der Farbindex bleibt 0-3 und trifft die
+// 4 aufgezeichneten Farben. Seit 02.10. gebraucht -- Windy Wells Blaetter sind
+// animierte BG3-Kacheln (bgcap G51 L2), anders als Gusty Glades auf BG1.
+function bgCapTileBytes4bpp(entry) {
+  if (entry.bytes.length >= 32) return entry.bytes;
+  const b = new Uint8Array(32);
+  b.set(entry.bytes.subarray(0, 16));
+  return b;
+}
+
 function decodeBgCapTileCanvas(entry) {
-  if (entry.layer > 1) return null;  // 2bpp BG3 not handled yet (none in current data)
   const img = new ImageData(8, 8);
   // drawTile8x8 indexes palette[c + palIndex]; the recorded cgram IS the tile's
   // 16-colour row, so palIndex 0. Colour 0 stays transparent (context padding
   // and the game's real backdrop fill it), matching the catalog tile convention.
-  drawTile8x8(img, entry.cgram, 0, 0, 0, entry.bytes, false, false);
+  drawTile8x8(img, entry.cgram, 0, 0, 0, bgCapTileBytes4bpp(entry), false, false);
   const c8 = new OffscreenCanvas(8, 8);
   c8.getContext('2d').putImageData(img, 0, 0);
   return c8;   // NATIVE 8x8 — the upscaler must see real pixels, not a blow-up
@@ -7904,7 +7914,7 @@ function buildAnimObjectSheet(obj, phase, ctx, framesByAddr) {
     const e = frames[phase % frames.length];
     const [tx, ty] = a.key.split(',').map(Number);
     const img = new ImageData(8, 8);
-    drawTile8x8(img, e.cgram, 0, 0, 0, e.bytes, a.info.flipH, a.info.flipV);
+    drawTile8x8(img, e.cgram, 0, 0, 0, bgCapTileBytes4bpp(e), a.info.flipH, a.info.flipV);
     f8ctx.putImageData(img, 0, 0);
     const cx = (tx - region.x0) * 8 * S, cy = (ty - region.y0) * 8 * S;
     octx.clearRect(cx, cy, 8 * S, 8 * S);
@@ -8282,7 +8292,10 @@ async function exportCatalogAsZip() {
     // manifest records where to slice the centre tile back to h<hash>_P<pal>.png.
     // Falls back to transparent per-tile padding if the overlay isn't available.
     if (bgCapEntries && catalogData.gfxSetIndex !== undefined) {
-      const animForGfx = bgCapEntries.filter(e => e.isAnim && e.gfx === catalogData.gfxSetIndex && e.layer <= 1);
+      // BG3 (L2) gehoert dazu: Windy Wells Blaetter sind animierte BG3-Kacheln. Der
+      // Filter stand seit 20.07. auf BG1/BG2, als es noch keine BG3-Animation in den
+      // Daten gab.
+      const animForGfx = bgCapEntries.filter(e => e.isAnim && e.gfx === catalogData.gfxSetIndex && e.layer <= 2);
       if (animForGfx.length > 0) {
         btn.textContent = 'Exporting anim frames...';
         await new Promise(r => setTimeout(r, 0));
@@ -9196,7 +9209,7 @@ function renderSpriteMissTile(entry, scale = 1) {
   c.width = 8 * scale; c.height = 8 * scale;
   const ctx = c.getContext('2d');
   const img = ctx.createImageData(8, 8);
-  drawTile8x8(img, entry.cgram, 0, 0, 0, entry.bytes, false, false);
+  drawTile8x8(img, entry.cgram, 0, 0, 0, bgCapTileBytes4bpp(entry), false, false);
   if (scale === 1) { ctx.putImageData(img, 0, 0); return c; }
   const tmp = document.createElement('canvas');
   tmp.width = 8; tmp.height = 8;
@@ -9737,7 +9750,7 @@ function renderRuntimeObject(obj) {
   for (const t of obj.tiles) {
     const e = rtTilePixels(`${t.hash}_P${t.pal}`);
     if (!e) continue;
-    drawTile8x8(img, e.cgram, 0, t.x, t.y, e.bytes, false, false);
+    drawTile8x8(img, e.cgram, 0, t.x, t.y, bgCapTileBytes4bpp(e), false, false);
   }
   ctx.putImageData(img, 0, 0);
   return c;
@@ -19508,7 +19521,7 @@ function renderFontPage() {
     let drew = false;
     halves.forEach((h, i) => {
       const e = spriteMissByHash && spriteMissByHash.get(`${h}_P6`);
-      if (e) { drawTile8x8(imgData, e.cgram, 0, 0, i * 8, e.bytes, false, false); drew = true; }
+      if (e) { drawTile8x8(imgData, e.cgram, 0, 0, i * 8, bgCapTileBytes4bpp(e), false, false); drew = true; }
     });
     if (drew) ctx.putImageData(imgData, 0, 0);
     // Overdraw with HD where the container has it — same slot, so the grid stays put.

@@ -49,6 +49,23 @@ S49 in Mesen bleibt unverändert (Dixies Kiste, Kleevers Schwert).
   Referenzpalette bestimmt werden kann. Mit Referenz lädt Mesen sie slot-frei (`SnesHdPackLoader.cpp`, S20),
   der Slot im Namen ist dann egal. Ohne Referenz bleiben sie wie bisher draußen. Die Konsole zählt beides.
 
+- **Windy Well (gfxset 51): Blätter sind animierte BG3-Kacheln, der Anim-Export nahm nur BG1/BG2.** Die Annahme
+  vom 28.09. („dieselben Blätter wie Gusty Glade, nur nicht im gfxset“) war falsch. Gusty Glades Blätter liegen auf
+  BG1 (`bg1/gfxset_29`, 90 Kacheln), die von Windy Well auf **BG3**, und es sind andere Kacheln (nur braune). Belegt:
+  - bgcap G51 hat nur L2-Aufnahmen: 143 Kacheln, davon 87 Animationsbilder an 17 Adressen (`$5008–$5250`).
+  - Vier frische Abzüge vom 02.10. (`VRAM_G33_20261002_*`): 54 der aufgezeichneten Hashes an ihren Adressen,
+    an 18 Adressen wechselt der Inhalt zwischen den Abzügen. Keine der 90 Gusty-Kacheln ist im WW-VRAM.
+  - Im Pack hatte `bg3/gfxset_51` nur die 17 festen Kacheln eines einzelnen Bildes. Deshalb sieht es im Katalog
+    nach HD aus, im Spiel schaltet die Animation weiter und Mesen fällt auf SD zurück.
+
+  Ursache: `animForGfx` filterte seit 20.07. auf `layer <= 1`, und `decodeBgCapTileCanvas` gab für BG3 `null`
+  zurück („2bpp BG3 not handled yet (none in current data)“). Jetzt `layer <= 2`. 2bpp-Kacheln laufen über
+  `bgCapTileBytes4bpp` (Bitebenen 3/4 = 0) durch dieselbe `drawTile8x8`. `buildAnimOverlayContexts` und der
+  Pack-Export (`bg/bg{layer+1}`) konnten BG3 schon, Mesens Loader ist ebenenneutral.
+
+  Nebenbefund, nicht angefasst: Mesens BG-Recorder merkt sich Kacheln ohne gfxset (`SnesHdVideoFilter.cpp`,
+  `seenKey` = Hash/Palette/Ebene). Eine Kachel, die zwei gfxsets teilen, wird nur im ersten aufgezeichnet.
+
 ---
 
 ## [2026-09-28, nachts] — Funky-Jet-Icon, Cattail und die „Breaking Barrel“-Fragmente
