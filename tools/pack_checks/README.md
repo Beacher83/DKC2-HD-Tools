@@ -13,6 +13,8 @@ Namen in HEX, dazu `_state.txt` mit den echten PPU-Registern) bzw. frische Abzü
 | `render_bg.py ...` | eine BG-Ebene aus echtem VRAM rendern und mit einem Bild vergleichen | — |
 | `fpcheck.js <fingerprints.bin> <vram>...` (aus `dkc2-viewer/` starten) | welches gfxset erkennt Mesen je Abzug (Dateireihenfolge = S56) | genau das eigene |
 | `sprpal_diff.py <alt> <neu> <out>` | welche Sprite-Hashes haben ihre Referenzpalette verloren/gewechselt | 0 verloren |
+| `refcheck.py <pack> <out.pkl>` (braucht `sprpal_lib.py`) | Sprite-Kacheln, deren Referenzpalette >3x schlechter passt als eine andere Palette im Pack | 29.09.: 87 Treffer (Liste in `data_2026-09-29/bad87.txt`) |
+| `refpick_sim.py` (Modul) | Nachbau von `bestRefFor()`: alte (erste 64 Texel) gegen neue (verteilte) Stichprobe | — |
 | `viewer_harness.js <probe.js>` | lädt `index.html` in Node (Platzhalter-DOM), Viewer-Funktionen direkt aufrufbar; `__setRom(bytes)` | — |
 
 Pfade in den Skripten sind teils fest auf `C:/Users/beach/...` gesetzt (Downloads, OneDrive, Google Drive).
