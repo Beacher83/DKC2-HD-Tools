@@ -29,6 +29,16 @@ Deshalb reicht eine geänderte Reihenfolge allein nicht, die 37 müssen in Teile
 
 S49 in Mesen bleibt unverändert (Dixies Kiste, Kleevers Schwert).
 
+- **Sprite-Export: „Sheets“ standardmäßig AUS.** Das Sheet (alle Frames einer Animation in einer Zeile) wird
+  von Import und Pack-Export nicht gelesen, nur die `frame_###.png`. Gemessen am Colab-Lauf vom 02.10.
+  (`4xSGI_103000_G.pth`): Sheet-Zelle gegen einzeln hochgerechnetes Bild, 659 Frames, mittlere Abweichung
+  1,4/255 (innen 1,2, am Zellrand 4,7, dort wirkt das Nachbarbild hinein). Kein Qualitätsgewinn, aber
+  doppelte Rechenzeit, weil das Sheet dieselben Pixel noch einmal enthält.
+  **Notiz für später:** Ein ESRGAN-artiges Modell sieht nur eine lokale Umgebung und rechnet deterministisch,
+  für ihn ist der Kontext egal. Bei einem Wechsel auf ein generatives Modell (Stable Diffusion/ControlNet-Weg
+  im Notebook) kann ein gemeinsames Blatt die Frames einer Animation einheitlicher machen. Dann Sheets wieder
+  anhaken, und der Sprite-Import müsste aus dem Sheet schneiden statt die Einzelbilder zu lesen.
+
 ---
 
 ## [2026-09-28, nachts] — Funky-Jet-Icon, Cattail und die „Breaking Barrel“-Fragmente
