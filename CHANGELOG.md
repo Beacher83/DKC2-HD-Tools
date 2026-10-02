@@ -1,5 +1,36 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-10-02] — Composites in Teilen hochrechnen (N1 Klobber, N2 Diddy/Radio, N5 Tierfreunde)
+
+**Ursache, belegt per A/B (`ab_no_oam_tiebreak.bat`, Mesen S49 aus → Klobber und Diddys Gesicht richtig):**
+Ein Composite (gfxRef + extraRefs) ging als EIN Bild zum Upscaler und wurde danach geschnitten, jede Kachel trug
+die Kunst des anderen Teils mit: das Fass in Klobbers Kacheln, Diddys Gesicht im Radio (0x45), Diddys Umriss in
+Rattlys Kacheln. Seit S49 (23.09.) zeichnet Mesen bei OAM-Gleichstand den Teil einer Kachel, wo sie in SD
+durchsichtig ist, über das andere Sprite. Das macht die mitgebackene Kunst sichtbar, umgefärbt mit der Palette
+der Kachel. Für N5 ist der Fehler nicht auf den Rand beschränkt: die Kunst des anderen Teils steckt auch INNERHALB der Silhouette.
+Die Analyse vom 29.09. („Ref Fass statt Klobber“, Fix über alle Texel in `bestRefFor`) war verkehrt herum und
+ist damit erledigt.
+
+Umfang: 37 Animationen, 876 Bilder, 4266 Kachel-Hashes. 1379 davon gibt es auch in Einzelbildern, 2887 nur im Composite.
+Deshalb reicht eine geänderte Reihenfolge allein nicht, die 37 müssen in Teilen neu hochgerechnet werden.
+
+- **SD-Export:** Ein Composite wird in Teile zerlegt, ein Ordner je Teil. Teil 0 = gfxRef und behält den alten
+  Namen (ersetzt beim Import das gemischte Set), Teil k = `extraRefs[k-1]` als `…_0xNNNN_xk`. Manifest je Teil:
+  `folder`, `part`, `partCount`, je Variante `originX/originY` (Ursprung im Deskriptor-Raum).
+  Geprüft im Harness: die Teile ergeben zusammen dieselben 25.435 Kachel-Platzierungen wie das alte
+  Composite (876 Bilder, 0 Abweichungen).
+- **Colab:** unverändert, rechnet jedes PNG hoch und reicht das Manifest durch.
+- **Import/Container:** `part`, `originX/Y` werden übernommen und gespeichert.
+- **Anzeige:** `getHDSpriteFrame` setzt zerlegte Composites zusammen: jeder Teil an seinem Ursprung,
+  Reihenfolge nach `extraBehind`, wie das Spiel bzw. Mesen die Sprites übereinanderlegt.
+- **Pack-Export:** Ein Teil bekommt als Referenz nur seine eigene Palette (Teil 0 primär + block2, Zusatzteil
+  sekundär bzw. primär, wenn es keine gibt). Composite-Sets, die noch als ein Bild im Container liegen, laufen
+  zuletzt und werden in der Konsole genannt. Damit gewinnt für geteilte Kacheln die saubere Einzelanimation.
+
+S49 in Mesen bleibt unverändert (Dixies Kiste, Kleevers Schwert).
+
+---
+
 ## [2026-09-28, nachts] — Funky-Jet-Icon, Cattail und die „Breaking Barrel“-Fragmente
 
 Alle drei gegen die Spritecap geprüft (was das Spiel wirklich gezeichnet hat), mit den Viewer-Funktionen
