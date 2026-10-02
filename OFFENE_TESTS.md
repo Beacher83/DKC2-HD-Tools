@@ -1,6 +1,39 @@
-# Offene Tests — Stand 2026-09-29
+# Offene Tests — Stand 2026-10-02
 
-## ▶ NÄCHSTE SITZUNG — hier anfangen (Stand 29.09. abends)
+## ▶ NÄCHSTE SITZUNG — hier anfangen (Stand 02.10. abends)
+
+**Installiert:** Pack 02.10. 14:12 (`Downloads\Anim Tiles v2_mesen2_hdpack (1).zip`), Mesen S57.
+**Erledigt 02.10.** (Details im CHANGELOG beider Repos):
+- N1 Klobber, N2 Diddy/Radio, N5 Tierfreunde: Composites werden in Teilen hochgerechnet, im Spiel bestätigt.
+- Diddy auf Rattly HD. Nie aufgezeichnete Sprite-Kacheln gehen slot-frei über ihre Referenz ins Pack.
+- Windy-Well-Blätter (#5) HD: animierte BG3-Kacheln, der Anim-Export nahm nur BG1/BG2.
+- K. Rools Kabine (gfxset 46) neu im Pack.
+- Ruckler in Screech's Sprint: Mesen S57 Kachel-Cache, Filter 12,35 → 4,48 ms.
+
+**Nächster Colab-Lauf („King K.“-Run), zusammen exportieren:**
+1. **`Seq 26BE` (0xE003) — Dixie fällt auf Rattly (Haare nach oben).** Im Viewer noch ohne HD-Version. Die 70
+   Kacheln (Deskriptoren `$0DA4–$0DB8`, gfxset 37, Slot P2) fehlen im Pack. Nicht 0x0120: deren Dixie-Teil
+   (120 Kacheln) ist komplett im Pack.
+2. **K. Rools Blunderbuss** (0x0251, 0x0258, 0x025F, 0x0261, 0x0263; gfxset 46): 260 Kacheln, im Lauf 14:21 SD.
+3. Danach Pack exportieren, vor dem Installieren prüfen lassen (Sprite-Referenzen, Fingerabdrücke).
+
+**Weiter offen:**
+- **Spieltest nachholen:** Klobber, Got Prize mit dem Radio und Team-Up nach dem Composite-Umbau (am 02.10.
+  nicht getestet).
+- **Rest-Ruckler:** In Screech's Sprint liegt die Filterzeit ab ~Frame 290 bei 6,5–7 ms ohne Cache-Fehltreffer
+  (unter dem Budget, Ursache offen). Das Diagnose-Log deckt nur die ersten 600 Frames je Kontext ab. Falls es
+  stört: Lauf mit `SNES_HD_PERF=1`.
+- **Mesen-BG-Recorder merkt sich Kacheln ohne gfxset** (`SnesHdVideoFilter.cpp`, `seenKey`): Eine Kachel, die zwei
+  gfxsets teilen, wird nur im ersten aufgezeichnet. Kleine Änderung, noch nicht gemacht.
+- N3 übrige SD-Animationen/Gegner (Cat-O-9-Tails u. a., z. T. durch den Fix „nie aufgezeichnet“ erledigt, neu
+  spielen und bgcap/spritemiss prüfen), N4 Castle-Crush-Fackeln.
+- Nebenbefund `refcheck.py`: 87 Kacheln mit unpassender Referenz (37× Squitters Netz). Erst anschauen, wenn im Spiel
+  sichtbar.
+- Ghostly Grove (gfxset 30) und Speicherarchitektur: wie unten, unverändert.
+
+---
+
+## (alt) NÄCHSTE SITZUNG (Stand 29.09. abends)
 
 **Installiert:** Pack 29.09. 13:54 (`Downloads\Anim Tiles v2_mesen2_hdpack (2).zip`, 83.663 Dateien), vorher
 geprüft: 0 Sprite-Referenzen verloren/geändert, gfxset 39 mit 1113 Hashes + Fingerabdruck 8/8, sonst alle
