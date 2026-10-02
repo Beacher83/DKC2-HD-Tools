@@ -39,6 +39,16 @@ S49 in Mesen bleibt unverändert (Dixies Kiste, Kleevers Schwert).
   im Notebook) kann ein gemeinsames Blatt die Frames einer Animation einheitlicher machen. Dann Sheets wieder
   anhaken, und der Sprite-Import müsste aus dem Sheet schneiden statt die Einzelbilder zu lesen.
 
+- **Pack-Export: nie aufgezeichnete Sprite-Kacheln werden über ihre Referenz ausgeliefert.** Spieltest 02.10.:
+  Diddy auf Rattly blieb SD, Dixie war HD. Die HD-Kunst war vorhanden. Diddys 16 Reiter-Kacheln standen aber
+  erst ab der Session 02.10. 10:29 in der spritecap, und der Export übersprang jede Kachel ohne Aufzeichnung
+  (kein Palettenslot). Gemessen über alle 737 Galerie-Animationen: 3.267 von 48.434 platzierten Kacheln ohne
+  Aufzeichnung, keine davon im Pack. Betroffen 20 Animationen ganz, 56 teilweise (Team-Up Idle 218/394, DK Coin,
+  Kannon, Spread-Eagle, Endspiel/Abspann). Wahrscheinlich ein Teil von N3.
+  Jetzt: Kacheln ohne Aufzeichnung bekommen den Platzhalter-Slot `_P0` und werden ausgeliefert, **wenn** ihre
+  Referenzpalette bestimmt werden kann. Mit Referenz lädt Mesen sie slot-frei (`SnesHdPackLoader.cpp`, S20),
+  der Slot im Namen ist dann egal. Ohne Referenz bleiben sie wie bisher draußen. Die Konsole zählt beides.
+
 ---
 
 ## [2026-09-28, nachts] — Funky-Jet-Icon, Cattail und die „Breaking Barrel“-Fragmente

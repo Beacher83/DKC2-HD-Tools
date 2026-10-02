@@ -14392,7 +14392,21 @@ async function exportAsTexturePack(containerName) {
       } else {
         const spritesFolder = root.folder('sprites');
         const writtenKeys = writtenSpriteKeys;   // "{hash}_P{pal}"
-        const noPalHashes = new Set();       // seen but never recorded at runtime
+        const noPalHashes = new Set();       // never recorded at runtime AND no reference -> not shipped
+        const uncapturedShipped = new Set(); // never recorded, shipped slot-free on its reference
+        // Palettenslots einer Kachel. Was die spritecap nie gesehen hat, bekommt den
+        // Platzhalter-Slot 0: eine Kachel MIT Referenzpalette laedt Mesen ohnehin
+        // slot-frei (S20), der Slot im Dateinamen ist dann bedeutungslos. Ob es eine
+        // Referenz gibt, entscheidet sich erst beim Schneiden, siehe unten.
+        // Gemessen 02.10.: 3267 platzierte Galerie-Kacheln hatten keine Aufzeichnung
+        // und fehlten deshalb ganz im Pack -- Diddy auf Rattly, Team-Up, DK Coin, ...
+        const SLOT_UNKNOWN = new Set([0]);
+        const slotsFor = (hashHex) => {
+          const pals = spriteCapPairs.get(hashHex);
+          if (pals && pals.size > 0) return pals;
+          if (spriteRefVetoed.has(hashHex)) { noPalHashes.add(hashHex); return null; }
+          return SLOT_UNKNOWN;
+        };
         let noMetaFrames = 0, sprFrameCount = 0;
 
         // Guard for the reference palette. The cascade in resolveSpritePalettes() can
@@ -14599,8 +14613,8 @@ async function exportAsTexturePack(containerName) {
             let frameNeeded = false;
             for (const t of meta.tiles) {
               const hashHex = String(t.hash).toUpperCase();
-              const pals = spriteCapPairs.get(hashHex);
-              if (!pals || pals.size === 0) { noPalHashes.add(hashHex); continue; }
+              const pals = slotsFor(hashHex);
+              if (!pals) continue;
               for (const p of pals) { if (!writtenKeys.has(`${hashHex}_P${p}`)) { frameNeeded = true; break; } }
             }
             if (!frameNeeded) continue;
@@ -14616,8 +14630,9 @@ async function exportAsTexturePack(containerName) {
             try {
               for (const t of meta.tiles) {
                 const hashHex = String(t.hash).toUpperCase();
-                const pals = spriteCapPairs.get(hashHex);
-                if (!pals || pals.size === 0) continue;
+                const pals = slotsFor(hashHex);
+                if (!pals) continue;
+                const uncaptured = !spriteCapPairs.has(hashHex) || spriteCapPairs.get(hashHex).size === 0;
                 let needed = false;
                 for (const p of pals) { if (!writtenKeys.has(`${hashHex}_P${p}`)) { needed = true; break; } }
                 if (!needed) continue;
@@ -14664,6 +14679,14 @@ async function exportAsTexturePack(containerName) {
                   refStats.droppedDimmed++;
                   continue;
                 }
+                // Nie aufgezeichnet: ohne Referenz wuesste niemand, unter welchem Slot
+                // die gebackenen Farben stimmen -- dann lieber nativ. Mit Referenz ist
+                // der Slot egal (Mesen S20, SnesHdPackLoader: slot-frei).
+                if (uncaptured && !spriteRefPalettes.has(hashHex)) {
+                  noPalHashes.add(hashHex);
+                  continue;
+                }
+                if (uncaptured) uncapturedShipped.add(hashHex);
 
                 const dataUrl = outCanvas.toDataURL('image/png');
                 const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
@@ -14708,7 +14731,8 @@ async function exportAsTexturePack(containerName) {
           `${spriteRefPalettes.size} Kachel-Hashes abgedeckt`);
         console.log(`[sprites] ${spriteExportedTiles} Sprite-Tile-PNGs exportiert ` +
           `(davon ${spriteSlotFreeTiles} slot-frei, also einmal statt je OAM-Slot — braucht Mesen S20+); ` +
-          `${noPalHashes.size} Hashes ohne Runtime-Palette übersprungen (mehr Level mit S5a-Build spielen); ` +
+          `${uncapturedShipped.size} nie aufgezeichnete Hashes slot-frei über ihre Referenz ausgeliefert; ` +
+          `${noPalHashes.size} Hashes ohne Runtime-Palette und ohne Referenz übersprungen (mehr Level spielen); ` +
           `${noMetaFrames} Frames ohne Platzierungs-Metadaten`);
         if (noMetaFrames > 0 && spriteExportedTiles === 0) {
           console.warn('[sprites] ALLE Frames ohne Platzierungs-Metadaten. Zwei mögliche Ursachen: ' +
