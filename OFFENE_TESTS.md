@@ -1,6 +1,62 @@
-# Offene Tests — Stand 2026-10-02
+# Offene Tests — Stand 2026-10-05
 
-## ▶ NÄCHSTE SITZUNG — hier anfangen (Stand 02.10. abends)
+## ▶ UPSCALER-LISTE (Stand 05.10., Auswertung Lauf 02.10. 21:42 S57 + 14:21/15:16)
+
+Quelle: `snes_hd_spritemiss.txt` über ALLE Sitzungen (Recorder ist geseedet, eine einmal verfehlte Kachel
+erscheint nie wieder) gegen das installierte Pack 02.10. 14:12; Zuordnung über frischen ROM-Index
+(Deskriptoren, Animationen 1–0x30B, verwaiste Sequenzen). 5.290 je verfehlte Hashes: 3.632 inzwischen im Pack,
+**~1.600 fehlen**, 58 im Pack unter falschem Slot. `G` im Log ist DEZIMAL (G46 = 0x2E).
+Spieltest 02.10.: Klobber sauber ✔.
+
+### A. Sprites, in den letzten Läufen gesehen und noch SD
+| # | Was | Kacheln | gfxset | Im Viewer |
+|---|---|---|---|---|
+| 1 | Dixies Fall (Rattly) | 70 | 37 | `Seq E003` (Deskr. `$0DA4–$0DB8`) |
+| 2 | K. Rools Blunderbuss | ~130 gesehen / 260 | 46 | 0x0251/0258/025F/0261/0263 |
+| 3 | Rauchwolke/Explosion | 235 | 51, 29, 47 | `0x01BC Explosion` (teilt mit `0x0272 K. Rool Revival`) |
+| 4 | Wolke/Dampf Hitze-Level | 145 | 32 | `0x020F Unknown` |
+| 5 | Kunst ohne Animation Rickety Race/Target Terror | ~250 | 34 | `Gfx 2B08…2B50`, `Gfx 32FC` |
+| 6 | Flitter besiegt | 105 | 37, 29, 38 | `0x019D Flitter Flip Over` |
+| 7 | Funken | 131 (30 zuletzt) | 34, 44 | `0x01B1 Spark` |
+| 8 | Verwaiste Sequenzen Bayou-Set | 45 | 38 | `Seq E01A` / `Seq E01B` |
+| 9 | Laufzeit ohne Deskriptor | ~230 | 37 (86), 29 (62), 34 (55) | Laufzeit-Galerie |
+| 10 | Kleinkram | je 2–26 | | X Barrel `0x02DA` (15), Seil-Anims DD/DX (~20, gfx 37), `Gfx 7E5C` (26), `Gfx 2FFC/3000` (12), `Gfx 1AA0` (8), Kudgels Keule `0x029D` (6), `Gfx 2300/2304`, DK Coin |
+
+### B. Sprites aus älteren Läufen, laut Pack weiter ohne Kunst
+`0x01B6 Spark?/Splash?` 57 (gfx 3 Lava/Lockjaw) · `Gfx 31A0–31B8` 64 Schrift/Rahmen (gfx 44/29) ·
+`Gfx 0BB8–0D00` ~56 Inselkarte (gfx 53).
+
+### C. Hintergründe (Anteil `miss/bg` je Kontext; Kontrolle: komplett-HD-Level = 0 %)
+| Level | SD-Anteil | Befund |
+|---|---|---|
+| **Glimmer's Galleon (40)** | **61 %** | kein eigenes BG-Pack, läuft als Lockjaw (3) — Kacheln passen nicht |
+| **Slime Climb (45), vermutlich** | **22 %** | kein eigenes BG-Pack, läuft als Mainbrace (37); ROM-Abgleich: 35 der Miss-Kacheln nur in Set 45. User-Bestätigung offen |
+| Arctic Abyss/Clapper's Cavern (47) | 9 % | 101 BG1-Kacheln, vermutlich Schwesterlevel |
+| Shops (Kollege, Klubba, Funky, PP-Versteck) | 2–7 % | BG3-Textschrift, 30–54 Kacheln je Shop |
+| Windy Well | gering | 46 BG3-Kacheln ohne Kunst |
+| 3 nicht erkannte Bildschirme | 100 % | Mode-0-Textbildschirm + zwei unbekannte (sig `7DB645E0`, `BF50841D`) |
+MISS-Zeilen sind auf 60 je Kontext gedeckelt → Untergrenzen. Ohne eigenes BG-Pack außerdem: 33 Topsail, 36 Squawks's
+Shaft, 41 Red-Hot Ride, 42 Krocodile Kore, 49 Toxic Tower, 52 Web Woods (laufen ggf. über Schwestersets, ungeprüft).
+Vorsicht: `BGn − hdBGn` ist KEIN SD-Anteil (auch in gfx 7 mit miss=0 weit auseinander).
+
+### D. Kein Upscale — Export/Slot
+58 Kacheln im Pack unter anderem Slot: u. a. 6× `0x00E8 DX Got Prize` (P7), 19 Spritzer Bayou (P3), 24 Weltkarte.
+
+### E. Transparente Linie Level-Ende (Diddys Sonnenbrille, Dixies Gitarre)
+User-Test 05.10.: **„Sprite-Kanten glätten“ aus → Linie bei Diddy weg.** Ursache also in Mesens Kantenglättung,
+nicht in der Kunst. Diddy `0x0045` (131 Frames, 87 Composite), Dixie `0x00E8` (130 Frames, 90 Composite).
+→ **Mesen S58 gebaut (uncommittet):** An einer inneren Naht (alle 4 Nachbarn Sprite) wird nicht mehr gegen den BG
+geblendet. Test: Level-Ende mit Glättung an, `sprSeam=` > 0; A/B `ab_no_seam_guard.bat`.
+**User-Test 05.10.: Brille sauber, Linie größtenteils weg.** Rest GEPARKT: 1–2 Pixel zwischen Boombox und Diddy
+scheinen kurz noch durch, vermutlich Nahtpixel mit einem Nachbarn ohne Sprite (die Prüfung mit 4 Nachbarn greift
+dort nicht). Idee für später: als Untergrund den HD-Texel des Nachbar-Sprites nehmen statt des BG.
+**Slime Climb / Glimmer:** Der User sieht beide als HD. Kandidat für den SD-Anteil ist die Wasseroberfläche
+(BG3-Farbmathe aus Lockjaw, sieht auch dort kaum anders aus als SD). Slime Climb hat `sHd` ≈ 14.700 je Frame (der
+Operand ist teils HD). Klären mit einem F12-Paar HD an/aus am selben Savestate.
+
+---
+
+## (alt) NÄCHSTE SITZUNG (Stand 02.10. abends)
 
 **Installiert:** Pack 02.10. 14:12 (`Downloads\Anim Tiles v2_mesen2_hdpack (1).zip`), Mesen S57.
 **Erledigt 02.10.** (Details im CHANGELOG beider Repos):
