@@ -119,6 +119,7 @@
 <script src="vram_groundtruth.js"></script>
 <script src="font_groundtruth.js"></script>
 <script src="zahlen_groundtruth.js"></script>
+<script src="recordings_groundtruth.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -349,6 +350,7 @@ canvas { image-rendering: pixelated; cursor: crosshair; }
       <input type="file" id="bgCapInput" accept=".txt" multiple style="display:none">
       <button id="runtimeSprBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="snes_hd_spritemiss.txt + snes_hd_sprpos.txt laden (Mesen-Recording S8/S15) — Laufzeit-Sprites ohne ROM-Anim-Eintrag: Weltkarten-Schrift, Schädelwagen, Fackeln. Beide Dateien auf einmal auswählbar.">Laufzeit</button>
       <input type="file" id="runtimeSprInput" accept=".txt" multiple style="display:none">
+      <button id="bakeRecBtn" style="padding:3px 8px;background:#0f3460;color:#e0e0e0;border:1px solid #555;" title="Spritecap, BG-Anim und Laufzeit aus dem Browser-Speicher in recordings_groundtruth.js schreiben (Download). Die Datei neben index.html legen: der Viewer nimmt sie beim Start als Grundstock, neue Mesen-Dateien ergänzen sie wie bisher.">Einbacken</button>
       <button id="containerMgrBtn" style="padding:3px 10px;background:#9c27b0;color:#fff;border:1px solid #9c27b0;font-weight:bold;" title="HD Container verwalten — Speichern, Laden, Exportieren">Container</button>
       <input type="file" id="hdZipInput" accept=".zip" style="display:none;">
     </div>
@@ -10214,6 +10216,7 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
     if (!hdPack.sprites) hdPack.sprites = new Map();
 
     let totalFrames = 0, totalSprites = 0;
+    const importedKeys = [];   // only these go to the container afterwards
     let spriteScaleFactor = manifest.scaleFactor || 1;
     let scaleDetected = false;
 
@@ -10281,6 +10284,7 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
           originX: variant.originX ?? null,
           originY: variant.originY ?? null,
         });
+        importedKeys.push(spriteKey);
         totalSprites++;
       }
 
@@ -10298,6 +10302,7 @@ async function importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file
     btn.textContent = `${totalSprites} sprites (${totalFrames} frames) loaded!`;
     console.log(`HD Sprite Pack: ${spriteScaleFactor}x | ${totalSprites} sprites, ${totalFrames} frames | ${sizeMB} MB`);
     setTimeout(() => { if (hdImportBusy > 0) return; btn.textContent = origText; btn.disabled = false; }, 4000);  // still saving to the container: importHDPackToContainer re-enables it when done
+    return importedKeys;
 
   } catch (err) {
     console.error('HD Sprite Import error:', err);
@@ -10435,8 +10440,8 @@ async function importHDPack(file) {
 
     // Branch: sprite ZIP vs runtime ZIP vs level ZIP
     if (manifest.exportType === 'sprites') {
-      await importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file);
-      return { kind: 'sprites' };
+      const keys = await importHDSpritePack(zip, manifest, rootPrefix, btn, origText, file);
+      return { kind: 'sprites', keys };
     }
     if (manifest.exportType === 'runtime') {
       const n = await importHDRuntimePack(zip, manifest, rootPrefix, btn, origText, file);
@@ -11066,6 +11071,171 @@ async function restoreRuntimeSprFromDb() {
     }
   } catch (e) {
     console.warn('[laufzeit] restore failed:', e);
+  }
+}
+
+// --- Baked recordings (recordings_groundtruth.js) ---
+//
+// The Mesen recordings (spritecap, bgcap, spritemiss/oam/sprpos, keep list) live in
+// this browser's IndexedDB only: clearing site data, another browser or another
+// machine starts from nothing. "Einbacken" writes them into recordings_groundtruth.js
+// next to index.html, like vram_groundtruth.js, and on start the viewer takes that
+// file as its base. New Mesen files still merge on top in the database, exactly as
+// before; the next bake carries them into the file.
+//
+// Format: gzip'd JSON, base64. The spritecap is stored per column, because as text
+// every one of its 142 000 lines repeats 64 hex of tile bytes and 64 hex of CGRAM
+// (22 MB, 5.7 MB gzip'd) while there are only ~50 000 tiles and ~300 rows. The lines
+// are rebuilt byte for byte on the way in, so parseSpriteCap and the merge see
+// exactly what a file upload would have given them.
+const SPRCAP_LINE_RE = /^SPR ([0-9A-F]{16}) P(\d) T([0-9A-F]{64}) C([0-9A-F]{64})$/;
+
+function packSpriteCapLines(lines) {
+  const tileIdx = new Map(), rowIdx = new Map();
+  const tiles = [], rows = [], recs = [], extra = [];
+  for (const line of lines) {
+    const m = line.match(SPRCAP_LINE_RE);
+    if (!m) { extra.push(line); continue; }
+    let ti = tileIdx.get(m[1]);
+    if (ti === undefined) { ti = tiles.length; tileIdx.set(m[1], ti); tiles.push(m[1] + m[3]); }
+    let ri = rowIdx.get(m[4]);
+    if (ri === undefined) { ri = rows.length; rowIdx.set(m[4], ri); rows.push(m[4]); }
+    recs.push(ti, parseInt(m[2]), ri);
+  }
+  return { tiles, rows, recs, extra };
+}
+
+function unpackSpriteCapLines(p) {
+  const out = [];
+  for (let i = 0; i < p.recs.length; i += 3) {
+    const t = p.tiles[p.recs[i]];
+    out.push(`SPR ${t.slice(0, 16)} P${p.recs[i + 1]} T${t.slice(16)} C${p.rows[p.recs[i + 2]]}`);
+  }
+  for (const l of p.extra || []) out.push(l);
+  return out;
+}
+
+async function gzipToBase64(str) {
+  const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('gzip'));
+  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function base64GunzipToString(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
+async function bakeRecordings() {
+  const btn = document.getElementById('bakeRecBtn');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Einbacken...';
+  try {
+    const capLines = (await loadRecording('spritecap_lines'))?.lines || [];
+    const bgLines = (await loadRecording('bgcap_lines'))?.lines || [];
+    const miss = (await loadRecording('spritemiss'))?.entries || null;
+    const oam = (await loadRecording('oam'))?.frames || null;
+    const pos = (await loadRecording('sprpos'))?.entries || null;
+    const keep = (await loadRecording('keeplist'))?.ids || null;
+    if (!capLines.length && !bgLines.length && !miss && !oam) {
+      alert('Im Browser-Speicher liegen keine Aufzeichnungen — nichts einzubacken.');
+      return;
+    }
+    const payload = { spritecap: packSpriteCapLines(capLines), bgcap: bgLines,
+                      spritemiss: miss, oam, sprpos: pos, keeplist: keep };
+    const data = await gzipToBase64(JSON.stringify(payload));
+    const version = new Date().toISOString();
+    const counts = { spritecapLines: capLines.length, spritecapTiles: payload.spritecap.tiles.length,
+                     bgcapLines: bgLines.length, spritemiss: miss ? miss.length : 0,
+                     oamFrames: oam ? oam.length : 0, sprpos: pos ? pos.length : 0,
+                     keeplist: keep ? keep.length : 0 };
+    const js = '// AUTO-GENERATED by the viewer button "Einbacken" — do not edit manually.\n' +
+               '// Mesen recordings (spritecap, bgcap, spritemiss/oam/sprpos, keep list) as the\n' +
+               '// viewer had them; taken as the base on start (seedRecordingsFromGroundTruth).\n' +
+               `// Generated: ${version}\n` +
+               `// ${JSON.stringify(counts)}\n` +
+               `window.RECORDINGS_GT = ${JSON.stringify({ version, counts })};\n` +
+               `window.RECORDINGS_GT.data = '${data}';\n`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
+    a.download = 'recordings_groundtruth.js';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    // The database already holds everything in the file — mark it, so the next
+    // start does not merge the same data back in.
+    await saveRecording('baked', { version });
+    console.log(`[einbacken] recordings_groundtruth.js: ${(js.length / 1e6).toFixed(1)} MB`, counts,
+                '— neben index.html in dkc2-viewer/ legen.');
+    btn.textContent = `Eingebacken (${(js.length / 1e6).toFixed(1)} MB)`;
+  } catch (err) {
+    console.error('[einbacken] fehlgeschlagen:', err);
+    alert('Einbacken fehlgeschlagen: ' + err.message);
+    btn.textContent = orig;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Runs before the restores. Once per baked version: line recordings (spritecap,
+// bgcap) are MERGED with what the database has — nothing stored is lost, nothing
+// baked is missing. Whole-file recordings (spritemiss, oam, sprpos, keep list) are
+// replaced on every upload anyway, so the baked copy only fills an EMPTY slot.
+async function seedRecordingsFromGroundTruth() {
+  const gt = window.RECORDINGS_GT;
+  if (!gt || !gt.data) return;
+  try {
+    const mark = await loadRecording('baked');
+    if (mark && mark.version >= gt.version) return;
+    const t0 = performance.now();
+    const p = JSON.parse(await base64GunzipToString(gt.data));
+    const done = [];
+
+    const capRec = await loadRecording('spritecap_lines');
+    const capBase = capRec?.lines || [];
+    const capSet = new Set(capBase);
+    for (const l of unpackSpriteCapLines(p.spritecap)) capSet.add(l);
+    if (capSet.size > capBase.length || (capSet.size && !(await loadRecording('spritecap')))) {
+      const lines = [...capSet];
+      await saveRecording('spritecap_lines', { lines });
+      const res = parseSpriteCap(lines.join('\n'));
+      await saveRecording('spritecap', { entries: [...res.map], pairs: res.pairs, dimmed: [...res.dimmed],
+                                         rows: res.rows, hashRow: [...res.hashRow] });
+      done.push(`spritecap +${capSet.size - capBase.length} Zeilen`);
+    }
+
+    const bgRec = await loadRecording('bgcap_lines');
+    const bgBase = bgRec?.lines || [];
+    const bgSet = new Set(bgBase);
+    for (const l of p.bgcap || []) bgSet.add(l);
+    if (bgSet.size > bgBase.length) {
+      await saveRecording('bgcap_lines', { lines: [...bgSet] });
+      done.push(`bgcap +${bgSet.size - bgBase.length} Zeilen`);
+    }
+
+    const fill = async (name, key, value) => {
+      if (!value || !value.length) return;
+      const rec = await loadRecording(name);
+      if (rec && rec[key] && rec[key].length) return;
+      await saveRecording(name, { [key]: value });
+      done.push(`${name} ${value.length}`);
+    };
+    await fill('spritemiss', 'entries', p.spritemiss);
+    await fill('oam', 'frames', p.oam);
+    await fill('sprpos', 'entries', p.sprpos);
+    await fill('keeplist', 'ids', p.keeplist);
+
+    await saveRecording('baked', { version: gt.version });
+    console.log(`[einbacken] Stand ${gt.version} übernommen` +
+                (done.length ? `: ${done.join(', ')}` : ' — die Datenbank hatte schon alles') +
+                ` (${Math.round(performance.now() - t0)} ms)`);
+  } catch (e) {
+    console.warn('[einbacken] recordings_groundtruth.js konnte nicht übernommen werden:', e);
   }
 }
 
@@ -16815,10 +16985,18 @@ async function importHDPackToContainerInner(file, containerName) {
         savedInfo += (savedInfo ? ', ' : '') + `${merged.size} Laufzeit-Kacheln (+${added})`;
         console.log(`[laufzeit] im Container: ${merged.size} Kacheln (${added} neu).`);
       }
-      // Save sprite HD data
-      if (hdPack.sprites && hdPack.sprites.size > 0) {
+      // Save sprite HD data -- only what THIS ZIP brought. hdPack.sprites also holds
+      // every sprite of the loaded container, and saving all of them re-encoded each
+      // frame as PNG: 772 sprites for a 54-sprite import, a quarter of an hour behind
+      // "Saving to container..." (05.10.), and with another container loaded it would
+      // have copied that one's sprites into the target.
+      const sprKeys = imported?.kind === 'sprites' ? (imported.keys || []) : [];
+      if (hdPack.sprites && sprKeys.length > 0) {
         let sprCount = 0;
-        for (const [key, sprData] of hdPack.sprites) {
+        for (const key of sprKeys) {
+          const sprData = hdPack.sprites.get(key);
+          if (!sprData) continue;
+          btn.textContent = `Saving to container... ${sprCount + 1}/${sprKeys.length}`;
           // Convert all frames to blobs in parallel
           const frameEntries = [...sprData.frames.entries()];
           const frames = await Promise.all(frameEntries.map(async ([idx, img]) => ({
@@ -20866,6 +21044,10 @@ if (window.showDirectoryPicker) {
   console.log('[export] no File System Access API in this browser — ZIP export only');
 }
 
+// Baked recordings first (recordings_groundtruth.js), so the restores below find
+// them in the database like anything uploaded.
+(async () => {
+await seedRecordingsFromGroundTruth();
 // Bring the stored spritecap back, so it no longer has to be re-uploaded.
 restoreSpriteCapFromDb();
 // Same for the BG recording: re-parsed from its stored raw lines (~5 MB, a
@@ -20888,6 +21070,8 @@ restoreSpriteCapFromDb();
 // which is the first moment anyone needs it.
 restoreRuntimeSprFromDb();
 restoreKeepList();
+})();
+document.getElementById('bakeRecBtn').addEventListener('click', bakeRecordings);
 
 console.log('DKC2 Viewer: All scripts loaded and event listeners registered.');
 </script>

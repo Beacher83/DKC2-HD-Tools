@@ -1,5 +1,18 @@
 # Offene Tests — Stand 2026-10-05
 
+## ▶ NÄCHSTE SITZUNG (Stand 05.10. abends)
+
+- **Pack 05.10. 19:05** (`Downloads\Anim Tiles v2_mesen2_hdpack.zip`, entpackt `…hdpack 05102026\`) geprüft: BG,
+  cmFg, Fingerabdrücke, Paletten, hashes.bin byte-gleich; Sprites +3.182 Referenzen, 0 verloren, 1.868 nur
+  Slot-Name geändert (Bild identisch, alle slot-frei), 1 Kachel neu referenziert (`516BD3C778F2EA45`, geteilt
+  Kannon/Klubba/K. Rool → jetzt Ref K. Rool). Von 1.600 fehlenden Miss-Kacheln jetzt 1.025 drin. Spieltest offen:
+  Dixies Fall, Blunderbuss, Rauch/Explosion, Hitze-Dampf, Flitter, Funken.
+- **Rest Rickety Race:** `Gfx 2B30–2B48` (91 Kacheln) fehlen — im Viewer des Users eigene Gruppe (Suche `Gfx 2B3`
+  bzw. `Gfx 2B2`, IDs D018/D019). Mit `Gfx 7E5C`, X Barrel `02da` in den nächsten Colab-Lauf.
+- **Viewer 05.10.:** Sprite-Import speichert nur noch die importierten Sprites; Aufzeichnungen eingebacken
+  (`recordings_groundtruth.js`, 11 MB, nur an Meilensteinen neu erzeugen).
+- **Mesen S58** (innere Naht) bestätigt, Rest 1–2 Pixel Boombox/Diddy geparkt (unten E).
+
 ## ▶ UPSCALER-LISTE (Stand 05.10., Auswertung Lauf 02.10. 21:42 S57 + 14:21/15:16)
 
 Quelle: `snes_hd_spritemiss.txt` über ALLE Sitzungen (Recorder ist geseedet, eine einmal verfehlte Kachel

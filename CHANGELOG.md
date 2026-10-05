@@ -1,5 +1,48 @@
 # Changelog — DKC2-HD-Tools Viewer & Mesen2 SNES HD Fork
 
+## [2026-10-05] — Aufzeichnungen einbacken (`recordings_groundtruth.js`)
+
+**Anlass:** Spritecap, BG-Anim und Laufzeit (spritemiss, OAM, sprpos, Merkliste) lagen nur in der IndexedDB
+des Browsers. Wer die Website-Daten löscht oder einen anderen Browser oder Rechner nimmt, fängt bei null an.
+
+**Neu:**
+- **Knopf „Einbacken“** neben „Laufzeit“: schreibt alle Aufzeichnungen aus der Datenbank in
+  `recordings_groundtruth.js` (Download). Die Datei kommt neben `index.html` und wird wie `vram_groundtruth.js`
+  per `<script>` geladen.
+- **Beim Start** (`seedRecordingsFromGroundTruth`, läuft vor den Wiederherstellungen), einmal je eingebackenem
+  Stand: Spritecap- und BG-Anim-Zeilen werden mit der Datenbank **vereinigt**, also geht nichts verloren und
+  nichts Eingebackenes fehlt. Spritemiss, OAM, sprpos und Merkliste werden beim Hochladen ohnehin ganz ersetzt,
+  deshalb füllt die eingebackene Fassung nur einen leeren Platz. Neue Mesen-Dateien ergänzen wie bisher in der
+  Datenbank, beim nächsten Einbacken kommen sie mit in die Datei.
+- **Format:** gzip-JSON in base64. Die Spritecap wird spaltenweise abgelegt (jede Kachel und jede CGRAM-Zeile
+  einmal, je Zeile nur Kachel, Slot und Zeilennummer), sonst wiederholt jede der 142.275 Zeilen 128 Hex-Zeichen.
+
+**Geprüft (Node-Harness, echte Dateien vom 02.10.):** Rundweg packen → gzip → base64 → zurück: 142.275 von
+142.275 Zeilen identisch, `parseSpriteCap` liefert dasselbe (Hashes, Paare, Zeilen, `hashRow`), BG-Anim identisch.
+**Im Browser getestet (User, 05.10.):** eingebacken, dann eine private Sitzung (leere Datenbank) geöffnet, alle
+Werte identisch. Erste Datei: **11,0 MB** — sprpos 3,2 MB (260.019 Positionen, nur für die Schrift-Seite),
+Spritecap 2,7, OAM 2,2 (3.632 Frames), spritemiss 1,9 (29.287), BG-Anim 0,5 (10.224 Zeilen), Merkliste 16.
+Falls die Größe stört: sprpos weglassen bzw. spaltenweise packen spart ~3 MB.
+
+**Git:** Die Datei nur an Meilensteinen neu erzeugen und committen. Jede neue Fassung bleibt dauerhaft in
+der Historie.
+
+## [2026-10-05] — Sprite-Import speichert nur noch, was die ZIP mitbringt
+
+**Symptom:** Nach dem Import einer Sprite-ZIP mit 54 Sprites stand der Knopf rund eine Viertelstunde auf
+„Saving to container...“, ohne Ausgabe in der Konsole. Danach meldete er `772 sprites`.
+
+**Ursache:** Die Speicherschleife in `importHDPackToContainerInner` lief über ganz `hdPack.sprites`. Darin liegen
+aber auch alle Sprites des geladenen Containers. Jeder Import hat deshalb den ganzen Sprite-Bestand neu als PNG
+kodiert und zurückgeschrieben. War ein anderer Container geladen als das Ziel, wären dessen Sprites mit hinüber
+kopiert worden. Die Schleife stammt aus dem ersten Commit.
+
+**Lösung:** `importHDSpritePack` gibt die Schlüssel der eingelesenen Sprites zurück, `importHDPack` reicht sie als
+`{ kind: 'sprites', keys }` weiter, und gespeichert werden nur diese. Der Knopf zeigt den Fortschritt
+(`Saving to container... n/54`). Level- und Laufzeit-Importe schreiben keine Sprites mehr. Neue Sprites legt nur
+der Sprite-Import in `hdPack.sprites` an, ihnen geht also nichts verloren. Das Laden des Containers (`:12116`)
+schreibt nichts, was erst ein späterer Import sichern müsste.
+
 ## [2026-10-02] — Composites in Teilen hochrechnen (N1 Klobber, N2 Diddy/Radio, N5 Tierfreunde)
 
 **Ursache, belegt per A/B (`ab_no_oam_tiebreak.bat`, Mesen S49 aus → Klobber und Diddys Gesicht richtig):**
